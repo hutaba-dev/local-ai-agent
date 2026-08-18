@@ -1,0 +1,18 @@
+[Unit]
+Description=Local Qwen3.8-27B vLLM server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/local-ai-agent
+EnvironmentFile=-/etc/local-ai-agent/vllm.env
+ExecStart=/root/local-ai-agent/scripts/run-server.sh
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=15min
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
