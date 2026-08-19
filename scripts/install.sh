@@ -4,7 +4,7 @@ set -euo pipefail
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 readonly RUNTIME_ROOT="${RUNTIME_ROOT:-/srv/local-ai-agent}"
 readonly VENV_DIR="${VENV_DIR:-${RUNTIME_ROOT}/venv}"
-readonly VLLM_VERSION="0.27.1"
+readonly REQUIREMENTS_FILE="${REPO_ROOT}/requirements/vllm-cu129.lock"
 
 mkdir -p "${RUNTIME_ROOT}/models" "${RUNTIME_ROOT}/huggingface" \
   "${RUNTIME_ROOT}/vllm-cache" /var/log/local-ai-agent
@@ -15,8 +15,7 @@ fi
 
 "${VENV_DIR}/bin/python" -m pip install --upgrade pip
 "${VENV_DIR}/bin/python" -m pip install \
-  "vllm==${VLLM_VERSION}" \
-  "transformers>=5.8.0" \
+  -r "${REQUIREMENTS_FILE}" \
   --extra-index-url https://download.pytorch.org/whl/cu129
 
 "${VENV_DIR}/bin/python" - <<'PY'

@@ -20,7 +20,7 @@ Optional operational overrides belong in `/etc/local-ai-agent/vllm.env`, based o
 ## Operations
 
 ```bash
-./scripts/start.sh
+./scripts/start-vllm.sh
 ./scripts/status.sh
 ./scripts/logs.sh
 ./scripts/stop.sh
@@ -50,3 +50,4 @@ ssh -L 8000:127.0.0.1:8000 root@KIM_SERVER
 - [docs/model-decision.md](docs/model-decision.md)
 - [docs/environment-baseline.md](docs/environment-baseline.md)
 - [docs/decisions.md](docs/decisions.md)
+- [docs/model-serving.md](docs/model-serving.md)
