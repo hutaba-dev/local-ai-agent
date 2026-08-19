@@ -12,3 +12,6 @@ python3 -m unittest tests/test_coding_agent_fixture.py
 
 `test_agent_artifacts.py` checks the reusable Coding Agent instruction and
 endpoint-profile contract.
+
+`test_gpu_documentation.py` prevents obsolete GPU assumptions from returning to
+the current RTX PRO 6000 Blackwell deployment documentation.

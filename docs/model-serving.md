@@ -21,11 +21,10 @@ backend. Its BF16 checkpoint is approximately 51.7 GiB. The installed RTX PRO
 and a conservative KV cache. This is preferable to quantization for the initial
 bring-up because it preserves model quality without CPU offload.
 
-For smaller GPUs, do not force BF16. The Qwen alternatives previously evaluated
-for supported NVIDIA vLLM serving are `Qwen/Qwen3.8-27B-FP8` (approximately 38
-GiB) and `Inferact/Qwen3.8-27B-NVFP4` (approximately 32 GiB). Neither is needed
-on the current 96 GiB GPU. MXFP4 is not selected because it is not supported by
-the NVIDIA vLLM profile used here.
+Alternative precision checkpoints are not part of the current deployment. The
+Qwen FP8 and NVFP4 variants remain future evaluation candidates only; BF16 is
+the validated serving profile for this RTX PRO 6000 Blackwell. MXFP4 is not
+selected because it is not supported by the NVIDIA vLLM profile used here.
 
 ## Blackwell Compatibility
 

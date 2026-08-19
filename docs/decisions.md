@@ -3,8 +3,8 @@
 ## Model And Hardware
 
 - The baseline model is `Qwen/Qwen3.8-27B` served in BF16 with vLLM.
-- The actual installed accelerator is **one NVIDIA RTX PRO 6000 Blackwell with
-  96 GiB VRAM**, not an NVIDIA A6000.
+- The verified installed accelerator is **one NVIDIA RTX PRO 6000 Blackwell
+  with 96 GiB VRAM**.
 - Start with one RTX PRO 6000 Blackwell. Future scale-out to two matching RTX
   PRO 6000 Blackwell GPUs must be validated with tensor-parallel serving before
   becoming the default profile.
