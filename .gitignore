@@ -4,6 +4,7 @@ __pycache__/
 .env
 .env.*
 !.env.example
+agents/**/qwen-openai.env
 *.key
 *.pem
 *.crt
