@@ -10,7 +10,7 @@ class AgentArtifactTests(unittest.TestCase):
         instructions = (REPO_ROOT / "agents/coding/instructions.md").read_text()
         self.assertIn("../common/constitution.md", instructions)
         self.assertIn("git diff", instructions)
-        self.assertIn("Do not declare a", instructions)
+        self.assertIn("Do not declare", instructions)
 
     def test_endpoint_profile_uses_the_local_qwen_api(self) -> None:
         profile = (REPO_ROOT / "agents/coding/qwen-openai.env.example").read_text()
@@ -20,7 +20,20 @@ class AgentArtifactTests(unittest.TestCase):
 
     def test_constitution_blocks_unsafe_automatic_operations(self) -> None:
         constitution = (REPO_ROOT / "agents/common/constitution.md").read_text()
-        for restricted_operation in ("rm -rf", "driver or kernel", "force pushes"):
+        for principle in (
+            "Observe Before Acting",
+            "Use Tools When Reality Can Be Checked",
+            "Make The Smallest Justified Change",
+            "Verify Before Declaring Success",
+            "Learn From Environment Feedback",
+            "Respect Permissions",
+            "Protect Secrets And Personal Data",
+            "Keep Changes Reproducible",
+            "Use Git As The Audit Trail",
+            "Separate Fact, Inference, And Uncertainty",
+        ):
+            self.assertIn(principle, constitution)
+        for restricted_operation in ("rm -rf", "driver 또는 kernel", "force push"):
             self.assertIn(restricted_operation, constitution)
 
 
