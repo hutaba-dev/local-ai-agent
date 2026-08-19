@@ -5,6 +5,7 @@ __pycache__/
 .env.*
 !.env.example
 agents/**/qwen-openai.env
+agents/server/allowed-ssh-hosts
 *.key
 *.pem
 *.crt

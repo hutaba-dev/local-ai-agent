@@ -11,14 +11,15 @@ backend; agent roles are client-side instruction and workflow bundles.
 flowchart LR
     User --> Main[Main Agent]
     Main -->|workspace changes| Coding[Coding Agent]
-    Main -. future evidence tasks .-> Research[Research Agent]
-    Main -. future runtime tasks .-> Server[Server Agent]
+    Main -->|documents, evidence, data| Research[Research Agent]
+    Main -->|Linux, GPU, services| Server[Server Agent]
     Main -->|Chat Completions| Qwen[Qwen vLLM API]
     Coding -->|Chat Completions| Qwen
 ```
 
-Only Main and Coding are active roles. Research and Server are future roles,
-not background processes or invented delegates.
+Main, Coding, Research, and Server are active roles. They are instruction and
+workflow bundles, not background processes. No additional role is created until
+a distinct responsibility requires one.
 
 ## Role Boundaries
 
@@ -26,6 +27,11 @@ not background processes or invented delegates.
   operations, delegation decisions, and unified reporting.
 - Coding Agent owns repository investigation, minimal edits, executable
   validation, failure repair, and diff evidence for assigned workspace work.
+- Research Agent owns PDF/document review, web evidence, Python/data analysis,
+  source tracking, and the separation of source material from interpretation.
+- Server Agent owns read-only Linux, GPU, Docker, systemd, and approved SSH
+  diagnostics. State changes and all `sudo` commands require human approval and
+  post-change health validation.
 - All roles inherit the common constitution. Role-specific instructions add
   workflow but cannot relax common safety or secret-handling rules.
 

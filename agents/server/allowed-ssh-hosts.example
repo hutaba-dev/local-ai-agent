@@ -1,0 +1,3 @@
+# One SSH config host alias per line. Keep this file non-secret.
+# Copy to agents/server/allowed-ssh-hosts before enabling remote diagnostics.
+# The default is intentionally empty: no remote SSH target is approved.

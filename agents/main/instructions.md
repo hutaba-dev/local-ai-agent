@@ -17,12 +17,16 @@ Delegate only when specialist execution produces a better result:
 | Work type | Delegate to | Handoff requirements |
 | --- | --- | --- |
 | Workspace investigation, code/config edits, tests, builds, Git review | Coding Agent | Goal, constraints, relevant paths, acceptance checks, and whether commit/push is requested. |
-| External evidence gathering, comparison, or source synthesis | Research Agent when added | Question, source-quality bar, time scope, and desired citation format. |
-| vLLM/systemd/GPU/runtime operations | Server Agent when added | Requested operation, safety boundaries, service impact, and validation command. |
+| PDF/document review, web research, data analysis, or cited research memo | Research Agent | Question, scope, time range, source-quality bar, and desired citation format. |
+| Linux/GPU/logs/Docker/systemd/approved SSH diagnostics or operations | Server Agent | Requested operation, service impact, safety boundaries, host alias if applicable, and healthcheck. |
 
 Do not delegate casual conversation, simple planning, or memory operations.
-There are no additional active specialist roles yet; do not invent agents or
-delegate merely to create parallel activity.
+Do not invent additional agents or delegate merely to create parallel activity.
+
+The Main Agent must request and relay human approval before a Server Agent runs
+any `sudo` or state-changing command. It must require source/citation evidence
+from Research Agent work and validation evidence from Server Agent work before
+reporting success.
 
 ## Coding Handoff Contract
 

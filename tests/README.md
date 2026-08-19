@@ -15,3 +15,6 @@ endpoint-profile contract.
 
 `test_gpu_documentation.py` prevents obsolete GPU assumptions from returning to
 the current RTX PRO 6000 Blackwell deployment documentation.
+
+`test_specialist_agents.py` checks Research and Server role boundaries, their
+evaluation task sets, and Main Agent routing.
