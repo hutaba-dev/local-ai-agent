@@ -40,9 +40,49 @@ For a remote VS Code session on this host, configure the client to use that base
 ssh -L 8000:127.0.0.1:8000 root@KIM_SERVER
 ```
 
-## systemd Draft
+## systemd Service
 
-[infra/systemd/local-ai-agent-vllm.service](infra/systemd/local-ai-agent-vllm.service) is a draft only. It is intentionally not copied into `/etc/systemd/system` and not enabled. Review the runtime environment file and service user before enabling it.
+[infra/systemd/qwen-vllm.service](infra/systemd/qwen-vllm.service) is the
+systemd template for this host. It runs as `root` because the verified model,
+cache, and virtual environment paths are currently owned by `root`. It invokes
+`/root/local-ai-agent/scripts/run-server.sh`, which uses
+`/srv/local-ai-agent/venv/bin/vllm`.
+
+Keep operational overrides and any secrets in `/etc/local-ai-agent/vllm.env`.
+The unit does not embed secrets. Install the reviewed template, then manage it
+with these commands:
+
+```bash
+sudo install -m 0644 infra/systemd/qwen-vllm.service /etc/systemd/system/qwen-vllm.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now qwen-vllm.service
+sudo systemctl start qwen-vllm.service
+sudo systemctl stop qwen-vllm.service
+sudo systemctl restart qwen-vllm.service
+sudo systemctl status qwen-vllm.service
+sudo journalctl -u qwen-vllm.service -f
+```
+
+The service sends stdout and stderr to journald. For recent logs, use
+`sudo journalctl -u qwen-vllm.service -n 200 --no-pager`.
+
+### Reboot Validation
+
+After enabling the unit, validate reboot persistence during a maintenance
+window:
+
+```bash
+sudo reboot
+# After reconnecting:
+sudo systemctl is-enabled qwen-vllm.service
+sudo systemctl status qwen-vllm.service
+./scripts/healthcheck.sh
+./scripts/smoke-test.sh
+sudo journalctl -u qwen-vllm.service -b --no-pager
+```
+
+`is-enabled` should report `enabled`, and both API checks should pass. The first
+post-reboot start can take several minutes while vLLM initializes the engine.
 
 ## Documentation
 

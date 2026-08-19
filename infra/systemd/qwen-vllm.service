@@ -1,17 +1,23 @@
 [Unit]
-Description=Local Qwen3.8-27B vLLM server
+Description=Qwen3.8-27B vLLM API server
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=5min
+StartLimitBurst=3
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/root/local-ai-agent
+Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=-/etc/local-ai-agent/vllm.env
 ExecStart=/root/local-ai-agent/scripts/run-server.sh
 Restart=on-failure
-RestartSec=10
+RestartSec=15s
 TimeoutStartSec=15min
+TimeoutStopSec=2min
+StandardOutput=journal
+StandardError=journal
 LimitNOFILE=65535
 
 [Install]
