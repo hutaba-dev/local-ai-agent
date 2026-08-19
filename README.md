@@ -34,6 +34,9 @@ The initial model download is large and occurs during the first `start.sh`. Do n
 
 Use the OpenAI-compatible base URL `http://127.0.0.1:8000/v1` and model name `qwen3.8-27b`. The smoke test validates both `GET /v1/models` and `POST /v1/chat/completions`.
 
+For VS Code Stable Custom Endpoint values, SSH tunnel access, and connection
+prompts, see [docs/vscode-local-model.md](docs/vscode-local-model.md).
+
 For a remote VS Code session on this host, configure the client to use that base URL. For a client on another machine, use an SSH port forward instead of exposing port 8000 publicly:
 
 ```bash
