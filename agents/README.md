@@ -6,3 +6,6 @@ serving process.
 
 All agent roles inherit [common/constitution.md](common/constitution.md). The
 first implementation is documented in [coding/README.md](coding/README.md).
+The Main Agent is the default user-facing coordinator; see
+[main/README.md](main/README.md). Memory rules are shared in
+[common/memory-policy.md](common/memory-policy.md).

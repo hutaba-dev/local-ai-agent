@@ -95,3 +95,4 @@ post-reboot start can take several minutes while vLLM initializes the engine.
 - [docs/decisions.md](docs/decisions.md)
 - [docs/model-serving.md](docs/model-serving.md)
 - [docs/agent-evaluation.md](docs/agent-evaluation.md)
+- [docs/architecture.md](docs/architecture.md)
