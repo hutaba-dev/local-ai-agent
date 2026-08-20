@@ -32,11 +32,21 @@ button.secondary { color: var(--ink); background: var(--panel); }
 .messages { display: flex; flex-direction: column; gap: 16px; padding: 28px 0 140px; }
 .message { max-width: 88%; padding: 16px 18px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); box-shadow: 0 1px 1px rgb(0 0 0 / 3%); }
 .message.user { align-self: flex-end; background: var(--user); }
-.message-label { margin-bottom: 9px; color: var(--muted); font: 700 12px/1.2 ui-monospace, monospace; }
+.message-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
+.message-label { color: var(--muted); font: 700 12px/1.2 ui-monospace, monospace; }
+.copy-response, .copy-code { border: 1px solid #b9cbbd; border-radius: 4px; background: #f8fbf7; color: var(--accent-dark); padding: 5px 8px; font: 700 11px/1 ui-monospace, monospace; }
+.copy-response:hover, .copy-code:hover { background: #e3efe5; }
 .markdown { line-height: 1.55; overflow-wrap: anywhere; }
 .markdown p { margin: 0 0 12px; }
 .markdown p:last-child { margin-bottom: 0; }
-.markdown pre { overflow-x: auto; padding: 12px; border-radius: 4px; color: #e9f4ef; background: #193128; }
+.markdown h1, .markdown h2, .markdown h3 { margin: 0 0 10px; line-height: 1.25; }
+.markdown h1 { font-size: 22px; }.markdown h2 { font-size: 19px; }.markdown h3 { font-size: 16px; }
+.markdown ul, .markdown ol { margin: 0 0 12px; padding-left: 22px; }.markdown li + li { margin-top: 4px; }
+.markdown blockquote { margin: 0 0 12px; padding: 8px 12px; border-left: 3px solid #8ab8a2; color: #3d5145; background: #f1f7f1; }
+.markdown hr { border: 0; border-top: 1px solid var(--line); margin: 16px 0; }
+.code-block { position: relative; margin: 0 0 12px; }.code-block:last-child { margin-bottom: 0; }
+.copy-code { position: absolute; top: 8px; right: 8px; z-index: 1; }
+.markdown pre { overflow-x: auto; margin: 0; padding: 16px 72px 16px 14px; border-radius: 4px; color: #e9f4ef; background: #193128; }
 .markdown code { font: 13px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace; }
 .markdown :not(pre) > code { padding: 1px 4px; background: #e9eee8; border-radius: 3px; }
 details { margin-top: 14px; border-top: 1px solid var(--line); padding-top: 10px; color: var(--muted); font: 13px/1.45 ui-monospace, monospace; }

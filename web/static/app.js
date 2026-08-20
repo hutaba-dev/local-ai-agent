@@ -11,24 +11,89 @@ function escapeHtml(value) {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
 }
 
+function inlineMarkdown(value) {
+  return value
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>");
+}
+
 function markdown(value) {
   const codeBlocks = [];
   let text = escapeHtml(value).replace(/```([\s\S]*?)```/g, (_, code) => {
-    const id = codeBlocks.push(`<pre><code>${code.trim()}</code></pre>`) - 1;
+    const trimmed = code.trim();
+    const id = codeBlocks.push(`<div class="code-block"><button class="copy-code" type="button" data-copy="${encodeURIComponent(trimmed)}">Copy code</button><pre><code>${trimmed}</code></pre></div>`) - 1;
     return `@@CODE${id}@@`;
   });
-  text = text.replace(/`([^`]+)`/g, "<code>$1</code>").replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
-  text = text.split(/\n{2,}/).map((paragraph) => `<p>${paragraph.replaceAll("\n", "<br>")}</p>`).join("");
+  const blocks = [];
+  for (const rawBlock of text.split(/\n{2,}/)) {
+    const block = rawBlock.trim();
+    if (!block) continue;
+    if (/^@@CODE\d+@@$/.test(block)) { blocks.push(block); continue; }
+    if (/^---+$/.test(block)) { blocks.push("<hr>"); continue; }
+    const heading = block.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) { blocks.push(`<h${heading[1].length}>${inlineMarkdown(heading[2])}</h${heading[1].length}>`); continue; }
+    if (block.split("\n").every((line) => /^>\s?/.test(line))) {
+      blocks.push(`<blockquote>${inlineMarkdown(block.replace(/^>\s?/gm, "").replaceAll("\n", "<br>"))}</blockquote>`);
+      continue;
+    }
+    const lines = block.split("\n");
+    if (lines.every((line) => /^[-*]\s+/.test(line))) {
+      blocks.push(`<ul>${lines.map((line) => `<li>${inlineMarkdown(line.replace(/^[-*]\s+/, ""))}</li>`).join("")}</ul>`);
+      continue;
+    }
+    if (lines.every((line) => /^\d+\.\s+/.test(line))) {
+      blocks.push(`<ol>${lines.map((line) => `<li>${inlineMarkdown(line.replace(/^\d+\.\s+/, ""))}</li>`).join("")}</ol>`);
+      continue;
+    }
+    blocks.push(`<p>${inlineMarkdown(block.replaceAll("\n", "<br>"))}</p>`);
+  }
+  text = blocks.join("");
   return text.replace(/@@CODE(\d+)@@/g, (_, id) => codeBlocks[Number(id)]);
 }
 
 function addMessage(role, content, label, activity) {
   const article = document.createElement("article");
   article.className = `message ${role}`;
-  article.innerHTML = `<div class="message-label">${escapeHtml(label)}</div><div class="markdown">${markdown(content)}</div>`;
+  const copyButton = role === "assistant" ? `<button class="copy-response" type="button" aria-label="Copy response">Copy</button>` : "";
+  article.innerHTML = `<div class="message-header"><div class="message-label">${escapeHtml(label)}</div>${copyButton}</div><div class="markdown">${markdown(content)}</div>`;
   if (activity) article.append(activityElement(activity));
   messages.append(article);
   article.scrollIntoView({ behavior: "smooth", block: "end" });
+  article.querySelector(".copy-response")?.addEventListener("click", (event) => copyText(content, event.currentTarget, "Copied"));
+  article.querySelectorAll(".copy-code").forEach((button) => button.addEventListener("click", (event) => copyText(decodeURIComponent(event.currentTarget.dataset.copy), event.currentTarget, "Copied")));
+}
+
+async function copyText(value, button, successLabel) {
+  const original = button.textContent;
+  try {
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(value);
+      } catch (error) {
+        legacyCopy(value);
+      }
+    } else {
+      legacyCopy(value);
+    }
+    button.textContent = successLabel;
+  } catch (error) {
+    button.textContent = "Copy failed";
+  }
+  setTimeout(() => { button.textContent = original; }, 1600);
+}
+
+function legacyCopy(value) {
+  const temporaryInput = document.createElement("textarea");
+  temporaryInput.value = value;
+  temporaryInput.setAttribute("readonly", "");
+  temporaryInput.style.position = "fixed";
+  temporaryInput.style.opacity = "0";
+  document.body.append(temporaryInput);
+  temporaryInput.select();
+  const copied = document.execCommand("copy");
+  temporaryInput.remove();
+  if (!copied) throw new Error("clipboard copy was rejected");
 }
 
 function activityElement(activity) {
