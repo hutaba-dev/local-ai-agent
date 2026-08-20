@@ -9,7 +9,6 @@ const accountName = document.querySelector("#account-name");
 const status = document.querySelector("#connection-status");
 let sessionId = null;
 let composing = false;
-let compositionJustEnded = false;
 let sending = false;
 let selectedAssistantText = "";
 const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
@@ -209,15 +208,13 @@ input.addEventListener("compositionstart", () => {
 
 input.addEventListener("compositionend", () => {
   composing = false;
-  compositionJustEnded = true;
-  setTimeout(() => { compositionJustEnded = false; }, 0);
 });
 
 input.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey && !composing && !compositionJustEnded && !event.isComposing && event.keyCode !== 229) {
-    event.preventDefault();
-    form.requestSubmit();
-  }
+  if (event.key !== "Enter" || event.shiftKey) return;
+  if (composing || event.isComposing || event.keyCode === 229) return;
+  event.preventDefault();
+  form.requestSubmit();
 });
 newChatButton.addEventListener("click", newSession);
 logoutButton.addEventListener("click", logout);

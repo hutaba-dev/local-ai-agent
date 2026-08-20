@@ -102,6 +102,7 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["content"], "verified response")
         self.assertTrue(payload["activity"]["direct"])
         self.assertEqual(self.fake_client.requests[0]["url"], "http://127.0.0.1:8000/v1/chat/completions")
+        self.assertEqual(self.fake_client.requests[0]["json"]["chat_template_kwargs"], {"enable_thinking": False})
 
     def test_web_ui_assets_are_not_cached(self) -> None:
         client = TestClient(web_app.app)

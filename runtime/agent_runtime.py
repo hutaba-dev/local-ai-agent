@@ -59,7 +59,13 @@ class AgentRuntime:
             messages.append({"role": "user", "content": public_context})
         response = self._client.post(
             f"{BASE_URL}/chat/completions",
-            json={"model": MODEL, "messages": messages, "temperature": 0.2, "max_tokens": 1024},
+            json={
+                "model": MODEL,
+                "messages": messages,
+                "temperature": 0.2,
+                "max_tokens": 1024,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
         )
         response.raise_for_status()
         payload = response.json()
