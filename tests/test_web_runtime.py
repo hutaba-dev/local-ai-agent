@@ -183,6 +183,16 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime._search_mode("지금 KT 롤스터와 T1의 최신 경기 상황을 알려줘"), "QUICK_SEARCH")
         self.assertEqual(runtime._search_mode("현재 repository 구조를 실제로 확인해줘"), "NO_SEARCH")
 
+    def test_source_search_request_always_runs_deep_research(self) -> None:
+        runtime = AgentRuntime(client=FakeClient())
+        message = "수소 액화 저장 관련 최근 2년간 논문, 세미나, 보고서를 검색해줘"
+        with patch("runtime.agent_runtime.run_agent_tools", return_value=[]) as run_tools:
+            result = runtime.chat(message, "auto")
+
+        self.assertEqual(result.route.agent, "research")
+        self.assertEqual(result.route.search_mode, "DEEP_RESEARCH")
+        run_tools.assert_called_once_with("research", message, "DEEP_RESEARCH")
+
     def test_research_uses_larger_output_budget_and_marks_truncation(self) -> None:
         class TruncatedResponse(FakeResponse):
             def json(self) -> dict[str, object]:

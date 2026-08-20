@@ -26,6 +26,11 @@ CURRENT_INFORMATION_TERMS = (
     "latest", "today", "now", "breaking news", "price", "schedule", "live score",
     "최신", "지금", "오늘", "뉴스", "가격", "일정", "경기", "실시간",
 )
+RESEARCH_SOURCE_TERMS = (
+    "paper", "papers", "seminar", "conference", "report", "reports", "literature",
+    "논문", "세미나", "학회", "보고서", "문헌",
+)
+RESEARCH_REQUEST_TERMS = ("search", "find", "research", "검색", "찾아", "조사", "수집")
 
 
 @dataclass(frozen=True)
@@ -113,6 +118,10 @@ class AgentRuntime:
 
     def _search_mode(self, message: str) -> str:
         normalized = message.lower()
+        if any(term in normalized for term in RESEARCH_SOURCE_TERMS) and any(
+            term in normalized for term in RESEARCH_REQUEST_TERMS
+        ):
+            return "DEEP_RESEARCH"
         if any(term in normalized for term in CURRENT_INFORMATION_TERMS):
             return "QUICK_SEARCH"
         decision_prompt = (
