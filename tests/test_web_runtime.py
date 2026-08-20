@@ -18,7 +18,7 @@ class FakeResponse:
 
     def json(self) -> dict[str, object]:
         return {
-            "choices": [{"message": {"content": "verified response"}}],
+            "choices": [{"message": {"content": "verified response"}, "finish_reason": "stop"}],
             "usage": {"prompt_tokens": 10, "completion_tokens": 4},
         }
 
@@ -182,6 +182,24 @@ class WebRuntimeTests(unittest.TestCase):
 
         self.assertEqual(runtime._search_mode("지금 KT 롤스터와 T1의 최신 경기 상황을 알려줘"), "QUICK_SEARCH")
         self.assertEqual(runtime._search_mode("현재 repository 구조를 실제로 확인해줘"), "NO_SEARCH")
+
+    def test_research_uses_larger_output_budget_and_marks_truncation(self) -> None:
+        class TruncatedResponse(FakeResponse):
+            def json(self) -> dict[str, object]:
+                payload = super().json()
+                payload["choices"][0]["finish_reason"] = "length"
+                return payload
+
+        class TruncatedClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> TruncatedResponse:
+                self.requests.append({"url": url, "json": json})
+                return TruncatedResponse()
+
+        client = TruncatedClient()
+        result = AgentRuntime(client=client).chat("논문을 분석해줘", "research")
+
+        self.assertEqual(client.requests[0]["json"]["max_tokens"], 3072)
+        self.assertIn("truncated", result.content)
 
     def test_brave_search_limits_quick_results(self) -> None:
         with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "test-key"}), patch("runtime.web_search.httpx.get", return_value=BraveResponse()) as get:

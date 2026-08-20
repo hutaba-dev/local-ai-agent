@@ -20,6 +20,8 @@ AGENT_DIR = REPO_ROOT / "agents"
 MODEL = os.getenv("OPENAI_MODEL", "qwen3.8-27b")
 BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
 MAX_TOOL_ITERATIONS = 1
+DEFAULT_MAX_TOKENS = 1024
+RESEARCH_MAX_TOKENS = 3072
 CURRENT_INFORMATION_TERMS = (
     "latest", "today", "now", "breaking news", "price", "schedule", "live score",
     "최신", "지금", "오늘", "뉴스", "가격", "일정", "경기", "실시간",
@@ -68,13 +70,15 @@ class AgentRuntime:
                 "model": MODEL,
                 "messages": messages,
                 "temperature": 0.2,
-                "max_tokens": 1024,
+                "max_tokens": self._max_tokens(route),
                 "chat_template_kwargs": {"enable_thinking": False},
             },
         )
         response.raise_for_status()
         payload = response.json()
         answer = self._assistant_text(payload)
+        if self._finish_reason(payload) == "length":
+            answer += "\n\n> Response was truncated at the output limit. Ask to continue for the remaining section."
         self.sessions.append(session, "user", message)
         self.sessions.append(session, "assistant", answer)
         usage = payload.get("usage")
@@ -87,6 +91,10 @@ class AgentRuntime:
             round((perf_counter() - started) * 1000),
             usage if isinstance(usage, dict) else None,
         )
+
+    @staticmethod
+    def _max_tokens(route: Route) -> int:
+        return RESEARCH_MAX_TOKENS if route.agent == "research" else DEFAULT_MAX_TOKENS
 
     def _load_prompt(self, agent: str) -> str:
         files = [AGENT_DIR / "common" / "constitution.md"]
@@ -154,3 +162,11 @@ class AgentRuntime:
         if isinstance(reasoning, str) and reasoning.strip():
             return "The model produced reasoning but no final answer. Please retry with a shorter request."
         raise ValueError("vLLM response had no assistant content")
+
+    @staticmethod
+    def _finish_reason(payload: dict[str, object]) -> str | None:
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            return None
+        reason = choices[0].get("finish_reason")
+        return reason if isinstance(reason, str) else None
