@@ -1,4 +1,6 @@
-from runtime.web_search import academic_papers, fetch_sources, search
+import json
+
+from runtime.web_search import academic_papers, fetch_sources, s2_get_author, s2_get_author_papers, s2_get_paper, s2_search_author, search, unpaywall_get_oa_location
 import os
 import unittest
 from pathlib import Path
@@ -8,7 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from runtime.agent_runtime import AgentRuntime
-from runtime.tool_registry import run_agent_tools
+from runtime.tool_registry import _academic_evidence_gaps, run_agent_tools
 from runtime.web_search import fetch_sources, search
 from web import app as web_app
 from web.auth import UserStore
@@ -96,6 +98,45 @@ class OpenAlexResponse:
             "authorships": [{"author": {"display_name": "Researcher"}}],
             "primary_location": {"source": {"display_name": "Journal"}},
         }]}
+
+
+class SemanticScholarResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, object]:
+        return {"name": "Researcher", "paperCount": 10, "citationCount": 200, "hIndex": 8, "affiliations": ["University"], "title": "Evidence Paper", "year": 2025, "externalIds": {"DOI": "10.1000/example"}, "venue": "Journal", "authors": [{"name": "Researcher"}], "abstract": "Verified abstract.", "data": [{
+            "authorId": "123",
+            "name": "Researcher",
+            "paperCount": 10,
+            "citationCount": 200,
+            "hIndex": 8,
+            "affiliations": ["University"],
+            "title": "Evidence Paper",
+            "year": 2025,
+            "citationCount": 12,
+            "externalIds": {"DOI": "10.1000/example"},
+            "venue": "Journal",
+            "authors": [{"name": "Researcher"}],
+            "abstract": "Verified abstract.",
+        }]}
+
+
+class UnpaywallResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, object]:
+        return {
+            "doi": "10.1000/example",
+            "title": "Evidence Paper",
+            "best_oa_location": {
+                "url": "https://repository.example/paper",
+                "host_type": "repository",
+                "license": "cc-by",
+                "version": "publishedVersion",
+            },
+        }
 
 
 class WebRuntimeTests(unittest.TestCase):
@@ -412,6 +453,58 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(papers[0]["title"], "Evidence Paper")
         self.assertEqual(papers[0]["cited_by_count"], 12)
         self.assertEqual(get.call_args.args[0], "https://api.openalex.org/works")
+
+    def test_semantic_scholar_adapters_normalize_author_and_paper_data(self) -> None:
+        with patch("runtime.web_search.httpx.get", return_value=SemanticScholarResponse()):
+            candidates = s2_search_author("Researcher University")
+            author = s2_get_author("123")
+            papers = s2_get_author_papers("123")
+            paper = s2_get_paper("paper-id")
+
+        self.assertEqual(candidates[0]["author_id"], "123")
+        self.assertEqual(author["h_index"], 8)
+        self.assertEqual(papers[0]["doi"], "10.1000/example")
+        self.assertEqual(paper["title"], "Evidence Paper")
+
+    def test_unpaywall_returns_only_legal_oa_location_when_configured(self) -> None:
+        with patch.dict(os.environ, {"UNPAYWALL_EMAIL": "research@example.com"}), patch(
+            "runtime.web_search.httpx.get", return_value=UnpaywallResponse()
+        ):
+            location = unpaywall_get_oa_location("https://doi.org/10.1000/example")
+
+        self.assertEqual(location["oa_url"], "https://repository.example/paper")
+        self.assertEqual(location["host_type"], "repository")
+
+    def test_gap_selection_uses_semantic_scholar_for_citation_request_only(self) -> None:
+        papers = json.dumps([{"title": "Paper", "doi": "10.1000/example", "cited_by_count": 10}] * 3)
+        sources = [
+            type("Result", (), {"name": "web_sources", "success": True, "output": json.dumps([{"text": "source"}] * 3)})(),
+        ]
+        with patch("runtime.tool_registry.semantic_scholar_evidence", return_value=None) as semantic, patch(
+            "runtime.tool_registry.unpaywall_oa_locations"
+        ) as unpaywall:
+            evidence = _academic_evidence_gaps(("researcher citation h-index",), papers, sources)
+
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].name, "semantic_scholar")
+        self.assertFalse(evidence[0].success)
+        semantic.assert_called_once()
+        unpaywall.assert_not_called()
+
+    def test_gap_selection_uses_unpaywall_when_public_source_evidence_is_sparse(self) -> None:
+        papers = json.dumps([{"title": "Paper", "doi": "10.1000/example", "cited_by_count": 10}] * 3)
+        sources = [
+            type("Result", (), {"name": "web_sources", "success": True, "output": json.dumps([{"text": "source"}])})(),
+        ]
+        with patch("runtime.tool_registry.semantic_scholar_evidence") as semantic, patch(
+            "runtime.tool_registry.unpaywall_oa_locations", return_value=[]) as unpaywall:
+            evidence = _academic_evidence_gaps(("researcher representative papers",), papers, sources)
+
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].name, "unpaywall_oa_location")
+        self.assertFalse(evidence[0].success)
+        semantic.assert_not_called()
+        unpaywall.assert_called_once()
 
     def test_academic_search_returns_structured_work_metadata(self) -> None:
         with patch("runtime.web_search.httpx.get", return_value=OpenAlexResponse()) as get:

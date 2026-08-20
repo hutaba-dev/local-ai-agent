@@ -10,8 +10,7 @@ from time import perf_counter
 
 import httpx
 
-from runtime.web_search import search
-from runtime.web_search import academic_papers, search_many
+from runtime.web_search import academic_papers, search_many, semantic_scholar_evidence, unpaywall_oa_locations
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -64,7 +63,10 @@ def _research_tools(message: str, search_mode: str, allow_local_tools: bool = Tr
         results.append(web_result)
         if search_mode == "DEEP_RESEARCH" and web_result.success:
             results.append(_web_sources(web_result.output))
-            results.append(_academic_papers(_queries(message)))
+            academic_result = _academic_papers(_queries(message))
+            results.append(academic_result)
+            if academic_result.success:
+                results.extend(_academic_evidence_gaps(_queries(message), academic_result.output, results))
     return results
 
 
@@ -132,3 +134,54 @@ def _academic_papers(queries: tuple[str, ...]) -> ToolResult:
         return ToolResult("academic_papers", True, json.dumps(papers, ensure_ascii=False), None, round((perf_counter() - started) * 1000))
     except (RuntimeError, httpx.HTTPError) as error:
         return ToolResult("academic_papers", False, "", str(error), round((perf_counter() - started) * 1000))
+
+
+def _academic_evidence_gaps(
+    queries: tuple[str, ...],
+    academic_output: str,
+    existing_results: list[ToolResult],
+) -> list[ToolResult]:
+    try:
+        papers = json.loads(academic_output)
+        if not isinstance(papers, list):
+            return []
+    except json.JSONDecodeError:
+        return []
+    source_count = next((len(json.loads(result.output)) for result in existing_results if result.name == "web_sources" and result.success), 0)
+    evidence: list[ToolResult] = []
+    if _needs_s2_cross_check(papers, queries):
+        evidence.append(_semantic_scholar(_researcher_query(queries)))
+    if source_count < 2 and any(isinstance(paper, dict) and isinstance(paper.get("doi"), str) for paper in papers):
+        evidence.append(_unpaywall_locations(papers))
+    return evidence
+
+
+def _needs_s2_cross_check(papers: list[object], queries: tuple[str, ...]) -> bool:
+    citation_request = any(
+        term in " ".join(queries).lower()
+        for term in ("citation", "citations", "h-index", "h index", "인용", "피인용")
+    )
+    return citation_request or len(papers) < 3 or sum(
+        1 for paper in papers if isinstance(paper, dict) and isinstance(paper.get("cited_by_count"), int)
+    ) < 3
+
+
+def _researcher_query(queries: tuple[str, ...]) -> str:
+    return queries[0][:500]
+
+
+def _semantic_scholar(query: str) -> ToolResult:
+    started = perf_counter()
+    evidence = semantic_scholar_evidence(query)
+    if evidence is None:
+        return ToolResult("semantic_scholar", False, "", "Semantic Scholar unavailable or no suitable author candidate", round((perf_counter() - started) * 1000))
+    return ToolResult("semantic_scholar", True, json.dumps(evidence, ensure_ascii=False), None, round((perf_counter() - started) * 1000))
+
+
+def _unpaywall_locations(papers: list[object]) -> ToolResult:
+    started = perf_counter()
+    typed_papers = [paper for paper in papers if isinstance(paper, dict)]
+    locations = unpaywall_oa_locations(typed_papers)
+    if not locations:
+        return ToolResult("unpaywall_oa_location", False, "", "Unpaywall unavailable, not configured, or no legal OA location found", round((perf_counter() - started) * 1000))
+    return ToolResult("unpaywall_oa_location", True, json.dumps(locations, ensure_ascii=False), None, round((perf_counter() - started) * 1000))

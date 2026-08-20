@@ -16,6 +16,8 @@ BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 NAVER_ENDPOINT = "https://openapi.naver.com/v1/search/webkr.json"
 REDDIT_ENDPOINT = "https://www.reddit.com/search.json"
 OPENALEX_WORKS_ENDPOINT = "https://api.openalex.org/works"
+S2_API_BASE = "https://api.semanticscholar.org/graph/v1"
+UNPAYWALL_API_BASE = "https://api.unpaywall.org/v2"
 KOREAN_PATTERN = re.compile(r"[\uac00-\ud7a3]")
 USER_AGENT = "local-ai-agent-research/0.1"
 MAX_SOURCE_COUNT = 5
@@ -146,6 +148,141 @@ def academic_papers(queries: tuple[str, ...], limit_per_query: int = 3) -> list[
                 "venue": source.get("display_name") if isinstance(source, dict) else None,
             })
     return papers[:12]
+
+
+def s2_search_author(query: str) -> list[dict[str, object]]:
+    """Return bounded Semantic Scholar author candidates as independent evidence."""
+    payload = _s2_get("/author/search", {"query": query, "limit": 5, "fields": "name,paperCount,citationCount,hIndex,affiliations"})
+    candidates = payload.get("data", [])
+    return [
+        {
+            "author_id": candidate.get("authorId"),
+            "name": candidate.get("name"),
+            "paper_count": candidate.get("paperCount"),
+            "citation_count": candidate.get("citationCount"),
+            "h_index": candidate.get("hIndex"),
+            "affiliations": candidate.get("affiliations", []),
+        }
+        for candidate in candidates
+        if isinstance(candidate, dict) and isinstance(candidate.get("authorId"), str)
+    ]
+
+
+def s2_get_author(author_id: str) -> dict[str, object]:
+    """Return one Semantic Scholar author record."""
+    payload = _s2_get(f"/author/{author_id}", {"fields": "name,paperCount,citationCount,hIndex,affiliations"})
+    return {
+        "author_id": author_id,
+        "name": payload.get("name"),
+        "paper_count": payload.get("paperCount"),
+        "citation_count": payload.get("citationCount"),
+        "h_index": payload.get("hIndex"),
+        "affiliations": payload.get("affiliations", []),
+    }
+
+
+def s2_get_author_papers(author_id: str) -> list[dict[str, object]]:
+    """Return representative papers for a confirmed Semantic Scholar author."""
+    payload = _s2_get(
+        f"/author/{author_id}/papers",
+        {"limit": 6, "fields": "title,year,citationCount,externalIds,venue,authors,abstract"},
+    )
+    return [_s2_paper_record(paper) for paper in payload.get("data", []) if isinstance(paper, dict)]
+
+
+def s2_get_paper(paper_id: str) -> dict[str, object]:
+    """Return detailed metadata for one Semantic Scholar paper."""
+    payload = _s2_get(
+        f"/paper/{paper_id}",
+        {"fields": "title,year,citationCount,externalIds,venue,authors,abstract"},
+    )
+    return _s2_paper_record(payload)
+
+
+def semantic_scholar_evidence(query: str) -> dict[str, object] | None:
+    """Best-effort author and representative-paper cross-check for an evidence gap."""
+    try:
+        candidates = s2_search_author(query)
+        if not candidates:
+            return None
+        author = s2_get_author(candidates[0]["author_id"])
+        papers = s2_get_author_papers(candidates[0]["author_id"])
+        return {"author": author, "representative_papers": papers}
+    except (RuntimeError, httpx.HTTPError, ValueError):
+        return None
+
+
+def unpaywall_get_oa_location(doi: str) -> dict[str, object] | None:
+    """Locate legal open-access metadata for a DOI; never bypasses a paywall."""
+    email = os.getenv("UNPAYWALL_EMAIL")
+    if not email:
+        return None
+    normalized_doi = doi.removeprefix("https://doi.org/").removeprefix("http://doi.org/")
+    try:
+        response = httpx.get(
+            f"{UNPAYWALL_API_BASE}/{normalized_doi}",
+            params={"email": email},
+            headers={"User-Agent": USER_AGENT},
+            timeout=12,
+        )
+        response.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    payload = response.json()
+    location = payload.get("best_oa_location")
+    if not isinstance(location, dict):
+        return None
+    url = location.get("url_for_pdf") or location.get("url")
+    if not isinstance(url, str) or not url.startswith("https://"):
+        return None
+    return {
+        "doi": payload.get("doi") or normalized_doi,
+        "title": payload.get("title"),
+        "oa_url": url,
+        "host_type": location.get("host_type"),
+        "license": location.get("license"),
+        "version": location.get("version"),
+    }
+
+
+def unpaywall_oa_locations(papers: list[dict[str, object]], limit: int = 3) -> list[dict[str, object]]:
+    """Find legal OA locations only for DOI-bearing representative-paper candidates."""
+    locations = []
+    for paper in papers:
+        if len(locations) >= limit:
+            break
+        doi = paper.get("doi")
+        if isinstance(doi, str):
+            location = unpaywall_get_oa_location(doi)
+            if location:
+                locations.append(location)
+    return locations
+
+
+def _s2_get(path: str, params: dict[str, object]) -> dict[str, object]:
+    headers = {"User-Agent": USER_AGENT}
+    if api_key := os.getenv("S2_API_KEY"):
+        headers["x-api-key"] = api_key
+    response = httpx.get(f"{S2_API_BASE}{path}", params=params, headers=headers, timeout=12)
+    response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Semantic Scholar returned an invalid response")
+    return payload
+
+
+def _s2_paper_record(paper: dict[str, object]) -> dict[str, object]:
+    external_ids = paper.get("externalIds")
+    doi = external_ids.get("DOI") if isinstance(external_ids, dict) else None
+    return {
+        "title": paper.get("title"),
+        "year": paper.get("year"),
+        "citation_count": paper.get("citationCount"),
+        "doi": doi,
+        "venue": paper.get("venue"),
+        "authors": paper.get("authors", []),
+        "abstract": paper.get("abstract"),
+    }
 
 
 def fetch_sources(results: list[dict[str, str]], limit: int = MAX_SOURCE_COUNT) -> list[dict[str, str]]:
