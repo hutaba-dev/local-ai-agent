@@ -67,7 +67,6 @@ def _server_tools(message: str, search_mode: str) -> list[ToolResult]:
     return [
         _command("nvidia_smi", ["nvidia-smi", "--query-gpu=name,memory.used,memory.total,utilization.gpu", "--format=csv,noheader"]),
         _command("systemctl_status_qwen_vllm", ["systemctl", "is-active", "qwen-vllm.service"]),
-        _command("journalctl_qwen_vllm", ["journalctl", "-u", "qwen-vllm.service", "-n", "12", "--no-pager"]),
         _command("df", ["df", "-h", "/"]),
         _command("free", ["free", "-h"]),
     ]

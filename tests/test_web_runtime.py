@@ -127,10 +127,30 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual({tool["name"] for tool in result.tools}, {
             "nvidia_smi",
             "systemctl_status_qwen_vllm",
-            "journalctl_qwen_vllm",
             "df",
             "free",
         })
+
+    def test_server_response_redacts_host_and_ip_identifiers(self) -> None:
+        class SensitiveResponse(FakeResponse):
+            def json(self) -> dict[str, object]:
+                return {
+                    "choices": [{"message": {"content": "호스트명: 3990X-KIM, API: 127.0.0.1:8000"}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+                }
+
+        class SensitiveClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> SensitiveResponse:
+                self.requests.append({"url": url, "json": json})
+                return SensitiveResponse()
+
+        with patch("runtime.agent_runtime.run_agent_tools", return_value=[]):
+            result = AgentRuntime(client=SensitiveClient()).chat("서버 IP를 알려줘", "server")
+
+        self.assertNotIn("3990X-KIM", result.content)
+        self.assertNotIn("127.0.0.1", result.content)
+        self.assertIn("[redacted host]", result.content)
+        self.assertIn("[redacted IP]", result.content)
 
     def test_fastapi_chat_uses_runtime_not_a_direct_vllm_proxy(self) -> None:
         previous_runtime = web_app.runtime

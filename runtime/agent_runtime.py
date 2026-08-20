@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
@@ -23,6 +24,8 @@ MAX_TOOL_ITERATIONS = 1
 DEFAULT_MAX_TOKENS = 1024
 RESEARCH_MAX_TOKENS = 3072
 SEARCH_MODES = ("NO_SEARCH", "QUICK_SEARCH", "DEEP_RESEARCH")
+IP_ADDRESS_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
+HOSTNAME_VALUE_PATTERN = re.compile(r"(?i)(hostname|host name|호스트명)\s*[:：]?\s*[a-z0-9][a-z0-9.-]*")
 
 
 @dataclass(frozen=True)
@@ -91,6 +94,8 @@ class AgentRuntime:
         response.raise_for_status()
         payload = response.json()
         answer = self._assistant_text(payload)
+        if route.agent == "server":
+            answer = self._redact_server_identifiers(answer)
         if self._finish_reason(payload) == "length":
             answer += "\n\n> Response was truncated at the output limit. Ask to continue for the remaining section."
         self.sessions.append(session, "user", message)
@@ -187,6 +192,11 @@ class AgentRuntime:
         if not tools:
             return ""
         return "Read-only tool observations:\n" + json.dumps(tools, ensure_ascii=False)
+
+    @staticmethod
+    def _redact_server_identifiers(answer: str) -> str:
+        answer = IP_ADDRESS_PATTERN.sub("[redacted IP]", answer)
+        return HOSTNAME_VALUE_PATTERN.sub(r"\1: [redacted host]", answer)
 
     @staticmethod
     def _assistant_text(payload: dict[str, object]) -> str:
