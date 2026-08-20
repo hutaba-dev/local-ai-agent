@@ -177,6 +177,12 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertFalse(result.tools[-1]["success"])
         self.assertIn("BRAVE_SEARCH_API_KEY", result.tools[-1]["error"])
 
+    def test_explicit_live_information_uses_quick_search_before_model_decision(self) -> None:
+        runtime = AgentRuntime(client=FakeClient())
+
+        self.assertEqual(runtime._search_mode("지금 KT 롤스터와 T1의 최신 경기 상황을 알려줘"), "QUICK_SEARCH")
+        self.assertEqual(runtime._search_mode("현재 repository 구조를 실제로 확인해줘"), "NO_SEARCH")
+
     def test_brave_search_limits_quick_results(self) -> None:
         with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "test-key"}), patch("runtime.web_search.httpx.get", return_value=BraveResponse()) as get:
             results = search("latest example", "QUICK_SEARCH")

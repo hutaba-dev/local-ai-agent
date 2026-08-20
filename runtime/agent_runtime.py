@@ -20,6 +20,10 @@ AGENT_DIR = REPO_ROOT / "agents"
 MODEL = os.getenv("OPENAI_MODEL", "qwen3.8-27b")
 BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
 MAX_TOOL_ITERATIONS = 1
+CURRENT_INFORMATION_TERMS = (
+    "latest", "today", "now", "breaking news", "price", "schedule", "live score",
+    "최신", "지금", "오늘", "뉴스", "가격", "일정", "경기", "실시간",
+)
 
 
 @dataclass(frozen=True)
@@ -100,6 +104,9 @@ class AgentRuntime:
         )
 
     def _search_mode(self, message: str) -> str:
+        normalized = message.lower()
+        if any(term in normalized for term in CURRENT_INFORMATION_TERMS):
+            return "QUICK_SEARCH"
         decision_prompt = (
             "Classify whether this request needs current external web evidence. Reply with exactly one token: "
             "NO_SEARCH for translation, writing, supplied-text work, stable concepts, or local server/repository questions; "
