@@ -35,7 +35,7 @@ class FakeClient:
 class SearchDecisionClient(FakeClient):
     def post(self, url: str, json: dict[str, object]) -> FakeResponse:
         self.requests.append({"url": url, "json": json})
-        content = "QUICK_SEARCH" if len(self.requests) == 1 else "web-verified answer"
+        content = '{"search_mode":"QUICK_SEARCH","query":"Seoul weather"}' if len(self.requests) == 1 else "web-verified answer"
         response = FakeResponse()
         response.json = lambda: {  # type: ignore[method-assign]
             "choices": [{"message": {"content": content}}],
@@ -177,21 +177,38 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertFalse(result.tools[-1]["success"])
         self.assertIn("BRAVE_SEARCH_API_KEY", result.tools[-1]["error"])
 
-    def test_explicit_live_information_uses_quick_search_before_model_decision(self) -> None:
-        runtime = AgentRuntime(client=FakeClient())
+    def test_model_search_decision_controls_search_mode(self) -> None:
+        client = SearchDecisionClient()
+        runtime = AgentRuntime(client=client)
 
-        self.assertEqual(runtime._search_mode("지금 KT 롤스터와 T1의 최신 경기 상황을 알려줘"), "QUICK_SEARCH")
-        self.assertEqual(runtime._search_mode("현재 repository 구조를 실제로 확인해줘"), "NO_SEARCH")
+        self.assertEqual(runtime._search_mode("현재 repository 구조를 실제로 확인해줘"), "QUICK_SEARCH")
+        decision_request = client.requests[0]["json"]
+        self.assertEqual(decision_request["max_tokens"], 128)
+        self.assertEqual(
+            decision_request["messages"][1],
+            {"role": "user", "content": "현재 repository 구조를 실제로 확인해줘"},
+        )
 
-    def test_source_search_request_always_runs_deep_research(self) -> None:
-        runtime = AgentRuntime(client=FakeClient())
+    def test_model_deep_research_decision_runs_search_with_model_query(self) -> None:
+        class DeepResearchDecisionClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                content = '{"search_mode":"DEEP_RESEARCH","query":"liquefied hydrogen storage papers 2024 2026"}' if len(self.requests) == 1 else "web-verified answer"
+                response = FakeResponse()
+                response.json = lambda: {  # type: ignore[method-assign]
+                    "choices": [{"message": {"content": content}}],
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+                }
+                return response
+
+        runtime = AgentRuntime(client=DeepResearchDecisionClient())
         message = "수소 액화 저장 관련 최근 2년간 논문, 세미나, 보고서를 검색해줘"
         with patch("runtime.agent_runtime.run_agent_tools", return_value=[]) as run_tools:
             result = runtime.chat(message, "auto")
 
         self.assertEqual(result.route.agent, "research")
         self.assertEqual(result.route.search_mode, "DEEP_RESEARCH")
-        run_tools.assert_called_once_with("research", message, "DEEP_RESEARCH")
+        run_tools.assert_called_once_with("research", "liquefied hydrogen storage papers 2024 2026", "DEEP_RESEARCH")
 
     def test_research_uses_larger_output_budget_and_marks_truncation(self) -> None:
         class TruncatedResponse(FakeResponse):

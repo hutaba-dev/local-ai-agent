@@ -22,15 +22,7 @@ BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
 MAX_TOOL_ITERATIONS = 1
 DEFAULT_MAX_TOKENS = 1024
 RESEARCH_MAX_TOKENS = 3072
-CURRENT_INFORMATION_TERMS = (
-    "latest", "today", "now", "breaking news", "price", "schedule", "live score",
-    "최신", "지금", "오늘", "뉴스", "가격", "일정", "경기", "실시간",
-)
-RESEARCH_SOURCE_TERMS = (
-    "paper", "papers", "seminar", "conference", "report", "reports", "literature",
-    "논문", "세미나", "학회", "보고서", "문헌",
-)
-RESEARCH_REQUEST_TERMS = ("search", "find", "research", "검색", "찾아", "조사", "수집")
+SEARCH_MODES = ("NO_SEARCH", "QUICK_SEARCH", "DEEP_RESEARCH")
 
 
 @dataclass(frozen=True)
@@ -42,6 +34,12 @@ class ChatResult:
     tools: list[dict[str, object]]
     duration_ms: int
     usage: dict[str, int] | None
+
+
+@dataclass(frozen=True)
+class SearchDecision:
+    mode: str
+    query: str | None = None
 
 
 class AgentRuntime:
@@ -57,9 +55,11 @@ class AgentRuntime:
             raise ValueError("message must not be empty")
         started = perf_counter()
         session = self.sessions.get_or_create(session_id)
-        search_mode = self._search_mode(message) if selected_agent == "auto" else "NO_SEARCH"
+        decision = self._search_decision(message) if selected_agent == "auto" else SearchDecision("NO_SEARCH")
+        search_mode = decision.mode
         route = route_request(message, selected_agent, search_mode)
-        tools = run_agent_tools(route.agent, message, route.search_mode) if route.agent != "main" else []
+        tool_message = decision.query or message
+        tools = run_agent_tools(route.agent, tool_message, route.search_mode) if route.agent != "main" else []
         system_prompt = self._load_prompt(route.agent)
         public_context = self._tool_context(tools)
         messages = [
@@ -117,40 +117,61 @@ class AgentRuntime:
         )
 
     def _search_mode(self, message: str) -> str:
-        normalized = message.lower()
-        if any(term in normalized for term in RESEARCH_SOURCE_TERMS) and any(
-            term in normalized for term in RESEARCH_REQUEST_TERMS
-        ):
-            return "DEEP_RESEARCH"
-        if any(term in normalized for term in CURRENT_INFORMATION_TERMS):
-            return "QUICK_SEARCH"
+        return self._search_decision(message).mode
+
+    def _search_decision(self, message: str) -> SearchDecision:
         decision_prompt = (
-            "Classify whether this request needs current external web evidence. Reply with exactly one token: "
-            "NO_SEARCH for translation, writing, supplied-text work, stable concepts, or local server/repository questions; "
-            "QUICK_SEARCH for a current fact, recent event, price, availability, schedule, policy, or fact check; "
-            "DEEP_RESEARCH for a multi-source comparison, report, recommendation, medical/legal/financial guidance, or contested claim. "
-            "Do not explain.\n\nRequest:\n"
-            + message
+            "Decide whether this request needs external web evidence before answering. "
+            "Return exactly one JSON object and no other text in this form: "
+            '{"search_mode":"NO_SEARCH|QUICK_SEARCH|DEEP_RESEARCH","query":"search terms or null"}. '
+            "Use NO_SEARCH for writing, translation, supplied-text work, stable concepts, or local server/repository questions. "
+            "Use QUICK_SEARCH for a current fact, recent event, price, availability, schedule, policy, or fact check. "
+            "Use DEEP_RESEARCH for a multi-source comparison, report, recommendation, academic or technical source search, "
+            "medical/legal/financial guidance, or contested claim. For either search mode, provide a concise search query. "
+            "Do not answer the request yet."
         )
         try:
             response = self._client.post(
                 f"{BASE_URL}/chat/completions",
                 json={
                     "model": MODEL,
-                    "messages": [{"role": "system", "content": decision_prompt}],
+                    "messages": [
+                        {"role": "system", "content": decision_prompt},
+                        {"role": "user", "content": message},
+                    ],
                     "temperature": 0,
-                    "max_tokens": 16,
+                    "max_tokens": 128,
                     "chat_template_kwargs": {"enable_thinking": False},
                 },
             )
             response.raise_for_status()
-            content = self._assistant_text(response.json()).upper()
-            for mode in ("DEEP_RESEARCH", "QUICK_SEARCH", "NO_SEARCH"):
-                if mode in content:
-                    return mode
+            return self._parse_search_decision(self._assistant_text(response.json()))
         except (httpx.HTTPError, ValueError):
             pass
-        return "NO_SEARCH"
+        return SearchDecision("NO_SEARCH")
+
+    @staticmethod
+    def _parse_search_decision(content: str) -> SearchDecision:
+        decoder = json.JSONDecoder()
+        for index, character in enumerate(content):
+            if character != "{":
+                continue
+            try:
+                value, _ = decoder.raw_decode(content[index:])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(value, dict):
+                continue
+            mode = value.get("search_mode")
+            query = value.get("query")
+            if mode not in SEARCH_MODES:
+                break
+            if mode == "NO_SEARCH":
+                return SearchDecision(mode)
+            if isinstance(query, str) and query.strip():
+                return SearchDecision(mode, query.strip()[:500])
+            break
+        raise ValueError("model did not return a valid search decision")
 
     @staticmethod
     def _tool_context(tools: list[dict[str, object]]) -> str:
