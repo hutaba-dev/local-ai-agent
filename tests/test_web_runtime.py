@@ -1,6 +1,6 @@
 import json
 
-from runtime.web_search import academic_papers, fetch_sources, s2_get_author, s2_get_author_papers, s2_get_paper, s2_search_author, search, unpaywall_get_oa_location
+from runtime.web_search import _s2_author_queries, _select_s2_author, academic_papers, fetch_sources, s2_get_author, s2_get_author_papers, s2_get_paper, s2_search_author, search, unpaywall_get_oa_location
 import os
 import unittest
 from pathlib import Path
@@ -10,7 +10,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from runtime.agent_runtime import AgentRuntime
-from runtime.tool_registry import _academic_evidence_gaps, run_agent_tools
+from runtime.tool_registry import ToolResult, _academic_evidence_gaps, _research_tools, _researcher_query, run_agent_tools
 from runtime.web_search import fetch_sources, search
 from web import app as web_app
 from web.auth import UserStore
@@ -396,6 +396,32 @@ class WebRuntimeTests(unittest.TestCase):
             True,
         )
 
+    def test_deep_research_uses_evidence_analyst_critic_and_revision_passes(self) -> None:
+        class PipelineClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                responses = (
+                    '{"search_mode":"DEEP_RESEARCH","queries":["researcher papers"]}',
+                    "analyst draft",
+                    "critic feedback",
+                    "final revision",
+                )
+                response = FakeResponse()
+                response.json = lambda: {"choices": [{"message": {"content": responses[len(self.requests) - 1]}}], "usage": {}}  # type: ignore[method-assign]
+                return response
+
+        runtime = AgentRuntime(client=PipelineClient())
+        tools = [{"name": "semantic_scholar", "success": True, "output": json.dumps({"author": {"name": "Researcher"}, "representative_papers": []}), "error": None}]
+        with patch("runtime.agent_runtime.run_agent_tools", return_value=tools):
+            result = runtime.chat("연구자 역량을 평가해줘", "auto")
+
+        self.assertEqual(result.content, "final revision")
+        self.assertEqual(len(runtime._client.requests), 4)
+        analyst_input = runtime._client.requests[1]["json"]["messages"][1]["content"]
+        critic_input = runtime._client.requests[2]["json"]["messages"][1]["content"]
+        self.assertIn("Evidence Package", analyst_input)
+        self.assertIn("Analyst Draft", critic_input)
+
     def test_research_uses_larger_output_budget_and_marks_truncation(self) -> None:
         class TruncatedResponse(FakeResponse):
             def json(self) -> dict[str, object]:
@@ -466,6 +492,52 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(papers[0]["doi"], "10.1000/example")
         self.assertEqual(paper["title"], "Evidence Paper")
 
+    def test_semantic_scholar_evidence_retries_shorter_author_query(self) -> None:
+        empty = type("EmptyResponse", (), {"status_code": 200, "raise_for_status": lambda self: None, "json": lambda self: {"data": []}})()
+        with patch("runtime.web_search.httpx.get", side_effect=[empty, SemanticScholarResponse(), SemanticScholarResponse(), SemanticScholarResponse()]):
+            from runtime.web_search import semantic_scholar_evidence
+
+            evidence = semantic_scholar_evidence("Researcher University Mechanical Engineering")
+
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence["author"]["name"], "Researcher")
+        self.assertEqual(evidence["identity_status"], "matched")
+
+    def test_semantic_scholar_evidence_uses_search_title_hint(self) -> None:
+        empty = type("EmptyResponse", (), {"status_code": 200, "raise_for_status": lambda self: None, "json": lambda self: {"data": []}})()
+        with patch("runtime.web_search.httpx.get", side_effect=[empty, empty, SemanticScholarResponse(), SemanticScholarResponse(), SemanticScholarResponse()]):
+            from runtime.web_search import semantic_scholar_evidence
+
+            evidence = semantic_scholar_evidence("한글 이름 소속", ("Researcher University",))
+
+        self.assertIsNotNone(evidence)
+        self.assertEqual(evidence["author"]["name"], "Researcher")
+
+    def test_researcher_query_prefers_ascii_planner_alias(self) -> None:
+        query = _researcher_query(("안호선 교수 연구 실적", "Ho Seon Ahn Incheon National University"))
+
+        self.assertEqual(query, "Ho Seon Ahn Incheon National University")
+
+    def test_s2_author_queries_extracts_and_reorders_hyphenated_professor_name(self) -> None:
+        queries = _s2_author_queries("Incheon University Ho-Sun Ahn professor research papers")
+
+        self.assertEqual(queries, ("Ho Sun Ahn", "Sun Ho Ahn"))
+
+    def test_s2_author_queries_extracts_korean_professor_name(self) -> None:
+        self.assertEqual(_s2_author_queries("안호선교수 연구 역량"), ("안호선",))
+
+    def test_s2_author_selection_prefers_full_name_over_initials(self) -> None:
+        selected = _select_s2_author(
+            [
+                {"author_id": "1", "name": "S. Ahn", "affiliations": []},
+                {"author_id": "2", "name": "Sun Ho Ahn", "affiliations": []},
+            ],
+            "Ho Sun Ahn",
+            "Incheon University Ho-Sun Ahn professor",
+        )
+
+        self.assertEqual(selected["author_id"], "2")
+
     def test_unpaywall_returns_only_legal_oa_location_when_configured(self) -> None:
         with patch.dict(os.environ, {"UNPAYWALL_EMAIL": "research@example.com"}), patch(
             "runtime.web_search.httpx.get", return_value=UnpaywallResponse()
@@ -490,6 +562,20 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertFalse(evidence[0].success)
         semantic.assert_called_once()
         unpaywall.assert_not_called()
+
+    def test_deep_research_runs_s2_fallback_when_openalex_has_no_match(self) -> None:
+        with patch(
+            "runtime.tool_registry._web_search", return_value=ToolResult("web_search", True, "[]", None, 0)
+        ), patch("runtime.tool_registry._web_sources", return_value=ToolResult("web_sources", False, "", "empty", 0)), patch(
+            "runtime.tool_registry._academic_papers", return_value=ToolResult("academic_papers", False, "", "empty", 0)
+        ), patch(
+            "runtime.tool_registry.semantic_scholar_evidence", return_value={"author": {}, "representative_papers": []}
+        ) as semantic:
+            results = _research_tools(("안호선교수 연구 역량을 평가해줘",), "DEEP_RESEARCH", False)
+
+        self.assertEqual(results[-1].name, "semantic_scholar")
+        self.assertTrue(results[-1].success)
+        semantic.assert_called_once()
 
     def test_gap_selection_uses_unpaywall_when_public_source_evidence_is_sparse(self) -> None:
         papers = json.dumps([{"title": "Paper", "doi": "10.1000/example", "cited_by_count": 10}] * 3)

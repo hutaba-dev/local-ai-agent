@@ -23,6 +23,7 @@ BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
 MAX_TOOL_ITERATIONS = 1
 DEFAULT_MAX_TOKENS = 1024
 RESEARCH_MAX_TOKENS = 4096
+CRITIC_MAX_TOKENS = 1200
 SEARCH_MODES = ("NO_SEARCH", "QUICK_SEARCH", "DEEP_RESEARCH")
 IP_ADDRESS_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 HOSTNAME_VALUE_PATTERN = re.compile(r"(?i)(hostname|host name|호스트명)\s*[:：]?\s*[a-z0-9][a-z0-9.-]*")
@@ -73,27 +74,18 @@ class AgentRuntime:
         tool_message = (message, *decision.queries) if search_mode == "DEEP_RESEARCH" else (decision.queries or (message,))
         tools = run_agent_tools(route.agent, tool_message, route.search_mode, allow_local_tools) if route.agent != "main" else []
         system_prompt = self._load_prompt(route.agent)
-        public_context = self._tool_context(tools)
-        messages = [
-            {"role": "system", "content": system_prompt},
-            *session.messages,
-            {"role": "user", "content": message},
-        ]
-        if public_context:
-            messages.append({"role": "user", "content": public_context})
-        response = self._client.post(
-            f"{BASE_URL}/chat/completions",
-            json={
-                "model": MODEL,
-                "messages": messages,
-                "temperature": 0.2,
-                "max_tokens": self._max_tokens(route),
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
-        )
-        response.raise_for_status()
-        payload = response.json()
-        answer = self._assistant_text(payload)
+        if route.agent == "research" and route.search_mode == "DEEP_RESEARCH":
+            answer, payload = self._synthesize_research(message, tools, system_prompt)
+        else:
+            public_context = self._tool_context(tools)
+            messages = [
+                {"role": "system", "content": system_prompt},
+                *session.messages,
+                {"role": "user", "content": message},
+            ]
+            if public_context:
+                messages.append({"role": "user", "content": public_context})
+            answer, payload = self._complete(messages, self._max_tokens(route))
         if route.agent == "server":
             answer = self._redact_server_identifiers(answer)
         if self._finish_reason(payload) == "length":
@@ -135,6 +127,97 @@ class AgentRuntime:
 
     def _search_mode(self, message: str) -> str:
         return self._search_decision(message).mode
+
+    def _synthesize_research(
+        self,
+        question: str,
+        tools: list[dict[str, object]],
+        system_prompt: str,
+    ) -> tuple[str, dict[str, object]]:
+        evidence_package = self._evidence_package(tools)
+        package_json = json.dumps(evidence_package, ensure_ascii=False)
+        analyst_prompt = (
+            "You are the Analyst / Synthesizer. Use only the supplied Evidence Package. "
+            "Do not merely summarize facts. Explain what each evidence item means for the requested evaluation. "
+            "Do not judge from publication or citation counts alone: assess topic consistency, development, originality, "
+            "representative-work significance, recent activity, collaboration, and leadership where evidence exists. "
+            "Separate Evidence from Interpretation, state uncertainty, and cite supplied URLs beside factual claims.\n\n"
+            f"Question:\n{question}\n\nEvidence Package:\n{package_json}"
+        )
+        draft, _ = self._complete(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": analyst_prompt}],
+            RESEARCH_MAX_TOKENS,
+        )
+        critic_prompt = (
+            "You are the Critic. Review the Analyst Draft only against the Evidence Package. "
+            "Do not add facts. Identify: unsupported claims, excessive praise or criticism, citation-metric overinterpretation, "
+            "identity confusion, unsourced numbers, shallow representative-work explanations, inadequate answer to the question, "
+            "repetition, and missing limitations or counterarguments. Return concise actionable revision notes.\n\n"
+            f"Evidence Package:\n{package_json}\n\nAnalyst Draft:\n{draft}"
+        )
+        critique, _ = self._complete(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": critic_prompt}],
+            CRITIC_MAX_TOKENS,
+        )
+        revision_prompt = (
+            "Write the final research answer in the user's language. Use the Analyst Draft and Critic Feedback, "
+            "but treat the Evidence Package as the sole factual authority. Do not add facts absent from it or expose this workflow. "
+            "Connect facts to meaning, comparative judgment, limitations, and a clear overall assessment. Preserve URL citations.\n\n"
+            f"Question:\n{question}\n\nEvidence Package:\n{package_json}\n\nAnalyst Draft:\n{draft}\n\nCritic Feedback:\n{critique}"
+        )
+        return self._complete(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": revision_prompt}],
+            RESEARCH_MAX_TOKENS,
+        )
+
+    def _complete(self, messages: list[dict[str, str]], max_tokens: int) -> tuple[str, dict[str, object]]:
+        response = self._client.post(
+            f"{BASE_URL}/chat/completions",
+            json={
+                "model": MODEL,
+                "messages": messages,
+                "temperature": 0.2,
+                "max_tokens": max_tokens,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+        )
+        response.raise_for_status()
+        payload = response.json()
+        return self._assistant_text(payload), payload
+
+    @staticmethod
+    def _evidence_package(tools: list[dict[str, object]]) -> dict[str, object]:
+        package: dict[str, object] = {
+            "identity": {}, "career": {}, "metrics": {}, "research_topics": [],
+            "representative_works": [], "recent_activity": [], "leadership": [],
+            "collaboration": [], "limitations": [], "sources": [],
+        }
+        for tool in tools:
+            if not tool.get("success"):
+                package["limitations"].append({"tool": tool.get("name"), "error": tool.get("error")})
+                continue
+            try:
+                output = json.loads(str(tool.get("output", "")))
+            except json.JSONDecodeError:
+                continue
+            if tool.get("name") == "semantic_scholar" and isinstance(output, dict):
+                author = output.get("author")
+                if isinstance(author, dict):
+                    package["identity"] = {key: author.get(key) for key in ("name", "affiliations", "author_id")}
+                    package["metrics"] = {key: author.get(key) for key in ("paper_count", "citation_count", "h_index")}
+                papers = output.get("representative_papers")
+                if isinstance(papers, list):
+                    package["representative_works"].extend(papers)
+                if output.get("identity_status") == "ambiguous":
+                    package["limitations"].append({"identity_status": "ambiguous", "same_name_candidate_count": output.get("same_name_candidate_count")})
+            elif tool.get("name") == "academic_papers" and isinstance(output, list):
+                package["representative_works"].extend(output)
+            elif tool.get("name") == "web_sources" and isinstance(output, list):
+                package["sources"].extend(
+                    {key: item.get(key) for key in ("title", "url", "text")}
+                    for item in output if isinstance(item, dict)
+                )
+        return package
 
     def _search_decision(self, message: str) -> SearchDecision:
         decision_prompt = (

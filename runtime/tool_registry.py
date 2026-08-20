@@ -65,8 +65,11 @@ def _research_tools(message: str, search_mode: str, allow_local_tools: bool = Tr
             results.append(_web_sources(web_result.output))
             academic_result = _academic_papers(_queries(message))
             results.append(academic_result)
-            if academic_result.success:
-                results.extend(_academic_evidence_gaps(_queries(message), academic_result.output, results))
+            results.extend(_academic_evidence_gaps(
+                _queries(message),
+                academic_result.output if academic_result.success else "[]",
+                results,
+            ))
     return results
 
 
@@ -150,7 +153,7 @@ def _academic_evidence_gaps(
     source_count = next((len(json.loads(result.output)) for result in existing_results if result.name == "web_sources" and result.success), 0)
     evidence: list[ToolResult] = []
     if _needs_s2_cross_check(papers, queries):
-        evidence.append(_semantic_scholar(_researcher_query(queries)))
+        evidence.append(_semantic_scholar(_researcher_query(queries), _search_title_hints(existing_results)))
     if source_count < 2 and any(isinstance(paper, dict) and isinstance(paper.get("doi"), str) for paper in papers):
         evidence.append(_unpaywall_locations(papers))
     return evidence
@@ -167,12 +170,28 @@ def _needs_s2_cross_check(papers: list[object], queries: tuple[str, ...]) -> boo
 
 
 def _researcher_query(queries: tuple[str, ...]) -> str:
+    for query in queries[1:]:
+        if any(character.isascii() and character.isalpha() for character in query):
+            return query[:500]
     return queries[0][:500]
 
 
-def _semantic_scholar(query: str) -> ToolResult:
+def _search_title_hints(results: list[ToolResult]) -> tuple[str, ...]:
+    search_result = next((result for result in results if result.name == "web_search" and result.success), None)
+    if search_result is None:
+        return ()
+    try:
+        items = json.loads(search_result.output)
+    except json.JSONDecodeError:
+        return ()
+    if not isinstance(items, list):
+        return ()
+    return tuple(item["title"] for item in items[:5] if isinstance(item, dict) and isinstance(item.get("title"), str))
+
+
+def _semantic_scholar(query: str, author_hints: tuple[str, ...]) -> ToolResult:
     started = perf_counter()
-    evidence = semantic_scholar_evidence(query)
+    evidence = semantic_scholar_evidence(query, author_hints)
     if evidence is None:
         return ToolResult("semantic_scholar", False, "", "Semantic Scholar unavailable or no suitable author candidate", round((perf_counter() - started) * 1000))
     return ToolResult("semantic_scholar", True, json.dumps(evidence, ensure_ascii=False), None, round((perf_counter() - started) * 1000))

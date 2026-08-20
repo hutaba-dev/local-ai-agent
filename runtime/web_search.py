@@ -6,6 +6,8 @@ import os
 import re
 import ipaddress
 import socket
+import re
+from time import sleep
 from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
@@ -22,6 +24,7 @@ KOREAN_PATTERN = re.compile(r"[\uac00-\ud7a3]")
 USER_AGENT = "local-ai-agent-research/0.1"
 MAX_SOURCE_COUNT = 5
 MAX_SOURCE_CHARS = 6_000
+S2_MAX_ATTEMPTS = 3
 
 
 class _TextExtractor(HTMLParser):
@@ -199,15 +202,37 @@ def s2_get_paper(paper_id: str) -> dict[str, object]:
     return _s2_paper_record(payload)
 
 
-def semantic_scholar_evidence(query: str) -> dict[str, object] | None:
+def semantic_scholar_evidence(query: str, author_hints: tuple[str, ...] = ()) -> dict[str, object] | None:
     """Best-effort author and representative-paper cross-check for an evidence gap."""
     try:
-        candidates = s2_search_author(query)
+        candidates: list[dict[str, object]] = []
+        selected_query = query
+        for candidate_query in (*_s2_author_queries(query), *author_hints):
+            candidates = s2_search_author(candidate_query)
+            if candidates:
+                selected_query = candidate_query
+                break
         if not candidates:
             return None
-        author = s2_get_author(candidates[0]["author_id"])
-        papers = s2_get_author_papers(candidates[0]["author_id"])
-        return {"author": author, "representative_papers": papers}
+        candidate = _select_s2_author(candidates, selected_query, query)
+        if candidate is None:
+            return None
+        author_id = candidate["author_id"]
+        if not isinstance(author_id, str):
+            return None
+        author = s2_get_author(author_id)
+        papers = s2_get_author_papers(author_id)
+        exact_name_matches = [
+            candidate for candidate in candidates
+            if isinstance(candidate.get("name"), str)
+            and candidate["name"].casefold() == selected_query.casefold()
+        ]
+        return {
+            "author": author,
+            "representative_papers": papers,
+            "identity_status": "ambiguous" if len(exact_name_matches) > 1 else "matched",
+            "same_name_candidate_count": len(exact_name_matches),
+        }
     except (RuntimeError, httpx.HTTPError, ValueError):
         return None
 
@@ -263,12 +288,80 @@ def _s2_get(path: str, params: dict[str, object]) -> dict[str, object]:
     headers = {"User-Agent": USER_AGENT}
     if api_key := os.getenv("S2_API_KEY"):
         headers["x-api-key"] = api_key
-    response = httpx.get(f"{S2_API_BASE}{path}", params=params, headers=headers, timeout=12)
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise ValueError("Semantic Scholar returned an invalid response")
-    return payload
+    last_error: httpx.HTTPError | None = None
+    for attempt in range(S2_MAX_ATTEMPTS):
+        try:
+            response = httpx.get(f"{S2_API_BASE}{path}", params=params, headers=headers, timeout=12)
+            status_code = getattr(response, "status_code", 200)
+            if status_code == 429 or status_code >= 500:
+                response.raise_for_status()
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise ValueError("Semantic Scholar returned an invalid response")
+            return payload
+        except httpx.HTTPStatusError as error:
+            last_error = error
+            if error.response.status_code != 429 and error.response.status_code < 500:
+                raise
+            if attempt < S2_MAX_ATTEMPTS - 1:
+                sleep(2 ** attempt)
+    if last_error:
+        raise last_error
+    raise RuntimeError("Semantic Scholar request failed")
+
+
+def _s2_author_queries(query: str) -> tuple[str, ...]:
+    """Extract a bounded person-name query before falling back to the full text."""
+    korean_match = re.search(r"([가-힣]{2,4})\s*교수", query)
+    if korean_match:
+        return (korean_match.group(1),)
+    match = re.search(
+        r"([A-Z][A-Za-z-]*\s+[A-Z][A-Za-z-]*)\s+(?:professor|researcher|academic)\b",
+        query,
+        re.IGNORECASE,
+    )
+    if match:
+        name = match.group(1).replace("-", " ")
+        parts = name.split()
+        reversed_given_name = " ".join((*reversed(parts[:-1]), parts[-1]))
+        return tuple(dict.fromkeys((name, reversed_given_name)))
+    words = query.split()
+    candidates = [query]
+    for length in (4, 3, 2):
+        if len(words) >= length:
+            candidates.append(" ".join(words[:length]))
+    return tuple(dict.fromkeys(candidate for candidate in candidates if candidate.strip()))
+
+
+def _select_s2_author(
+    candidates: list[dict[str, object]],
+    author_query: str,
+    context_query: str,
+) -> dict[str, object] | None:
+    name_terms = set(_s2_name_terms(author_query))
+    context_terms = set(_s2_name_terms(context_query))
+    ranked = sorted(
+        candidates,
+        key=lambda candidate: _s2_candidate_score(candidate, name_terms, context_terms),
+        reverse=True,
+    )
+    if not ranked or _s2_candidate_score(ranked[0], name_terms, context_terms) <= 0:
+        return None
+    return ranked[0]
+
+
+def _s2_candidate_score(candidate: dict[str, object], name_terms: set[str], context_terms: set[str]) -> int:
+    candidate_name = candidate.get("name")
+    candidate_terms = set(_s2_name_terms(candidate_name)) if isinstance(candidate_name, str) else set()
+    affiliations = candidate.get("affiliations")
+    affiliation_terms = set(_s2_name_terms(" ".join(value for value in affiliations if isinstance(value, str)))) if isinstance(affiliations, list) else set()
+    exact_name_bonus = 10 if candidate_terms == name_terms and name_terms else 0
+    return exact_name_bonus + 3 * len(candidate_terms & name_terms) + len(affiliation_terms & context_terms)
+
+
+def _s2_name_terms(value: str) -> tuple[str, ...]:
+    return tuple(term.lower() for term in re.findall(r"[A-Za-z]+|[가-힣]+", value) if len(term) > 1)
 
 
 def _s2_paper_record(paper: dict[str, object]) -> dict[str, object]:
