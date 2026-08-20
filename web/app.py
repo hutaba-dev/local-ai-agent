@@ -30,7 +30,7 @@ chat_session_owners: dict[str, str] = {}
 chat_session_roles: dict[str, str] = {}
 SESSION_COOKIE = "local_ai_session"
 ROLE_ALLOWED_AGENTS = {
-    "admin": frozenset(AGENT_CHOICES),
+    "admin": frozenset({"auto", "main", "research"}),
     "guest": frozenset({"auto", "main", "research"}),
 }
 
@@ -147,7 +147,6 @@ def agents(request: Request) -> dict[str, object]:
         {"id": "main", "label": "Main / Secretary"},
         {"id": "coding", "label": "Coding"},
         {"id": "research", "label": "Research"},
-        {"id": "server", "label": "Server"},
     ]
     return {
         "agents": [agent for agent in available_agents if agent["id"] in permitted_agents],
@@ -182,7 +181,7 @@ async def chat(request: ChatRequest, http_request: Request) -> dict[str, object]
             request.selected_agent,
             session_id,
             allowed_agents(user),
-            user.role == "admin",
+            False,
         )
     except PermissionError as error:
         raise HTTPException(status_code=403, detail=str(error)) from error

@@ -204,6 +204,25 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(coding.status_code, 403)
         self.assertFalse(self.fake_client.requests)
 
+    def test_admin_browser_cannot_access_server_or_auto_server_route(self) -> None:
+        previous_runtime = web_app.runtime
+        web_app.runtime = self.runtime
+        try:
+            admin = self.authenticated_client()
+            agents = admin.get("/api/agents").json()["agents"]
+            direct = admin.post("/api/chat", json={"message": "GPU 상태를 알려줘", "selected_agent": "server"})
+            coding = admin.post("/api/chat", json={"message": "코드를 보여줘", "selected_agent": "coding"})
+            with patch("runtime.agent_runtime.run_agent_tools") as run_tools:
+                automatic = admin.post("/api/chat", json={"message": "서버 GPU 상태를 알려줘"})
+        finally:
+            web_app.runtime = previous_runtime
+
+        self.assertEqual({agent["id"] for agent in agents}, {"auto", "main", "research"})
+        self.assertEqual(direct.status_code, 403)
+        self.assertEqual(coding.status_code, 403)
+        self.assertEqual(automatic.status_code, 403)
+        run_tools.assert_not_called()
+
     def test_guest_auto_route_cannot_execute_server_tools(self) -> None:
         previous_runtime = web_app.runtime
         web_app.runtime = self.runtime
@@ -230,6 +249,19 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         run_tools.assert_called_once_with("research", "수소 연구를 요약해줘", "NO_SEARCH", False)
         self.assertEqual(run_agent_tools("research", "수소 연구를 요약해줘", allow_local_tools=False), [])
+
+    def test_admin_browser_research_has_no_local_project_tools(self) -> None:
+        previous_runtime = web_app.runtime
+        web_app.runtime = self.runtime
+        try:
+            admin = self.authenticated_client()
+            with patch("runtime.agent_runtime.run_agent_tools", return_value=[]) as run_tools:
+                response = admin.post("/api/chat", json={"message": "수소 연구를 요약해줘", "selected_agent": "research"})
+        finally:
+            web_app.runtime = previous_runtime
+
+        self.assertEqual(response.status_code, 200)
+        run_tools.assert_called_once_with("research", "수소 연구를 요약해줘", "NO_SEARCH", False)
 
     def test_guest_legacy_session_is_replaced_before_history_is_used(self) -> None:
         old_session = self.runtime.new_session()
