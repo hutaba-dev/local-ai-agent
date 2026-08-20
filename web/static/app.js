@@ -4,12 +4,16 @@ const input = document.querySelector("#message-input");
 const selector = document.querySelector("#agent-select");
 const sendButton = document.querySelector("#send-button");
 const newChatButton = document.querySelector("#new-chat");
+const logoutButton = document.querySelector("#logout");
+const accountName = document.querySelector("#account-name");
 const status = document.querySelector("#connection-status");
 let sessionId = null;
 let composing = false;
 let compositionJustEnded = false;
 let sending = false;
 let selectedAssistantText = "";
+const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+let idleTimer;
 
 const selectionCopyButton = document.createElement("button");
 selectionCopyButton.className = "selection-copy";
@@ -147,8 +151,23 @@ function activityElement(activity) {
 async function request(path, options = {}) {
   const response = await fetch(path, options);
   const payload = await response.json();
+  if (response.status === 401) {
+    window.location.replace("/login");
+    throw new Error("login required");
+  }
   if (!response.ok) throw new Error(payload.detail || "Request failed");
   return payload;
+}
+
+async function logout() {
+  clearTimeout(idleTimer);
+  await fetch("/api/logout", { method: "POST" });
+  window.location.replace("/login");
+}
+
+function resetIdleTimer() {
+  clearTimeout(idleTimer);
+  idleTimer = setTimeout(logout, IDLE_TIMEOUT_MS);
 }
 
 async function newSession() {
@@ -201,6 +220,10 @@ input.addEventListener("keydown", (event) => {
   }
 });
 newChatButton.addEventListener("click", newSession);
+logoutButton.addEventListener("click", logout);
+for (const eventName of ["pointerdown", "keydown", "input", "scroll", "touchstart"]) {
+  document.addEventListener(eventName, resetIdleTimer, { passive: true });
+}
 document.addEventListener("selectionchange", updateSelectionCopyButton);
 document.addEventListener("scroll", hideSelectionCopyButton, true);
 selectionCopyButton.addEventListener("mousedown", (event) => event.preventDefault());
@@ -208,11 +231,13 @@ selectionCopyButton.addEventListener("click", () => copyText(selectedAssistantTe
 
 async function initialize() {
   try {
-    const [agentPayload, health] = await Promise.all([request("/api/agents"), request("/health")]);
+    const [agentPayload, health, account] = await Promise.all([request("/api/agents"), request("/health"), request("/api/me")]);
     selector.innerHTML = agentPayload.agents.map((agent) => `<option value="${agent.id}">${agent.label}</option>`).join("");
+    accountName.textContent = `${account.username} (${account.role})`;
     status.textContent = `Connected: ${health.model}`;
     status.className = "status online";
     await newSession();
   } catch (error) { status.textContent = "Backend unavailable"; status.className = "status offline"; }
 }
+resetIdleTimer();
 initialize();

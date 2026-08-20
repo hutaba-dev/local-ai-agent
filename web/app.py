@@ -24,7 +24,8 @@ app = FastAPI(title="Local AI Agent Chat", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=WEB_ROOT / "static"), name="static")
 runtime = AgentRuntime()
 user_store = configured_user_store()
-session_signer = SessionSigner(os.getenv("WEB_SESSION_SECRET", secrets.token_urlsafe(32)))
+session_timeout_minutes = int(os.getenv("WEB_SESSION_IDLE_MINUTES", "15"))
+session_signer = SessionSigner(os.getenv("WEB_SESSION_SECRET", secrets.token_urlsafe(32)), session_timeout_minutes)
 chat_session_owners: dict[str, str] = {}
 SESSION_COOKIE = "local_ai_session"
 
@@ -40,6 +41,17 @@ async def disable_ui_cache(request: Request, call_next):
             return RedirectResponse("/login", status_code=303)
         request.state.user = user
     response = await call_next(request)
+    if hasattr(request.state, "user") and request.url.path != "/api/logout":
+        refreshed = session_signer.renew(request.cookies.get(SESSION_COOKIE))
+        if refreshed:
+            response.set_cookie(
+                SESSION_COOKIE,
+                refreshed,
+                httponly=True,
+                samesite="lax",
+                secure=os.getenv("WEB_SECURE_COOKIE", "0") == "1",
+                max_age=session_timeout_minutes * 60,
+            )
     if request.url.path in {"/", "/login"} or request.url.path.startswith("/static/"):
         response.headers["Cache-Control"] = "no-store"
     return response
@@ -62,7 +74,10 @@ def current_user(request: Request) -> User:
 
 def chat_owner(request: Request) -> str:
     token = request.cookies.get(SESSION_COOKIE, "")
-    return hashlib.sha256(token.encode()).hexdigest()
+    session_key = session_signer.session_key(token)
+    if session_key is None:
+        raise HTTPException(status_code=401, detail="login required")
+    return hashlib.sha256(session_key.encode()).hexdigest()
 
 
 @app.get("/login", response_class=FileResponse)
@@ -82,7 +97,7 @@ def login(request: LoginRequest) -> JSONResponse:
         httponly=True,
         samesite="lax",
         secure=os.getenv("WEB_SECURE_COOKIE", "0") == "1",
-        max_age=12 * 60 * 60,
+        max_age=session_timeout_minutes * 60,
     )
     return response
 

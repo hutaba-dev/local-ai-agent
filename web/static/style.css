@@ -29,6 +29,7 @@ button.secondary { color: var(--ink); background: var(--panel); }
 .status.online { color: #075f48; background: #d9f1e6; }
 .status.offline { color: #963d30; background: #f9ddd7; }
 .status.checking { color: #72570a; background: #f4edc9; }
+.account-name { color: var(--muted); font: 700 12px/1.2 ui-monospace, monospace; }
 .messages { display: flex; flex-direction: column; gap: 16px; padding: 28px 0 140px; }
 .message { max-width: 88%; padding: 16px 18px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); box-shadow: 0 1px 1px rgb(0 0 0 / 3%); }
 .message.user { align-self: flex-end; background: var(--user); }

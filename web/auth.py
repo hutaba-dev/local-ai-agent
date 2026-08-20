@@ -92,18 +92,18 @@ class UserStore:
 
 
 class SessionSigner:
-    def __init__(self, secret: str, lifetime_hours: int = 12) -> None:
+    def __init__(self, secret: str, lifetime_minutes: int = 15) -> None:
         self.secret = secret.encode()
-        self.lifetime = timedelta(hours=lifetime_hours)
+        self.lifetime = timedelta(minutes=lifetime_minutes)
 
-    def create(self, user: User) -> str:
+    def create(self, user: User, nonce: str | None = None) -> str:
         expires = int((datetime.now(UTC) + self.lifetime).timestamp())
-        payload = f"{user.username}:{user.role}:{expires}:{secrets.token_urlsafe(16)}".encode()
+        payload = f"{user.username}:{user.role}:{nonce or secrets.token_urlsafe(16)}:{expires}".encode()
         encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
         signature = hmac.new(self.secret, encoded.encode(), hashlib.sha256).hexdigest()
         return f"{encoded}.{signature}"
 
-    def verify(self, token: str | None) -> User | None:
+    def _claims(self, token: str | None) -> tuple[str, str, str, int] | None:
         if not token or "." not in token:
             return None
         encoded, signature = token.rsplit(".", maxsplit=1)
@@ -112,12 +112,33 @@ class SessionSigner:
             return None
         try:
             padded = encoded + "=" * (-len(encoded) % 4)
-            username, role, expires, _nonce = base64.urlsafe_b64decode(padded).decode().split(":")
+            username, role, nonce, expires = base64.urlsafe_b64decode(padded).decode().split(":")
             if role not in {"admin", "guest"} or int(expires) < int(datetime.now(UTC).timestamp()):
                 return None
-            return User(username=username, role=role, active=True)
+            return username, role, nonce, int(expires)
         except (UnicodeDecodeError, ValueError):
             return None
+
+    def verify(self, token: str | None) -> User | None:
+        claims = self._claims(token)
+        if claims is None:
+            return None
+        username, role, _nonce, _expires = claims
+        return User(username=username, role=role, active=True)
+
+    def renew(self, token: str | None) -> str | None:
+        claims = self._claims(token)
+        if claims is None:
+            return None
+        username, role, nonce, _expires = claims
+        return self.create(User(username=username, role=role, active=True), nonce=nonce)
+
+    def session_key(self, token: str | None) -> str | None:
+        claims = self._claims(token)
+        if claims is None:
+            return None
+        username, role, nonce, _expires = claims
+        return f"{username}:{role}:{nonce}"
 
 
 def configured_user_store() -> UserStore:
