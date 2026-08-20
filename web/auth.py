@@ -15,7 +15,7 @@ from pathlib import Path
 
 
 USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{2,39}$")
-PASSWORD_MIN_LENGTH = 12
+PASSWORD_MIN_LENGTH = 8
 
 
 @dataclass(frozen=True)
@@ -98,7 +98,7 @@ class SessionSigner:
 
     def create(self, user: User) -> str:
         expires = int((datetime.now(UTC) + self.lifetime).timestamp())
-        payload = f"{user.username}:{user.role}:{expires}".encode()
+        payload = f"{user.username}:{user.role}:{expires}:{secrets.token_urlsafe(16)}".encode()
         encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
         signature = hmac.new(self.secret, encoded.encode(), hashlib.sha256).hexdigest()
         return f"{encoded}.{signature}"
@@ -112,7 +112,7 @@ class SessionSigner:
             return None
         try:
             padded = encoded + "=" * (-len(encoded) % 4)
-            username, role, expires = base64.urlsafe_b64decode(padded).decode().split(":")
+            username, role, expires, _nonce = base64.urlsafe_b64decode(padded).decode().split(":")
             if role not in {"admin", "guest"} or int(expires) < int(datetime.now(UTC).timestamp()):
                 return None
             return User(username=username, role=role, active=True)

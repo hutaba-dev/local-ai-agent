@@ -15,7 +15,7 @@ The default listener is `0.0.0.0:8080`, while vLLM remains private at
 that permits this host and port. The UI requires a manually provisioned account;
 there is no public registration. Create an initial administrator or guest from
 the server terminal. The command prompts for the password so it is never placed
-in shell history or the repository:
+in shell history or the repository. Passwords must contain at least 8 characters:
 
 ```bash
 /srv/local-ai-agent/venv/bin/python scripts/manage-users.py admin YOUR_ADMIN_USERNAME

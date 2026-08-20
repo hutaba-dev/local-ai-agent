@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import hashlib
 from pathlib import Path
 
 import httpx
@@ -57,6 +58,11 @@ class LoginRequest(BaseModel):
 
 def current_user(request: Request) -> User:
     return request.state.user
+
+
+def chat_owner(request: Request) -> str:
+    token = request.cookies.get(SESSION_COOKIE, "")
+    return hashlib.sha256(token.encode()).hexdigest()
 
 
 @app.get("/login", response_class=FileResponse)
@@ -126,7 +132,7 @@ def agents() -> dict[str, object]:
 @app.post("/api/new-session")
 def new_session(request: Request) -> dict[str, str]:
     session_id = runtime.new_session()
-    chat_session_owners[session_id] = current_user(request).username
+    chat_session_owners[session_id] = chat_owner(request)
     return {"session_id": session_id}
 
 
@@ -134,14 +140,14 @@ def new_session(request: Request) -> dict[str, str]:
 async def chat(request: ChatRequest, http_request: Request) -> dict[str, object]:
     if request.selected_agent not in AGENT_CHOICES:
         raise HTTPException(status_code=422, detail="unknown agent selection")
-    user = current_user(http_request)
-    if request.session_id and chat_session_owners.get(request.session_id) not in {None, user.username}:
+    owner = chat_owner(http_request)
+    if request.session_id and chat_session_owners.get(request.session_id) not in {None, owner}:
         raise HTTPException(status_code=403, detail="chat session belongs to another user")
     try:
         result = await run_in_threadpool(runtime.chat, request.message, request.selected_agent, request.session_id)
     except (httpx.HTTPError, ValueError) as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
-    chat_session_owners[result.session_id] = user.username
+    chat_session_owners[result.session_id] = owner
     usage = result.usage or {}
     completion_tokens = usage.get("completion_tokens")
     tokens_per_second = None

@@ -21,7 +21,10 @@ def main() -> None:
     confirmation = getpass.getpass("Confirm password: ")
     if password != confirmation:
         raise SystemExit("passwords do not match")
-    user = configured_user_store().create(args.username, password, args.role)
+    try:
+        user = configured_user_store().create(args.username, password, args.role)
+    except ValueError as error:
+        raise SystemExit(f"cannot create user: {error}") from error
     print(f"created {user.role} account: {user.username}")
 
 

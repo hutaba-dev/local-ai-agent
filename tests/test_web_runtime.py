@@ -114,6 +114,15 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(login.headers["cache-control"], "no-store")
         self.assertEqual(script.headers["cache-control"], "no-store")
 
+    def test_shared_account_cannot_reuse_another_browser_chat_session(self) -> None:
+        first_browser = self.authenticated_client()
+        second_browser = self.authenticated_client()
+
+        session_id = first_browser.post("/api/new-session").json()["session_id"]
+        response = second_browser.post("/api/chat", json={"message": "안녕", "session_id": session_id})
+
+        self.assertEqual(response.status_code, 403)
+
 
 if __name__ == "__main__":
     unittest.main()
