@@ -43,6 +43,13 @@ For a remote VS Code session on this host, configure the client to use that base
 ssh -L 8000:127.0.0.1:8000 root@KIM_SERVER
 ```
 
+## Browser Agent Test UI
+
+The optional LAN-only browser interface uses the local agent runtime rather than
+exposing vLLM to the browser. Start it with `./web/run.sh`, then open the
+server's LAN address on port `8088`. See [web/README.md](web/README.md) for the
+current address, API endpoints, and testing scope.
+
 ## systemd Service
 
 [infra/systemd/qwen-vllm.service](infra/systemd/qwen-vllm.service) is the

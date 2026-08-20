@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Local AI Agent Chat</title>
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">LOCAL MULTI-AGENT TEST</p>
+          <h1>Qwen3.8-27B</h1>
+        </div>
+        <div class="controls">
+          <label class="agent-select">Agent
+            <select id="agent-select" aria-label="Agent selector"></select>
+          </label>
+          <span id="connection-status" class="status checking">Checking connection</span>
+          <button id="new-chat" class="secondary" type="button">New Chat</button>
+        </div>
+      </header>
+
+      <section id="messages" class="messages" aria-live="polite">
+        <article class="message assistant">
+          <div class="message-label">Main / Secretary</div>
+          <div class="markdown">Start a conversation to test the local agent runtime.</div>
+        </article>
+      </section>
+
+      <form id="chat-form" class="composer">
+        <textarea id="message-input" rows="3" maxlength="12000" placeholder="Message the local agents" required></textarea>
+        <button id="send-button" type="submit">Send</button>
+      </form>
+    </main>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

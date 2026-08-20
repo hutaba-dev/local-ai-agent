@@ -18,3 +18,6 @@ the current RTX PRO 6000 Blackwell deployment documentation.
 
 `test_specialist_agents.py` checks Research and Server role boundaries, their
 evaluation task sets, and Main Agent routing.
+
+`test_web_runtime.py` verifies Main routing, short-term session history,
+read-only tools, and FastAPI's runtime integration with a mock Qwen client.

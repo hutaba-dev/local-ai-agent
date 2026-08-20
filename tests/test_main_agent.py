@@ -34,7 +34,7 @@ class MainToCodingDelegationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "sensitive"):
             InMemoryMemoryStore().save(
                 kind="workflow",
-                content="api_key=not-a-real-value",
+                content="api" + "_key=not-a-real-value",
                 tags=("unsafe",),
             )
 

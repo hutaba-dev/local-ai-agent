@@ -1,0 +1,1 @@
+"""Minimal local multi-agent runtime for the browser test interface."""

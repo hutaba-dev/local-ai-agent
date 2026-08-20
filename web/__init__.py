@@ -1,0 +1,1 @@
+"""Browser test interface for the local multi-agent runtime."""
