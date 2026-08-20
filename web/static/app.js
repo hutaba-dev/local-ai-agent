@@ -6,6 +6,8 @@ const sendButton = document.querySelector("#send-button");
 const newChatButton = document.querySelector("#new-chat");
 const status = document.querySelector("#connection-status");
 let sessionId = null;
+let composing = false;
+let compositionJustEnded = false;
 
 function escapeHtml(value) {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
@@ -141,8 +143,18 @@ form.addEventListener("submit", async (event) => {
   } finally { sendButton.disabled = false; input.focus(); }
 });
 
+input.addEventListener("compositionstart", () => {
+  composing = true;
+});
+
+input.addEventListener("compositionend", () => {
+  composing = false;
+  compositionJustEnded = true;
+  setTimeout(() => { compositionJustEnded = false; }, 0);
+});
+
 input.addEventListener("keydown", (event) => {
-  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+  if (event.key === "Enter" && !event.shiftKey && !composing && !compositionJustEnded && !event.isComposing && event.keyCode !== 229) {
     event.preventDefault();
     form.requestSubmit();
   }

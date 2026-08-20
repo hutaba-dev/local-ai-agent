@@ -84,6 +84,15 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertTrue(payload["activity"]["direct"])
         self.assertEqual(self.fake_client.requests[0]["url"], "http://127.0.0.1:8000/v1/chat/completions")
 
+    def test_web_ui_assets_are_not_cached(self) -> None:
+        client = TestClient(web_app.app)
+
+        index = client.get("/")
+        script = client.get("/static/app.js")
+
+        self.assertEqual(index.headers["cache-control"], "no-store")
+        self.assertEqual(script.headers["cache-control"], "no-store")
+
 
 if __name__ == "__main__":
     unittest.main()

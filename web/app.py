@@ -5,7 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -19,6 +19,14 @@ WEB_ROOT = Path(__file__).parent
 app = FastAPI(title="Local AI Agent Chat", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=WEB_ROOT / "static"), name="static")
 runtime = AgentRuntime()
+
+
+@app.middleware("http")
+async def disable_ui_cache(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path == "/" or request.url.path.startswith("/static/"):
+        response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 class ChatRequest(BaseModel):
