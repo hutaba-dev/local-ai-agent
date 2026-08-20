@@ -6,6 +6,32 @@ This repository is the source of truth for non-secret deployment configuration,
 operations scripts, and architecture decisions. The baseline server has one
 NVIDIA RTX PRO 6000 Blackwell GPU with 96 GiB VRAM.
 
+## What This Runs
+
+- **Qwen3.8-27B / vLLM**: private OpenAI-compatible model API on `127.0.0.1:8000`.
+- **Local Agent Runtime**: Main, Coding, Research, and Server instruction bundles with deterministic routing and fixed read-only tools.
+- **Browser Chat UI**: authenticated FastAPI chat service on `0.0.0.0:8080`; it calls the local runtime, never exposes vLLM directly.
+
+```mermaid
+flowchart LR
+	Browser[Authenticated browser] --> Web[FastAPI web chat :8080]
+	Web --> Runtime[AgentRuntime]
+	Runtime --> Main[Main / router]
+	Main --> Tools[Read-only specialist tools]
+	Runtime --> VLLM[Qwen vLLM :8000]
+	VLLM --> GPU[RTX PRO 6000 Blackwell 96 GiB]
+```
+
+## Quick Start
+
+```bash
+cd /root/local-ai-agent
+./scripts/start-vllm.sh
+./web/run.sh
+```
+
+The browser UI requires a manually created account. See [web/README.md](web/README.md) before exposing port `8080` to anyone else.
+
 ## Install
 
 ```bash
@@ -45,10 +71,15 @@ ssh -L 8000:127.0.0.1:8000 root@KIM_SERVER
 
 ## Browser Agent Test UI
 
-The optional LAN-only browser interface uses the local agent runtime rather than
-exposing vLLM to the browser. Start it with `./web/run.sh`, then open the
-server's LAN address on port `8080`. See [web/README.md](web/README.md) for the
-current address, API endpoints, and testing scope.
+The browser interface is an authenticated local-agent client, not a direct
+browser-to-vLLM client. It supports Main/Auto and specialist routing, Markdown
+answers, code-block copy, text-selection copy, short-term chat sessions, account
+switching, and automatic logout after 15 minutes without browser activity.
+
+Administrators provision `admin` and `guest` accounts from the server terminal.
+A single guest account may be shared; each browser login receives an isolated
+chat session. See [web/README.md](web/README.md) for account creation, the chat
+workflow, session behavior, and HTTPS requirements.
 
 ## systemd Service
 

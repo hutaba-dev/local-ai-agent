@@ -1,8 +1,28 @@
 # Local Agent Web Chat
 
-This LAN-only browser interface calls `runtime.AgentRuntime`, which loads the
-existing agent policy and instruction files before calling the localhost vLLM
-endpoint. It is not a direct browser-to-vLLM client.
+This browser interface calls `runtime.AgentRuntime`, which loads the existing
+agent policy and instruction files before calling the localhost vLLM endpoint.
+It is not a direct browser-to-vLLM client.
+
+```mermaid
+flowchart LR
+	User --> Login[Sign in]
+	Login --> Chat[Browser chat UI]
+	Chat --> Runtime[AgentRuntime]
+	Runtime --> Router[Main / specialist router]
+	Runtime --> Qwen[Qwen vLLM on localhost]
+```
+
+## Chat Experience
+
+- Choose **AUTO / Main** for normal delegation, or select Main, Coding, Research, or Server directly.
+- `Enter` sends a message; `Shift+Enter` creates a new line. Korean IME composition is handled before submission.
+- Requests are serialized while an answer is running, preventing duplicate trailing-character submissions.
+- Markdown headings, lists, quotes, inline code, and fenced code blocks render in the chat.
+- Code blocks include `Copy code`. For normal prose, select only the needed text to reveal `Copy selection`.
+- `New Chat` creates a fresh short-term session. Long-term memory is not changed.
+
+## Accounts And Sessions
 
 Start the UI from the repository root:
 
@@ -24,8 +44,26 @@ in shell history or the repository. Passwords must contain at least 8 characters
 
 Set `WEB_SESSION_SECRET` in the host `.env` before long-running use. The user
 database is stored at `local-memory/web-users.sqlite3` and is ignored by Git.
-The interface still uses HTTP by default. Do not expose it to the public
-internet until it is placed behind HTTPS.
+
+There is no public registration. An administrator creates accounts directly on
+the server. A single guest account may be shared by multiple people: each login
+receives a separate signed browser session and cannot reuse another browser's
+chat session ID. Shared credentials do not provide individual attribution or
+per-person revocation.
+
+The header shows the active account. **Switch account** logs out and returns to
+the login screen. A browser with no click, keyboard, input, scroll, or touch
+activity for 15 minutes is logged out automatically. The server cookie uses the
+same 15-minute sliding expiry.
+
+## Security Boundary
+
+The interface uses HTTP by default. HTTP does not encrypt passwords, chat
+content, or cookies in transit. Do not expose it to the public internet until
+it is placed behind HTTPS. For a public deployment, use a domain name and a
+reverse proxy such as Caddy to terminate TLS, then set `WEB_SECURE_COOKIE=1`.
+An IP address alone is generally not sufficient for a normal publicly trusted
+certificate.
 
 Endpoints:
 
