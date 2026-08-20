@@ -9,6 +9,14 @@ let sessionId = null;
 let composing = false;
 let compositionJustEnded = false;
 let sending = false;
+let selectedAssistantText = "";
+
+const selectionCopyButton = document.createElement("button");
+selectionCopyButton.className = "selection-copy";
+selectionCopyButton.type = "button";
+selectionCopyButton.textContent = "Copy selection";
+selectionCopyButton.hidden = true;
+document.body.append(selectionCopyButton);
 
 function escapeHtml(value) {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
@@ -55,30 +63,10 @@ function markdown(value) {
   return text.replace(/@@CODE(\d+)@@/g, (_, id) => codeBlocks[Number(id)]);
 }
 
-function addResponseCopyButton(article, content) {
-  if (!article.classList.contains("assistant") || article.querySelector(".copy-response")) return;
-  let header = article.querySelector(".message-header");
-  if (!header) {
-    header = document.createElement("div");
-    header.className = "message-header";
-    const label = article.querySelector(".message-label");
-    if (label) header.append(label);
-    article.prepend(header);
-  }
-  const button = document.createElement("button");
-  button.className = "copy-response";
-  button.type = "button";
-  button.setAttribute("aria-label", "Copy response");
-  button.textContent = "Copy";
-  button.addEventListener("click", () => copyText(content, button, "Copied"));
-  header.append(button);
-}
-
 function addMessage(role, content, label, activity) {
   const article = document.createElement("article");
   article.className = `message ${role}`;
   article.innerHTML = `<div class="message-header"><div class="message-label">${escapeHtml(label)}</div></div><div class="markdown">${markdown(content)}</div>`;
-  addResponseCopyButton(article, content);
   if (activity) article.append(activityElement(activity));
   messages.append(article);
   article.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -115,6 +103,31 @@ function legacyCopy(value) {
   const copied = document.execCommand("copy");
   temporaryInput.remove();
   if (!copied) throw new Error("clipboard copy was rejected");
+}
+
+function hideSelectionCopyButton() {
+  selectedAssistantText = "";
+  selectionCopyButton.hidden = true;
+}
+
+function updateSelectionCopyButton() {
+  const selection = document.getSelection();
+  const text = selection?.toString().trim() || "";
+  if (!selection?.rangeCount || !text) {
+    hideSelectionCopyButton();
+    return;
+  }
+  const node = selection.getRangeAt(0).commonAncestorContainer;
+  const element = node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+  if (!element?.closest(".message.assistant .markdown")) {
+    hideSelectionCopyButton();
+    return;
+  }
+  const rect = selection.getRangeAt(0).getBoundingClientRect();
+  selectedAssistantText = text;
+  selectionCopyButton.style.top = `${Math.max(8, rect.top - 38)}px`;
+  selectionCopyButton.style.left = `${Math.min(window.innerWidth - 132, Math.max(8, rect.left))}px`;
+  selectionCopyButton.hidden = false;
 }
 
 function activityElement(activity) {
@@ -188,10 +201,10 @@ input.addEventListener("keydown", (event) => {
   }
 });
 newChatButton.addEventListener("click", newSession);
-
-for (const article of messages.querySelectorAll(".message.assistant")) {
-  addResponseCopyButton(article, article.querySelector(".markdown")?.innerText || "");
-}
+document.addEventListener("selectionchange", updateSelectionCopyButton);
+document.addEventListener("scroll", hideSelectionCopyButton, true);
+selectionCopyButton.addEventListener("mousedown", (event) => event.preventDefault());
+selectionCopyButton.addEventListener("click", () => copyText(selectedAssistantText, selectionCopyButton, "Copied"));
 
 async function initialize() {
   try {

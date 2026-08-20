@@ -34,8 +34,9 @@ button.secondary { color: var(--ink); background: var(--panel); }
 .message.user { align-self: flex-end; background: var(--user); }
 .message-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 9px; }
 .message-label { color: var(--muted); font: 700 12px/1.2 ui-monospace, monospace; }
-.copy-response, .copy-code { border: 1px solid #b9cbbd; border-radius: 4px; background: #f8fbf7; color: var(--accent-dark); padding: 5px 8px; font: 700 11px/1 ui-monospace, monospace; }
-.copy-response:hover, .copy-code:hover { background: #e3efe5; }
+.copy-code, .selection-copy { border: 1px solid #b9cbbd; border-radius: 4px; background: #f8fbf7; color: var(--accent-dark); padding: 5px 8px; font: 700 11px/1 ui-monospace, monospace; }
+.copy-code:hover, .selection-copy:hover { background: #e3efe5; }
+.selection-copy { position: fixed; z-index: 10; box-shadow: 0 2px 8px rgb(0 0 0 / 14%); }
 .markdown { line-height: 1.55; overflow-wrap: anywhere; }
 .markdown p { margin: 0 0 12px; }
 .markdown p:last-child { margin-bottom: 0; }
