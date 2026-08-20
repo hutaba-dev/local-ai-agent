@@ -15,6 +15,7 @@ import httpx
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 NAVER_ENDPOINT = "https://openapi.naver.com/v1/search/webkr.json"
 REDDIT_ENDPOINT = "https://www.reddit.com/search.json"
+OPENALEX_WORKS_ENDPOINT = "https://api.openalex.org/works"
 KOREAN_PATTERN = re.compile(r"[\uac00-\ud7a3]")
 USER_AGENT = "local-ai-agent-research/0.1"
 MAX_SOURCE_COUNT = 5
@@ -75,6 +76,64 @@ def search(query: str, mode: str) -> list[dict[str, str]]:
         detail = "; ".join(errors) or "no configured search provider returned results"
         raise RuntimeError(f"web search is required but unavailable: {detail}")
     return [asdict(result) for result in _unique(results)[:result_count]]
+
+
+def search_many(queries: tuple[str, ...], mode: str) -> list[dict[str, str]]:
+    """Search each bounded research query and deduplicate the combined results."""
+    results: list[SearchResult] = []
+    errors: list[str] = []
+    for query in queries:
+        try:
+            results.extend(SearchResult(**result) for result in search(query, mode))
+        except RuntimeError as error:
+            errors.append(str(error))
+    unique = [asdict(result) for result in _unique(results)]
+    if not unique:
+        raise RuntimeError("; ".join(errors) or "no search results were returned")
+    return unique[:24]
+
+
+def academic_papers(queries: tuple[str, ...], limit_per_query: int = 3) -> list[dict[str, object]]:
+    """Retrieve public, structured work metadata from OpenAlex for Deep Research."""
+    papers: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for query in queries:
+        try:
+            response = httpx.get(
+                OPENALEX_WORKS_ENDPOINT,
+                params={"search": query, "per-page": limit_per_query, "select": "id,doi,title,publication_date,cited_by_count,authorships,primary_location"},
+                headers={"User-Agent": USER_AGENT},
+                timeout=12,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError:
+            continue
+        for work in response.json().get("results", []):
+            if not isinstance(work, dict) or not isinstance(work.get("title"), str):
+                continue
+            identifier = work.get("doi") or work.get("id")
+            if not isinstance(identifier, str) or identifier in seen:
+                continue
+            seen.add(identifier)
+            authorships = work.get("authorships", [])
+            authors = [
+                author["author"]["display_name"]
+                for author in authorships
+                if isinstance(author, dict) and isinstance(author.get("author"), dict)
+                and isinstance(author["author"].get("display_name"), str)
+            ][:12]
+            location = work.get("primary_location")
+            source = location.get("source") if isinstance(location, dict) else None
+            papers.append({
+                "title": work["title"],
+                "doi": work.get("doi"),
+                "openalex_url": work.get("id"),
+                "publication_date": work.get("publication_date"),
+                "cited_by_count": work.get("cited_by_count"),
+                "authors": authors,
+                "venue": source.get("display_name") if isinstance(source, dict) else None,
+            })
+    return papers[:12]
 
 
 def fetch_sources(results: list[dict[str, str]], limit: int = MAX_SOURCE_COUNT) -> list[dict[str, str]]:

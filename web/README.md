@@ -93,13 +93,16 @@ external evidence:
 - **Deep research**: multi-source comparisons, reports, recommendations, and medical, legal, financial, or contested claims. Uses at most 8 results.
 
 Search runs only through the Research Agent's bounded `web_search` tool. Korean
-queries prefer Naver when it is configured; global queries use Brave. Deep
-research fetches up to five public HTTPS HTML sources from the bounded result
-set, after rejecting private-network targets, redirects to them, and non-HTML
-responses. Those source texts, not search snippets, are the basis for factual
-claims and adjacent URL citations. Reddit is non-authoritative context only.
-If no source text is available, the answer must label itself a limited
-search-result overview instead of presenting unverified details as facts.
+queries prefer Naver when it is configured; global queries use Brave. For Deep
+Research, the model first creates two to four complementary research queries,
+then the runtime collects deduplicated search results, up to five public HTTPS
+HTML sources, and public OpenAlex work metadata. OpenAlex is used for structured
+title, DOI, date, venue, author, and citation fields; it is not treated as a
+complete quality judgement. Those source texts and structured metadata, not
+search snippets, are the basis for factual claims and adjacent URL citations.
+Reddit is non-authoritative context only. If no source text is available, the
+answer must label itself a limited search-result overview instead of presenting
+unverified details as facts.
 
 The initial provider is Brave Search. The existing **Search** API subscription is
 sufficient; Brave Answers is not used or required. Create an API key with Brave, then place

@@ -11,6 +11,7 @@ from time import perf_counter
 import httpx
 
 from runtime.web_search import search
+from runtime.web_search import academic_papers, search_many
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -28,7 +29,7 @@ class ToolResult:
 
 def run_agent_tools(
     agent: str,
-    message: str,
+    message: str | tuple[str, ...],
     search_mode: str = "NO_SEARCH",
     allow_local_tools: bool = True,
 ) -> list[dict[str, object]]:
@@ -63,6 +64,7 @@ def _research_tools(message: str, search_mode: str, allow_local_tools: bool = Tr
         results.append(web_result)
         if search_mode == "DEEP_RESEARCH" and web_result.success:
             results.append(_web_sources(web_result.output))
+            results.append(_academic_papers(_queries(message)))
     return results
 
 
@@ -93,10 +95,14 @@ def _command(name: str, command: list[str], cwd: Path | None = None) -> ToolResu
         return ToolResult(name, False, "", str(error), round((perf_counter() - started) * 1000))
 
 
-def _web_search(message: str, search_mode: str) -> ToolResult:
+def _queries(message: str | tuple[str, ...]) -> tuple[str, ...]:
+    return (message,) if isinstance(message, str) else message
+
+
+def _web_search(message: str | tuple[str, ...], search_mode: str) -> ToolResult:
     started = perf_counter()
     try:
-        return ToolResult("web_search", True, json.dumps(search(message, search_mode), ensure_ascii=False), None, round((perf_counter() - started) * 1000))
+        return ToolResult("web_search", True, json.dumps(search_many(_queries(message), search_mode), ensure_ascii=False), None, round((perf_counter() - started) * 1000))
     except (RuntimeError, httpx.HTTPError) as error:
         return ToolResult("web_search", False, "", str(error), round((perf_counter() - started) * 1000))
 
@@ -115,3 +121,14 @@ def _web_sources(search_output: str) -> ToolResult:
         return ToolResult("web_sources", True, json.dumps(sources, ensure_ascii=False), None, round((perf_counter() - started) * 1000))
     except (RuntimeError, ValueError, json.JSONDecodeError, httpx.HTTPError) as error:
         return ToolResult("web_sources", False, "", str(error), round((perf_counter() - started) * 1000))
+
+
+def _academic_papers(queries: tuple[str, ...]) -> ToolResult:
+    started = perf_counter()
+    try:
+        papers = academic_papers(queries)
+        if not papers:
+            raise RuntimeError("OpenAlex returned no matching academic works")
+        return ToolResult("academic_papers", True, json.dumps(papers, ensure_ascii=False), None, round((perf_counter() - started) * 1000))
+    except (RuntimeError, httpx.HTTPError) as error:
+        return ToolResult("academic_papers", False, "", str(error), round((perf_counter() - started) * 1000))

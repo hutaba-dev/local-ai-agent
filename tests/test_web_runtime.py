@@ -1,3 +1,4 @@
+from runtime.web_search import academic_papers, fetch_sources, search
 import os
 import unittest
 from pathlib import Path
@@ -36,7 +37,7 @@ class FakeClient:
 class SearchDecisionClient(FakeClient):
     def post(self, url: str, json: dict[str, object]) -> FakeResponse:
         self.requests.append({"url": url, "json": json})
-        content = '{"search_mode":"QUICK_SEARCH","query":"Seoul weather"}' if len(self.requests) == 1 else "web-verified answer"
+        content = '{"search_mode":"QUICK_SEARCH","queries":["Seoul weather"],"focus":["current weather"]}' if len(self.requests) == 1 else "web-verified answer"
         response = FakeResponse()
         response.json = lambda: {  # type: ignore[method-assign]
             "choices": [{"message": {"content": content}}],
@@ -79,6 +80,22 @@ class SourceResponse:
 
     def raise_for_status(self) -> None:
         return None
+
+
+class OpenAlexResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, object]:
+        return {"results": [{
+            "id": "https://openalex.org/W1",
+            "doi": "https://doi.org/10.1000/example",
+            "title": "Evidence Paper",
+            "publication_date": "2025-01-01",
+            "cited_by_count": 12,
+            "authorships": [{"author": {"display_name": "Researcher"}}],
+            "primary_location": {"source": {"display_name": "Journal"}},
+        }]}
 
 
 class WebRuntimeTests(unittest.TestCase):
@@ -256,7 +273,7 @@ class WebRuntimeTests(unittest.TestCase):
             web_app.runtime = previous_runtime
 
         self.assertEqual(response.status_code, 200)
-        run_tools.assert_called_once_with("research", "수소 연구를 요약해줘", "NO_SEARCH", False)
+        run_tools.assert_called_once_with("research", ("수소 연구를 요약해줘",), "NO_SEARCH", False)
         self.assertEqual(run_agent_tools("research", "수소 연구를 요약해줘", allow_local_tools=False), [])
 
     def test_admin_browser_research_has_no_local_project_tools(self) -> None:
@@ -270,7 +287,7 @@ class WebRuntimeTests(unittest.TestCase):
             web_app.runtime = previous_runtime
 
         self.assertEqual(response.status_code, 200)
-        run_tools.assert_called_once_with("research", "수소 연구를 요약해줘", "NO_SEARCH", False)
+        run_tools.assert_called_once_with("research", ("수소 연구를 요약해줘",), "NO_SEARCH", False)
 
     def test_guest_legacy_session_is_replaced_before_history_is_used(self) -> None:
         old_session = self.runtime.new_session()
@@ -306,7 +323,7 @@ class WebRuntimeTests(unittest.TestCase):
 
         self.assertEqual(runtime._search_mode("현재 repository 구조를 실제로 확인해줘"), "QUICK_SEARCH")
         decision_request = client.requests[0]["json"]
-        self.assertEqual(decision_request["max_tokens"], 128)
+        self.assertEqual(decision_request["max_tokens"], 256)
         self.assertEqual(
             decision_request["messages"][1],
             {"role": "user", "content": "현재 repository 구조를 실제로 확인해줘"},
@@ -316,7 +333,7 @@ class WebRuntimeTests(unittest.TestCase):
         class DeepResearchDecisionClient(FakeClient):
             def post(self, url: str, json: dict[str, object]) -> FakeResponse:
                 self.requests.append({"url": url, "json": json})
-                content = '{"search_mode":"DEEP_RESEARCH","query":"liquefied hydrogen storage papers 2024 2026"}' if len(self.requests) == 1 else "web-verified answer"
+                content = '{"search_mode":"DEEP_RESEARCH","queries":["liquefied hydrogen storage papers 2024 2026","liquefied hydrogen storage review"],"focus":["recent papers","reviews"]}' if len(self.requests) == 1 else "web-verified answer"
                 response = FakeResponse()
                 response.json = lambda: {  # type: ignore[method-assign]
                     "choices": [{"message": {"content": content}}],
@@ -331,7 +348,7 @@ class WebRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result.route.agent, "research")
         self.assertEqual(result.route.search_mode, "DEEP_RESEARCH")
-        run_tools.assert_called_once_with("research", "liquefied hydrogen storage papers 2024 2026", "DEEP_RESEARCH", True)
+        run_tools.assert_called_once_with("research", ("liquefied hydrogen storage papers 2024 2026", "liquefied hydrogen storage review"), "DEEP_RESEARCH", True)
 
     def test_research_uses_larger_output_budget_and_marks_truncation(self) -> None:
         class TruncatedResponse(FakeResponse):
@@ -348,7 +365,7 @@ class WebRuntimeTests(unittest.TestCase):
         client = TruncatedClient()
         result = AgentRuntime(client=client).chat("논문을 분석해줘", "research")
 
-        self.assertEqual(client.requests[0]["json"]["max_tokens"], 3072)
+        self.assertEqual(client.requests[0]["json"]["max_tokens"], 4096)
         self.assertIn("truncated", result.content)
 
     def test_brave_search_limits_quick_results(self) -> None:
@@ -382,6 +399,22 @@ class WebRuntimeTests(unittest.TestCase):
         results = [{"title": "Private", "url": "https://127.0.0.1/private", "description": ""}]
 
         self.assertEqual(fetch_sources(results), [])
+
+    def test_academic_search_returns_structured_work_metadata(self) -> None:
+        with patch("runtime.web_search.httpx.get", return_value=OpenAlexResponse()) as get:
+            papers = academic_papers(("liquid hydrogen storage",))
+
+        self.assertEqual(papers[0]["title"], "Evidence Paper")
+        self.assertEqual(papers[0]["cited_by_count"], 12)
+        self.assertEqual(get.call_args.args[0], "https://api.openalex.org/works")
+
+    def test_academic_search_returns_structured_work_metadata(self) -> None:
+        with patch("runtime.web_search.httpx.get", return_value=OpenAlexResponse()) as get:
+            papers = academic_papers(("liquid hydrogen storage",))
+
+        self.assertEqual(papers[0]["title"], "Evidence Paper")
+        self.assertEqual(papers[0]["cited_by_count"], 12)
+        self.assertEqual(get.call_args.args[0], "https://api.openalex.org/works")
 
 
 if __name__ == "__main__":
