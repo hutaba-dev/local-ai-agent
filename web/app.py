@@ -191,9 +191,16 @@ async def chat(request: ChatRequest, http_request: Request) -> dict[str, object]
     chat_session_roles[result.session_id] = user.role
     usage = result.usage or {}
     completion_tokens = usage.get("completion_tokens")
-    tokens_per_second = None
+    end_to_end_tokens_per_second = None
     if isinstance(completion_tokens, int) and result.duration_ms > 0:
-        tokens_per_second = round(completion_tokens / (result.duration_ms / 1000), 1)
+        end_to_end_tokens_per_second = round(completion_tokens / (result.duration_ms / 1000), 1)
+    total_input_tokens = sum(
+        call["input_tokens"] for call in result.llm_calls if isinstance(call.get("input_tokens"), int)
+    )
+    total_output_tokens = sum(
+        call["output_tokens"] for call in result.llm_calls if isinstance(call.get("output_tokens"), int)
+    )
+    final_call = result.llm_calls[-1] if result.llm_calls else None
     return {
         "session_id": result.session_id,
         "content": result.content,
@@ -205,6 +212,15 @@ async def chat(request: ChatRequest, http_request: Request) -> dict[str, object]
             "tools": result.tools,
             "duration_ms": result.duration_ms,
             "usage": usage,
-            "tokens_per_second": tokens_per_second,
+            "end_to_end_tokens_per_second": end_to_end_tokens_per_second,
+            "llm_calls": result.llm_calls,
+            "stages": result.stages,
+            "research_rounds": 1 if result.route.search_mode == "DEEP_RESEARCH" else 0,
+            "whole_request_usage": {
+                "input_tokens": total_input_tokens,
+                "output_tokens": total_output_tokens,
+                "llm_call_count": len(result.llm_calls),
+            },
+            "final_call": final_call,
         },
     }

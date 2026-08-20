@@ -135,16 +135,45 @@ function updateSelectionCopyButton() {
 
 function activityElement(activity) {
   const details = document.createElement("details");
-  const tools = activity.tools.map((tool) => `<div class="${tool.success ? "tool-ok" : "tool-failed"}">${tool.success ? "✓" : "!"} ${escapeHtml(tool.name)} (${tool.duration_ms} ms)</div>`).join("") || "No tools called";
+  const tools = activity.tools.map((tool) => toolActivity(tool)).join("") || "No tools called";
   const usage = activity.usage || {};
+  const wholeUsage = activity.whole_request_usage || {};
+  const finalCall = activity.final_call || {};
+  const llmCalls = (activity.llm_calls || []).map((call) => (
+    `<div>#${escapeHtml(String(call.call_id))} ${escapeHtml(call.purpose)}: ${formatMs(call.total_llm_latency_ms)}${call.decode_tokens_per_second ? `, ${escapeHtml(String(call.decode_tokens_per_second))} tok/s decode` : ""}</div>`
+  )).join("") || "No model calls recorded";
+  const stages = (activity.stages || []).map((stage) => (
+    `<div>${escapeHtml(stage.name)}: ${formatMs(stage.duration_ms)}</div>`
+  )).join("") || "No timed stages";
   const rows = [
     ["Selected", activity.selected_agent], ["Route", activity.direct ? `Direct ${activity.routed_agent}` : `Main → ${activity.routed_agent}`],
     ["Summary", activity.route_summary], ["Time", `${(activity.duration_ms / 1000).toFixed(1)} sec`],
-    ["Input tokens", usage.prompt_tokens ?? "N/A"], ["Output tokens", usage.completion_tokens ?? "N/A"],
-    ["Speed", activity.tokens_per_second ? `${activity.tokens_per_second} tok/s` : "N/A"], ["Tools", tools],
+    ["End-to-end rate", activity.end_to_end_tokens_per_second ? `${activity.end_to_end_tokens_per_second} tok/s` : "N/A"],
+    ["Final synthesis input", usage.prompt_tokens ?? "N/A"], ["Final synthesis output", usage.completion_tokens ?? "N/A"],
+    ["Final synthesis TTFT", formatMs(finalCall.ttft_ms)], ["Final synthesis decode", formatMs(finalCall.generation_time_ms)],
+    ["Final synthesis decode speed", finalCall.decode_tokens_per_second ? `${finalCall.decode_tokens_per_second} tok/s` : "N/A"],
+    ["Research rounds", activity.research_rounds ? `${activity.research_rounds} / 1` : "N/A"],
+    ["LLM calls", wholeUsage.llm_call_count ?? 0], ["Whole LLM input", wholeUsage.input_tokens ?? 0],
+    ["Whole LLM output", wholeUsage.output_tokens ?? 0], ["Stages", stages], ["LLM timing", llmCalls], ["Tools", tools],
   ];
   details.innerHTML = `<summary>Agent Activity</summary><div class="activity-grid">${rows.map(([key, value]) => `<strong>${escapeHtml(key)}</strong><span>${value}</span>`).join("")}</div>`;
   return details;
+}
+
+function formatMs(value) {
+  return typeof value === "number" ? `${(value / 1000).toFixed(1)} sec` : "N/A";
+}
+
+function toolActivity(tool) {
+  const details = tool.details || {};
+  const reason = details.failure_reason ? `: ${escapeHtml(details.failure_reason)}` : "";
+  const requests = (details.requests || []).map((request) => (
+    `<div>${request.success ? "✓" : "!"} ${escapeHtml(request.path || request.query || request.operation || "request")} (${formatMs(request.duration_ms)})${request.attempt ? ` attempt ${escapeHtml(String(request.attempt))}` : ""}${request.failure_reason ? `: ${escapeHtml(request.failure_reason)}` : ""}</div>`
+  )).join("");
+  const fetches = (details.fetches || []).map((fetch) => (
+    `<div>${fetch.success ? "✓" : "!"} ${escapeHtml(fetch.url)} (${formatMs(fetch.total_fetch_time_ms)}, ${fetch.text_length ?? 0} chars${fetch.connect_time_ms === null ? ", connect N/A" : ""})${fetch.failure_reason ? `: ${escapeHtml(fetch.failure_reason)}` : ""}</div>`
+  )).join("");
+  return `<div class="${tool.success ? "tool-ok" : "tool-failed"}">${tool.success ? "✓" : "!"} ${escapeHtml(tool.name)} (${formatMs(tool.duration_ms)})${reason}${requests}${fetches}</div>`;
 }
 
 async function request(path, options = {}) {

@@ -7,7 +7,7 @@ import re
 import ipaddress
 import socket
 import re
-from time import sleep
+from time import perf_counter, sleep
 from dataclasses import asdict, dataclass
 from html.parser import HTMLParser
 from urllib.parse import urljoin, urlparse
@@ -110,11 +110,17 @@ def _relevance_score(result: SearchResult, terms: tuple[str, ...]) -> int:
     return sum(1 for term in terms if term in haystack)
 
 
-def academic_papers(queries: tuple[str, ...], limit_per_query: int = 3) -> list[dict[str, object]]:
+def academic_papers(
+    queries: tuple[str, ...],
+    limit_per_query: int = 3,
+    diagnostics: list[dict[str, object]] | None = None,
+) -> list[dict[str, object]]:
     """Retrieve public, structured work metadata from OpenAlex for Deep Research."""
     papers: list[dict[str, object]] = []
     seen: set[str] = set()
     for query in queries:
+        started = perf_counter()
+        record: dict[str, object] = {"query": query, "success": False}
         try:
             response = httpx.get(
                 OPENALEX_WORKS_ENDPOINT,
@@ -123,9 +129,21 @@ def academic_papers(queries: tuple[str, ...], limit_per_query: int = 3) -> list[
                 timeout=12,
             )
             response.raise_for_status()
-        except httpx.HTTPError:
+        except httpx.HTTPError as error:
+            record["failure_reason"] = _http_failure_reason(error)
+            record["duration_ms"] = round((perf_counter() - started) * 1000)
+            if diagnostics is not None:
+                diagnostics.append(record)
             continue
-        for work in response.json().get("results", []):
+        works = response.json().get("results", [])
+        record.update({
+            "success": True,
+            "duration_ms": round((perf_counter() - started) * 1000),
+            "result_count": len(works) if isinstance(works, list) else 0,
+        })
+        if diagnostics is not None:
+            diagnostics.append(record)
+        for work in works:
             if not isinstance(work, dict) or not isinstance(work.get("title"), str):
                 continue
             identifier = work.get("doi") or work.get("id")
@@ -202,17 +220,23 @@ def s2_get_paper(paper_id: str) -> dict[str, object]:
     return _s2_paper_record(payload)
 
 
-def semantic_scholar_evidence(query: str, author_hints: tuple[str, ...] = ()) -> dict[str, object] | None:
+def semantic_scholar_evidence(
+    query: str,
+    author_hints: tuple[str, ...] = (),
+    diagnostics: list[dict[str, object]] | None = None,
+) -> dict[str, object] | None:
     """Best-effort author and representative-paper cross-check for an evidence gap."""
     try:
         candidates: list[dict[str, object]] = []
         selected_query = query
         for candidate_query in (*_s2_author_queries(query), *author_hints):
-            candidates = s2_search_author(candidate_query)
+            candidates = _s2_search_author(candidate_query, diagnostics)
             if candidates:
                 selected_query = candidate_query
                 break
         if not candidates:
+            if diagnostics is not None:
+                diagnostics.append({"operation": "author_resolution", "success": False, "failure_reason": "no_matching_author"})
             return None
         candidate = _select_s2_author(candidates, selected_query, query)
         if candidate is None:
@@ -220,8 +244,8 @@ def semantic_scholar_evidence(query: str, author_hints: tuple[str, ...] = ()) ->
         author_id = candidate["author_id"]
         if not isinstance(author_id, str):
             return None
-        author = s2_get_author(author_id)
-        papers = s2_get_author_papers(author_id)
+        author = _s2_get_author(author_id, diagnostics)
+        papers = _s2_get_author_papers(author_id, diagnostics)
         exact_name_matches = [
             candidate for candidate in candidates
             if isinstance(candidate.get("name"), str)
@@ -233,7 +257,9 @@ def semantic_scholar_evidence(query: str, author_hints: tuple[str, ...] = ()) ->
             "identity_status": "ambiguous" if len(exact_name_matches) > 1 else "matched",
             "same_name_candidate_count": len(exact_name_matches),
         }
-    except (RuntimeError, httpx.HTTPError, ValueError):
+    except (RuntimeError, httpx.HTTPError, ValueError) as error:
+        if diagnostics is not None:
+            diagnostics.append({"operation": "semantic_scholar", "success": False, "failure_reason": _http_failure_reason(error)})
         return None
 
 
@@ -284,12 +310,13 @@ def unpaywall_oa_locations(papers: list[dict[str, object]], limit: int = 3) -> l
     return locations
 
 
-def _s2_get(path: str, params: dict[str, object]) -> dict[str, object]:
+def _s2_get(path: str, params: dict[str, object], diagnostics: list[dict[str, object]] | None = None) -> dict[str, object]:
     headers = {"User-Agent": USER_AGENT}
     if api_key := os.getenv("S2_API_KEY"):
         headers["x-api-key"] = api_key
     last_error: httpx.HTTPError | None = None
     for attempt in range(S2_MAX_ATTEMPTS):
+        started = perf_counter()
         try:
             response = httpx.get(f"{S2_API_BASE}{path}", params=params, headers=headers, timeout=12)
             status_code = getattr(response, "status_code", 200)
@@ -299,9 +326,13 @@ def _s2_get(path: str, params: dict[str, object]) -> dict[str, object]:
             payload = response.json()
             if not isinstance(payload, dict):
                 raise ValueError("Semantic Scholar returned an invalid response")
+            if diagnostics is not None:
+                diagnostics.append({"path": path, "attempt": attempt + 1, "success": True, "duration_ms": round((perf_counter() - started) * 1000)})
             return payload
         except httpx.HTTPStatusError as error:
             last_error = error
+            if diagnostics is not None:
+                diagnostics.append({"path": path, "attempt": attempt + 1, "success": False, "duration_ms": round((perf_counter() - started) * 1000), "failure_reason": _http_failure_reason(error)})
             if error.response.status_code != 429 and error.response.status_code < 500:
                 raise
             if attempt < S2_MAX_ATTEMPTS - 1:
@@ -309,6 +340,40 @@ def _s2_get(path: str, params: dict[str, object]) -> dict[str, object]:
     if last_error:
         raise last_error
     raise RuntimeError("Semantic Scholar request failed")
+
+
+def _s2_search_author(query: str, diagnostics: list[dict[str, object]] | None) -> list[dict[str, object]]:
+    payload = _s2_get("/author/search", {"query": query, "limit": 5, "fields": "name,paperCount,citationCount,hIndex,affiliations"}, diagnostics)
+    return [
+        {
+            "author_id": candidate.get("authorId"), "name": candidate.get("name"), "paper_count": candidate.get("paperCount"),
+            "citation_count": candidate.get("citationCount"), "h_index": candidate.get("hIndex"), "affiliations": candidate.get("affiliations", []),
+        }
+        for candidate in payload.get("data", [])
+        if isinstance(candidate, dict) and isinstance(candidate.get("authorId"), str)
+    ]
+
+
+def _s2_get_author(author_id: str, diagnostics: list[dict[str, object]] | None) -> dict[str, object]:
+    payload = _s2_get(f"/author/{author_id}", {"fields": "name,paperCount,citationCount,hIndex,affiliations"}, diagnostics)
+    return {"author_id": author_id, "name": payload.get("name"), "paper_count": payload.get("paperCount"), "citation_count": payload.get("citationCount"), "h_index": payload.get("hIndex"), "affiliations": payload.get("affiliations", [])}
+
+
+def _s2_get_author_papers(author_id: str, diagnostics: list[dict[str, object]] | None) -> list[dict[str, object]]:
+    payload = _s2_get(f"/author/{author_id}/papers", {"limit": 6, "fields": "title,year,citationCount,externalIds,venue,authors,abstract"}, diagnostics)
+    return [_s2_paper_record(paper) for paper in payload.get("data", []) if isinstance(paper, dict)]
+
+
+def _http_failure_reason(error: BaseException) -> str:
+    if isinstance(error, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(error, httpx.HTTPStatusError):
+        return f"http_{error.response.status_code}"
+    if isinstance(error, httpx.HTTPError):
+        return "network_error"
+    if isinstance(error, ValueError):
+        return "parsing_error"
+    return "request_error"
 
 
 def _s2_author_queries(query: str) -> tuple[str, ...]:
@@ -378,23 +443,39 @@ def _s2_paper_record(paper: dict[str, object]) -> dict[str, object]:
     }
 
 
-def fetch_sources(results: list[dict[str, str]], limit: int = MAX_SOURCE_COUNT) -> list[dict[str, str]]:
+def fetch_sources(
+    results: list[dict[str, str]],
+    limit: int = MAX_SOURCE_COUNT,
+    include_metrics: bool = False,
+) -> list[dict[str, str]] | tuple[list[dict[str, str]], list[dict[str, object]]]:
     """Fetch bounded text from public HTTPS result URLs for Deep Research.
 
     URLs are provider output but remain untrusted. Block private network targets,
     validate each redirect, and accept HTML only.
     """
     sources: list[dict[str, str]] = []
+    fetches: list[dict[str, object]] = []
     for result in results:
         if len(sources) >= limit:
             break
         url = result.get("url")
         if not isinstance(url, str):
             continue
+        started = perf_counter()
+        measurement: dict[str, object] = {
+            "url": url,
+            "execution": "sequential",
+            # httpx's high-level sync API does not expose TCP connect timing.
+            "connect_time_ms": None,
+            "success": False,
+            "bytes": None,
+            "text_length": 0,
+        }
         try:
             response, final_url = _safe_fetch(url)
             content_type = response.headers.get("content-type", "").lower()
             if "text/html" not in content_type:
+                measurement["failure_reason"] = "non_html_content"
                 continue
             extractor = _TextExtractor()
             extractor.feed(response.text[:MAX_SOURCE_CHARS * 3])
@@ -405,9 +486,32 @@ def fetch_sources(results: list[dict[str, str]], limit: int = MAX_SOURCE_COUNT) 
                     "url": final_url,
                     "text": text,
                 })
-        except (OSError, ValueError, httpx.HTTPError):
-            continue
-    return sources
+                measurement.update({
+                    "url": final_url,
+                    "success": True,
+                    "bytes": len(response.text.encode("utf-8")),
+                    "text_length": len(text),
+                })
+            else:
+                measurement["failure_reason"] = "empty_extracted_text"
+        except (OSError, ValueError, httpx.HTTPError) as error:
+            measurement["failure_reason"] = _fetch_failure_reason(error)
+        finally:
+            measurement["total_fetch_time_ms"] = round((perf_counter() - started) * 1000)
+            fetches.append(measurement)
+    return (sources, fetches) if include_metrics else sources
+
+
+def _fetch_failure_reason(error: BaseException) -> str:
+    if isinstance(error, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(error, httpx.HTTPStatusError):
+        return f"http_{error.response.status_code}"
+    if isinstance(error, httpx.HTTPError):
+        return "network_error"
+    if isinstance(error, ValueError):
+        return "validation_or_redirect_error"
+    return "fetch_error"
 
 
 def _safe_fetch(url: str) -> tuple[httpx.Response, str]:

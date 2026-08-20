@@ -8,6 +8,7 @@ import re
 from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter
+from typing import Callable, TypeVar
 
 import httpx
 
@@ -38,12 +39,61 @@ class ChatResult:
     tools: list[dict[str, object]]
     duration_ms: int
     usage: dict[str, int] | None
+    llm_calls: list[dict[str, object]]
+    stages: list[dict[str, object]]
 
 
 @dataclass(frozen=True)
 class SearchDecision:
     mode: str
     queries: tuple[str, ...] = ()
+
+
+T = TypeVar("T")
+
+
+class LatencyRecorder:
+    def __init__(self) -> None:
+        self.llm_calls: list[dict[str, object]] = []
+        self.stages: list[dict[str, object]] = []
+
+    def stage(self, name: str, operation: Callable[[], T]) -> T:
+        started = perf_counter()
+        try:
+            return operation()
+        finally:
+            self.stages.append({"name": name, "duration_ms": round((perf_counter() - started) * 1000)})
+
+    def llm_call(
+        self,
+        purpose: str,
+        payload: dict[str, object],
+        started: float,
+        first_token_at: float | None,
+        finished: float,
+    ) -> None:
+        usage = payload.get("usage")
+        usage = usage if isinstance(usage, dict) else {}
+        input_tokens = usage.get("prompt_tokens")
+        output_tokens = usage.get("completion_tokens")
+        ttft_seconds = first_token_at - started if first_token_at else None
+        generation_seconds = finished - first_token_at if first_token_at else None
+        decode_tokens_per_second = (
+            output_tokens / generation_seconds
+            if isinstance(output_tokens, int) and generation_seconds and generation_seconds > 0
+            else None
+        )
+        self.llm_calls.append({
+            "call_id": len(self.llm_calls) + 1,
+            "purpose": purpose,
+            "model": MODEL,
+            "input_tokens": input_tokens if isinstance(input_tokens, int) else None,
+            "output_tokens": output_tokens if isinstance(output_tokens, int) else None,
+            "ttft_ms": round(ttft_seconds * 1000) if ttft_seconds is not None else None,
+            "generation_time_ms": round(generation_seconds * 1000) if generation_seconds is not None else None,
+            "total_llm_latency_ms": round((finished - started) * 1000),
+            "decode_tokens_per_second": round(decode_tokens_per_second, 2) if decode_tokens_per_second else None,
+        })
 
 
 class AgentRuntime:
@@ -65,17 +115,24 @@ class AgentRuntime:
         if not message.strip():
             raise ValueError("message must not be empty")
         started = perf_counter()
+        latency = LatencyRecorder()
         session = self.sessions.get_or_create(session_id)
-        decision = self._search_decision(message) if selected_agent == "auto" else SearchDecision("NO_SEARCH")
+        decision = latency.stage(
+            "research_mode_decision",
+            lambda: self._search_decision(message, latency),
+        ) if selected_agent == "auto" else SearchDecision("NO_SEARCH")
         search_mode = decision.mode
         route = route_request(message, selected_agent, search_mode)
         if allowed_agents is not None and route.agent not in allowed_agents:
             raise PermissionError("This account is not permitted to access the requested capability.")
         tool_message = (message, *decision.queries) if search_mode == "DEEP_RESEARCH" else (decision.queries or (message,))
-        tools = run_agent_tools(route.agent, tool_message, route.search_mode, allow_local_tools) if route.agent != "main" else []
+        tools = latency.stage(
+            "research_round_1_tools",
+            lambda: run_agent_tools(route.agent, tool_message, route.search_mode, allow_local_tools),
+        ) if route.agent != "main" else []
         system_prompt = self._load_prompt(route.agent)
         if route.agent == "research" and route.search_mode == "DEEP_RESEARCH":
-            answer, payload = self._synthesize_research(message, tools, system_prompt)
+            answer, payload = self._synthesize_research(message, tools, system_prompt, latency)
         else:
             public_context = self._tool_context(tools)
             messages = [
@@ -85,7 +142,7 @@ class AgentRuntime:
             ]
             if public_context:
                 messages.append({"role": "user", "content": public_context})
-            answer, payload = self._complete(messages, self._max_tokens(route))
+            answer, payload = self._complete(messages, self._max_tokens(route), latency, "response")
         if route.agent == "server":
             answer = self._redact_server_identifiers(answer)
         if self._finish_reason(payload) == "length":
@@ -101,6 +158,8 @@ class AgentRuntime:
             tools,
             round((perf_counter() - started) * 1000),
             usage if isinstance(usage, dict) else None,
+            latency.llm_calls,
+            latency.stages,
         )
 
     @staticmethod
@@ -133,6 +192,7 @@ class AgentRuntime:
         question: str,
         tools: list[dict[str, object]],
         system_prompt: str,
+        latency: LatencyRecorder,
     ) -> tuple[str, dict[str, object]]:
         evidence_package = self._evidence_package(tools)
         package_json = json.dumps(evidence_package, ensure_ascii=False)
@@ -147,6 +207,8 @@ class AgentRuntime:
         draft, _ = self._complete(
             [{"role": "system", "content": system_prompt}, {"role": "user", "content": analyst_prompt}],
             RESEARCH_MAX_TOKENS,
+            latency,
+            "analyst_synthesis",
         )
         critic_prompt = (
             "You are the Critic. Review the Analyst Draft only against the Evidence Package. "
@@ -158,6 +220,8 @@ class AgentRuntime:
         critique, _ = self._complete(
             [{"role": "system", "content": system_prompt}, {"role": "user", "content": critic_prompt}],
             CRITIC_MAX_TOKENS,
+            latency,
+            "critic",
         )
         revision_prompt = (
             "Write the final research answer in the user's language. Use the Analyst Draft and Critic Feedback, "
@@ -168,21 +232,83 @@ class AgentRuntime:
         return self._complete(
             [{"role": "system", "content": system_prompt}, {"role": "user", "content": revision_prompt}],
             RESEARCH_MAX_TOKENS,
+            latency,
+            "final_revision",
         )
 
-    def _complete(self, messages: list[dict[str, str]], max_tokens: int) -> tuple[str, dict[str, object]]:
-        response = self._client.post(
-            f"{BASE_URL}/chat/completions",
-            json={
-                "model": MODEL,
-                "messages": messages,
-                "temperature": 0.2,
-                "max_tokens": max_tokens,
-                "chat_template_kwargs": {"enable_thinking": False},
-            },
-        )
+    def _complete(
+        self,
+        messages: list[dict[str, str]],
+        max_tokens: int,
+        latency: LatencyRecorder | None = None,
+        purpose: str = "response",
+        temperature: float = 0.2,
+    ) -> tuple[str, dict[str, object]]:
+        request_body: dict[str, object] = {
+            "model": MODEL,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+        started = perf_counter()
+        if hasattr(self._client, "stream"):
+            return self._stream_complete(request_body, started, latency, purpose)
+        response = self._client.post(f"{BASE_URL}/chat/completions", json=request_body)
         response.raise_for_status()
         payload = response.json()
+        finished = perf_counter()
+        if latency is not None:
+            latency.llm_call(purpose, payload, started, None, finished)
+        return self._assistant_text(payload), payload
+
+    def _stream_complete(
+        self,
+        request_body: dict[str, object],
+        started: float,
+        latency: LatencyRecorder | None,
+        purpose: str,
+    ) -> tuple[str, dict[str, object]]:
+        request_body = {
+            **request_body,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+        }
+        content_parts: list[str] = []
+        usage: dict[str, object] = {}
+        finish_reason: str | None = None
+        first_token_at: float | None = None
+        with self._client.stream("POST", f"{BASE_URL}/chat/completions", json=request_body) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if not line.startswith("data: ") or line == "data: [DONE]":
+                    continue
+                event = json.loads(line[6:])
+                if not isinstance(event, dict):
+                    continue
+                event_usage = event.get("usage")
+                if isinstance(event_usage, dict):
+                    usage = event_usage
+                choices = event.get("choices")
+                if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta")
+                text = delta.get("content") if isinstance(delta, dict) else None
+                if isinstance(text, str) and text:
+                    if first_token_at is None:
+                        first_token_at = perf_counter()
+                    content_parts.append(text)
+                reason = choice.get("finish_reason")
+                if isinstance(reason, str):
+                    finish_reason = reason
+        finished = perf_counter()
+        payload: dict[str, object] = {
+            "choices": [{"message": {"content": "".join(content_parts)}, "finish_reason": finish_reason}],
+            "usage": usage,
+        }
+        if latency is not None:
+            latency.llm_call(purpose, payload, started, first_token_at, finished)
         return self._assistant_text(payload), payload
 
     @staticmethod
@@ -219,7 +345,7 @@ class AgentRuntime:
                 )
         return package
 
-    def _search_decision(self, message: str) -> SearchDecision:
+    def _search_decision(self, message: str, latency: LatencyRecorder | None = None) -> SearchDecision:
         decision_prompt = (
             "Decide whether this request needs external web evidence before answering. "
             "Return exactly one JSON object and no other text in this form: "
@@ -233,21 +359,17 @@ class AgentRuntime:
             "Do not answer the request yet."
         )
         try:
-            response = self._client.post(
-                f"{BASE_URL}/chat/completions",
-                json={
-                    "model": MODEL,
-                    "messages": [
-                        {"role": "system", "content": decision_prompt},
-                        {"role": "user", "content": message},
-                    ],
-                    "temperature": 0,
-                    "max_tokens": 256,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                },
+            content, _ = self._complete(
+                [
+                    {"role": "system", "content": decision_prompt},
+                    {"role": "user", "content": message},
+                ],
+                256,
+                latency,
+                "research_mode_decision",
+                temperature=0,
             )
-            response.raise_for_status()
-            return self._parse_search_decision(self._assistant_text(response.json()))
+            return self._parse_search_decision(content)
         except (httpx.HTTPError, ValueError):
             pass
         return SearchDecision("NO_SEARCH")

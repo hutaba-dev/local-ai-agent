@@ -232,6 +232,11 @@ class WebRuntimeTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["content"], "verified response")
         self.assertTrue(payload["activity"]["direct"])
+        self.assertEqual(payload["activity"]["whole_request_usage"]["llm_call_count"], 1)
+        self.assertEqual(payload["activity"]["whole_request_usage"]["input_tokens"], 10)
+        self.assertEqual(payload["activity"]["whole_request_usage"]["output_tokens"], 4)
+        self.assertIn("end_to_end_tokens_per_second", payload["activity"])
+        self.assertEqual(payload["activity"]["final_call"]["purpose"], "response")
         self.assertEqual(self.fake_client.requests[0]["url"], "http://127.0.0.1:8000/v1/chat/completions")
         self.assertEqual(self.fake_client.requests[0]["json"]["chat_template_kwargs"], {"enable_thinking": False})
 

@@ -24,6 +24,7 @@ class ToolResult:
     output: str
     error: str | None
     duration_ms: int
+    details: dict[str, object] | None = None
 
 
 def run_agent_tools(
@@ -120,23 +121,56 @@ def _web_sources(search_output: str) -> ToolResult:
             raise ValueError("web search returned an invalid result list")
         from runtime.web_search import fetch_sources
 
-        sources = fetch_sources(results)
+        sources, fetches = fetch_sources(results, include_metrics=True)
         if not sources:
             raise RuntimeError("no public HTML sources could be fetched")
-        return ToolResult("web_sources", True, json.dumps(sources, ensure_ascii=False), None, round((perf_counter() - started) * 1000))
+        duration_ms = round((perf_counter() - started) * 1000)
+        return ToolResult(
+            "web_sources",
+            True,
+            json.dumps(sources, ensure_ascii=False),
+            None,
+            duration_ms,
+            {"execution": "sequential", "wall_time_ms": duration_ms, "fetches": fetches},
+        )
     except (RuntimeError, ValueError, json.JSONDecodeError, httpx.HTTPError) as error:
-        return ToolResult("web_sources", False, "", str(error), round((perf_counter() - started) * 1000))
+        duration_ms = round((perf_counter() - started) * 1000)
+        return ToolResult(
+            "web_sources",
+            False,
+            "",
+            str(error),
+            duration_ms,
+            {"execution": "sequential", "wall_time_ms": duration_ms, "failure_reason": _failure_reason(error)},
+        )
 
 
 def _academic_papers(queries: tuple[str, ...]) -> ToolResult:
     started = perf_counter()
     try:
-        papers = academic_papers(queries)
+        diagnostics: list[dict[str, object]] = []
+        papers = academic_papers(queries, diagnostics=diagnostics)
         if not papers:
             raise RuntimeError("OpenAlex returned no matching academic works")
-        return ToolResult("academic_papers", True, json.dumps(papers, ensure_ascii=False), None, round((perf_counter() - started) * 1000))
+        duration_ms = round((perf_counter() - started) * 1000)
+        return ToolResult(
+            "academic_papers",
+            True,
+            json.dumps(papers, ensure_ascii=False),
+            None,
+            duration_ms,
+            {"execution": "sequential", "wall_time_ms": duration_ms, "query_count": len(queries), "requests": diagnostics},
+        )
     except (RuntimeError, httpx.HTTPError) as error:
-        return ToolResult("academic_papers", False, "", str(error), round((perf_counter() - started) * 1000))
+        duration_ms = round((perf_counter() - started) * 1000)
+        return ToolResult(
+            "academic_papers",
+            False,
+            "",
+            str(error),
+            duration_ms,
+            {"execution": "sequential", "wall_time_ms": duration_ms, "failure_reason": _failure_reason(error), "requests": diagnostics if "diagnostics" in locals() else []},
+        )
 
 
 def _academic_evidence_gaps(
@@ -191,10 +225,31 @@ def _search_title_hints(results: list[ToolResult]) -> tuple[str, ...]:
 
 def _semantic_scholar(query: str, author_hints: tuple[str, ...]) -> ToolResult:
     started = perf_counter()
-    evidence = semantic_scholar_evidence(query, author_hints)
+    diagnostics: list[dict[str, object]] = []
+    evidence = semantic_scholar_evidence(query, author_hints, diagnostics)
+    duration_ms = round((perf_counter() - started) * 1000)
     if evidence is None:
-        return ToolResult("semantic_scholar", False, "", "Semantic Scholar unavailable or no suitable author candidate", round((perf_counter() - started) * 1000))
-    return ToolResult("semantic_scholar", True, json.dumps(evidence, ensure_ascii=False), None, round((perf_counter() - started) * 1000))
+        return ToolResult(
+            "semantic_scholar",
+            False,
+            "",
+            "Semantic Scholar unavailable or no suitable author candidate",
+            duration_ms,
+            {"wall_time_ms": duration_ms, "failure_reason": "unavailable_or_no_matching_author", "requests": diagnostics},
+        )
+    return ToolResult("semantic_scholar", True, json.dumps(evidence, ensure_ascii=False), None, duration_ms, {"wall_time_ms": duration_ms, "requests": diagnostics})
+
+
+def _failure_reason(error: BaseException) -> str:
+    if isinstance(error, httpx.TimeoutException):
+        return "timeout"
+    if isinstance(error, httpx.HTTPStatusError):
+        return f"http_{error.response.status_code}"
+    if isinstance(error, httpx.HTTPError):
+        return "network_error"
+    if isinstance(error, json.JSONDecodeError):
+        return "parsing_error"
+    return "no_results_or_invalid_response"
 
 
 def _unpaywall_locations(papers: list[object]) -> ToolResult:
