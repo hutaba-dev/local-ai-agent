@@ -348,7 +348,12 @@ class WebRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result.route.agent, "research")
         self.assertEqual(result.route.search_mode, "DEEP_RESEARCH")
-        run_tools.assert_called_once_with("research", ("liquefied hydrogen storage papers 2024 2026", "liquefied hydrogen storage review"), "DEEP_RESEARCH", True)
+        run_tools.assert_called_once_with(
+            "research",
+            (message, "liquefied hydrogen storage papers 2024 2026", "liquefied hydrogen storage review"),
+            "DEEP_RESEARCH",
+            True,
+        )
 
     def test_research_uses_larger_output_budget_and_marks_truncation(self) -> None:
         class TruncatedResponse(FakeResponse):

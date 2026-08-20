@@ -87,10 +87,22 @@ def search_many(queries: tuple[str, ...], mode: str) -> list[dict[str, str]]:
             results.extend(SearchResult(**result) for result in search(query, mode))
         except RuntimeError as error:
             errors.append(str(error))
-    unique = [asdict(result) for result in _unique(results)]
+    unique_results = _unique(results)
+    anchor_terms = _query_terms(queries[0]) if queries else ()
+    unique_results.sort(key=lambda result: _relevance_score(result, anchor_terms), reverse=True)
+    unique = [asdict(result) for result in unique_results]
     if not unique:
         raise RuntimeError("; ".join(errors) or "no search results were returned")
     return unique[:24]
+
+
+def _query_terms(query: str) -> tuple[str, ...]:
+    return tuple(term.lower() for term in re.findall(r"[\w가-힣]{2,}", query) if term.lower() not in {"교수", "대한", "연구", "평가", "근거", "최근", "논문"})
+
+
+def _relevance_score(result: SearchResult, terms: tuple[str, ...]) -> int:
+    haystack = f"{result.title} {result.description}".lower()
+    return sum(1 for term in terms if term in haystack)
 
 
 def academic_papers(queries: tuple[str, ...], limit_per_query: int = 3) -> list[dict[str, object]]:

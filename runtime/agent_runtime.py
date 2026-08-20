@@ -70,7 +70,7 @@ class AgentRuntime:
         route = route_request(message, selected_agent, search_mode)
         if allowed_agents is not None and route.agent not in allowed_agents:
             raise PermissionError("This account is not permitted to access the requested capability.")
-        tool_message = decision.queries or (message,)
+        tool_message = (message, *decision.queries) if search_mode == "DEEP_RESEARCH" else (decision.queries or (message,))
         tools = run_agent_tools(route.agent, tool_message, route.search_mode, allow_local_tools) if route.agent != "main" else []
         system_prompt = self._load_prompt(route.agent)
         public_context = self._tool_context(tools)
