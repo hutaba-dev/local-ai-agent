@@ -90,6 +90,15 @@ class UserStore:
             return None
         return User(username=row[0], role=row[2], active=bool(row[3]))
 
+    def set_password(self, username: str, password: str) -> None:
+        self._validate(username, password)
+        with self._connect() as connection:
+            result = connection.execute(
+                "UPDATE users SET password_hash = ? WHERE username = ?", (self._hash(password), username)
+            )
+        if result.rowcount != 1:
+            raise ValueError("username does not exist")
+
 
 class SessionSigner:
     def __init__(self, secret: str, lifetime_minutes: int = 15) -> None:

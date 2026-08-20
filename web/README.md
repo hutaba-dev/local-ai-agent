@@ -38,8 +38,15 @@ the server terminal. The command prompts for the password so it is never placed
 in shell history or the repository. Passwords must contain at least 8 characters:
 
 ```bash
-/srv/local-ai-agent/venv/bin/python scripts/manage-users.py admin YOUR_ADMIN_USERNAME
-/srv/local-ai-agent/venv/bin/python scripts/manage-users.py guest GUEST_USERNAME
+/srv/local-ai-agent/venv/bin/python scripts/manage-users.py create admin YOUR_ADMIN_USERNAME
+/srv/local-ai-agent/venv/bin/python scripts/manage-users.py create guest GUEST_USERNAME
+```
+
+To replace a forgotten password, use the existing username. The command prompts
+for the new password twice:
+
+```bash
+/srv/local-ai-agent/venv/bin/python scripts/manage-users.py set-password YOUR_USERNAME
 ```
 
 Set `WEB_SESSION_SECRET` in the host `.env` before long-running use. The user
