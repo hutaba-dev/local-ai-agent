@@ -47,7 +47,7 @@ ssh -L 8000:127.0.0.1:8000 root@KIM_SERVER
 
 The optional LAN-only browser interface uses the local agent runtime rather than
 exposing vLLM to the browser. Start it with `./web/run.sh`, then open the
-server's LAN address on port `8088`. See [web/README.md](web/README.md) for the
+server's LAN address on port `8080`. See [web/README.md](web/README.md) for the
 current address, API endpoints, and testing scope.
 
 ## systemd Service
