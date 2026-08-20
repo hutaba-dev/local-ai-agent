@@ -55,6 +55,22 @@ class BraveResponse:
         ]}}
 
 
+class NaverResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, object]:
+        return {"items": [{"title": "<b>국내 출처</b>", "link": "https://naver.example/result", "description": "<b>요약</b>"}]}
+
+
+class RedditResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, object]:
+        return {"data": {"children": [{"data": {"title": "Discussion", "permalink": "/r/example/1", "selftext": "Context"}}]}}
+
+
 class WebRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fake_client = FakeClient()
@@ -167,6 +183,15 @@ class WebRuntimeTests(unittest.TestCase):
 
         self.assertEqual(len(results), 5)
         self.assertEqual(get.call_args.kwargs["params"]["count"], 5)
+
+    def test_korean_deep_research_uses_naver_and_reddit(self) -> None:
+        responses = [NaverResponse(), RedditResponse()]
+        with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "", "NAVER_SEARCH_CLIENT_ID": "naver-id", "NAVER_SEARCH_CLIENT_SECRET": "naver-secret"}), patch("runtime.web_search.httpx.get", side_effect=responses) as get:
+            results = search("국내 최신 정책 비교", "DEEP_RESEARCH")
+
+        self.assertEqual({result["provider"] for result in results}, {"naver", "reddit"})
+        self.assertEqual(get.call_args_list[0].args[0], "https://openapi.naver.com/v1/search/webkr.json")
+        self.assertEqual(get.call_args_list[1].args[0], "https://www.reddit.com/search.json")
 
 
 if __name__ == "__main__":

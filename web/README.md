@@ -87,17 +87,27 @@ external evidence:
 - **Quick search**: current facts, recent events, prices, availability, schedules, policy changes, and fact checks. Uses at most 5 results.
 - **Deep research**: multi-source comparisons, reports, recommendations, and medical, legal, financial, or contested claims. Uses at most 8 results.
 
-Search runs only through the Research Agent's bounded `web_search` tool. The
-answer must identify web-verified claims and cite relevant result URLs. If the
-search provider is unavailable, it must state that current verification failed
-instead of presenting model knowledge as a current fact.
+Search runs only through the Research Agent's bounded `web_search` tool. Korean
+queries prefer Naver when it is configured; global queries use Brave. Deep
+research also includes a small number of Reddit discussion results as
+non-authoritative context, never as sole evidence for factual claims. The answer
+must identify web-verified claims and cite relevant result URLs. If the search
+provider is unavailable, it must state that current verification failed instead
+of presenting model knowledge as a current fact.
 
 The initial provider is Brave Search. Create an API key with Brave, then place
 it only in the ignored host `.env` file:
 
 ```bash
 BRAVE_SEARCH_API_KEY=your-brave-search-api-key
+NAVER_SEARCH_CLIENT_ID=your-naver-client-id
+NAVER_SEARCH_CLIENT_SECRET=your-naver-client-secret
 ```
+
+Naver is useful for Korean web, news, blog, and local service discovery; Brave
+is useful for global web results. Kakao and Google credential placeholders are
+available in `.env.example`, but adapters are intentionally not enabled yet so
+an unused key never triggers unexpected requests or cost.
 
 Restart the persistent UI after adding or changing the key:
 
