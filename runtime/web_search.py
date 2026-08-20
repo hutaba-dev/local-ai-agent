@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import os
 import re
+import ipaddress
+import socket
 from dataclasses import asdict, dataclass
+from html.parser import HTMLParser
+from urllib.parse import urljoin, urlparse
 
 import httpx
 
@@ -13,6 +17,30 @@ NAVER_ENDPOINT = "https://openapi.naver.com/v1/search/webkr.json"
 REDDIT_ENDPOINT = "https://www.reddit.com/search.json"
 KOREAN_PATTERN = re.compile(r"[\uac00-\ud7a3]")
 USER_AGENT = "local-ai-agent-research/0.1"
+MAX_SOURCE_COUNT = 5
+MAX_SOURCE_CHARS = 6_000
+
+
+class _TextExtractor(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self._parts: list[str] = []
+        self._ignored_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"script", "style", "noscript", "svg"}:
+            self._ignored_depth += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript", "svg"} and self._ignored_depth:
+            self._ignored_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self._ignored_depth:
+            self._parts.append(data)
+
+    def text(self) -> str:
+        return re.sub(r"\s+", " ", " ".join(self._parts)).strip()
 
 
 @dataclass(frozen=True)
@@ -47,6 +75,69 @@ def search(query: str, mode: str) -> list[dict[str, str]]:
         detail = "; ".join(errors) or "no configured search provider returned results"
         raise RuntimeError(f"web search is required but unavailable: {detail}")
     return [asdict(result) for result in _unique(results)[:result_count]]
+
+
+def fetch_sources(results: list[dict[str, str]], limit: int = MAX_SOURCE_COUNT) -> list[dict[str, str]]:
+    """Fetch bounded text from public HTTPS result URLs for Deep Research.
+
+    URLs are provider output but remain untrusted. Block private network targets,
+    validate each redirect, and accept HTML only.
+    """
+    sources: list[dict[str, str]] = []
+    for result in results:
+        if len(sources) >= limit:
+            break
+        url = result.get("url")
+        if not isinstance(url, str):
+            continue
+        try:
+            response, final_url = _safe_fetch(url)
+            content_type = response.headers.get("content-type", "").lower()
+            if "text/html" not in content_type:
+                continue
+            extractor = _TextExtractor()
+            extractor.feed(response.text[:MAX_SOURCE_CHARS * 3])
+            text = extractor.text()[:MAX_SOURCE_CHARS]
+            if text:
+                sources.append({
+                    "title": result.get("title", "Untitled source"),
+                    "url": final_url,
+                    "text": text,
+                })
+        except (OSError, ValueError, httpx.HTTPError):
+            continue
+    return sources
+
+
+def _safe_fetch(url: str) -> tuple[httpx.Response, str]:
+    current_url = url
+    for _ in range(4):
+        _validate_public_https_url(current_url)
+        response = httpx.get(
+            current_url,
+            headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
+            timeout=12,
+            follow_redirects=False,
+        )
+        if response.is_redirect:
+            location = response.headers.get("location")
+            if not location:
+                raise ValueError("redirect had no location")
+            current_url = urljoin(current_url, location)
+            continue
+        response.raise_for_status()
+        return response, current_url
+    raise ValueError("too many redirects")
+
+
+def _validate_public_https_url(url: str) -> None:
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
+        raise ValueError("only public HTTPS URLs are allowed")
+    for address_info in socket.getaddrinfo(parsed.hostname, None, type=socket.SOCK_STREAM):
+        address = ipaddress.ip_address(address_info[4][0])
+        if not address.is_global:
+            raise ValueError("non-public network targets are not allowed")
 
 
 def _primary_providers(query: str):

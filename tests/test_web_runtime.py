@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 from runtime.agent_runtime import AgentRuntime
 from runtime.tool_registry import run_agent_tools
-from runtime.web_search import search
+from runtime.web_search import fetch_sources, search
 from web import app as web_app
 from web.auth import UserStore
 
@@ -70,6 +70,15 @@ class RedditResponse:
 
     def json(self) -> dict[str, object]:
         return {"data": {"children": [{"data": {"title": "Discussion", "permalink": "/r/example/1", "selftext": "Context"}}]}}
+
+
+class SourceResponse:
+    headers = {"content-type": "text/html; charset=utf-8"}
+    is_redirect = False
+    text = "<html><head><title>Ignored</title><script>secret()</script></head><body><h1>Evidence</h1><p>Verified source text.</p></body></html>"
+
+    def raise_for_status(self) -> None:
+        return None
 
 
 class WebRuntimeTests(unittest.TestCase):
@@ -135,7 +144,7 @@ class WebRuntimeTests(unittest.TestCase):
         class SensitiveResponse(FakeResponse):
             def json(self) -> dict[str, object]:
                 return {
-                    "choices": [{"message": {"content": "호스트명: 3990X-KIM, API: 127.0.0.1:8000"}}],
+                    "choices": [{"message": {"content": "호스트명: private-host.invalid, API: 127.0.0.1:8000"}}],
                     "usage": {"prompt_tokens": 10, "completion_tokens": 4},
                 }
 
@@ -147,7 +156,7 @@ class WebRuntimeTests(unittest.TestCase):
         with patch("runtime.agent_runtime.run_agent_tools", return_value=[]):
             result = AgentRuntime(client=SensitiveClient()).chat("서버 IP를 알려줘", "server")
 
-        self.assertNotIn("3990X-KIM", result.content)
+        self.assertNotIn("private-host.invalid", result.content)
         self.assertNotIn("127.0.0.1", result.content)
         self.assertIn("[redacted host]", result.content)
         self.assertIn("[redacted IP]", result.content)
@@ -357,6 +366,22 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual({result["provider"] for result in results}, {"naver", "reddit"})
         self.assertEqual(get.call_args_list[0].args[0], "https://openapi.naver.com/v1/search/webkr.json")
         self.assertEqual(get.call_args_list[1].args[0], "https://www.reddit.com/search.json")
+
+    def test_deep_research_fetches_public_html_source_text(self) -> None:
+        results = [{"title": "Evidence", "url": "https://example.com/paper", "description": "Snippet"}]
+        with patch("runtime.web_search.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), patch(
+            "runtime.web_search.httpx.get", return_value=SourceResponse()
+        ):
+            sources = fetch_sources(results)
+
+        self.assertEqual(sources[0]["url"], "https://example.com/paper")
+        self.assertIn("Verified source text.", sources[0]["text"])
+        self.assertNotIn("secret", sources[0]["text"])
+
+    def test_source_fetch_rejects_private_network_urls(self) -> None:
+        results = [{"title": "Private", "url": "https://127.0.0.1/private", "description": ""}]
+
+        self.assertEqual(fetch_sources(results), [])
 
 
 if __name__ == "__main__":

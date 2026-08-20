@@ -15,7 +15,8 @@ flowchart LR
 
 ## Chat Experience
 
-- Choose **AUTO / Main** for normal delegation, or select Main, Coding, Research, or Server directly.
+- Choose **AUTO / Main**, Main, or Research. Browser users cannot access Coding,
+  Server, local project files, or local system diagnostics.
 - `Enter` sends a message; `Shift+Enter` creates a new line. Korean IME composition is handled before submission.
 - Requests are serialized while an answer is running, preventing duplicate trailing-character submissions.
 - Markdown headings, lists, quotes, inline code, and fenced code blocks render in the chat.
@@ -36,12 +37,12 @@ ends with the terminal session. For normal operation, install and enable
 The service starts after vLLM, restarts automatically if the web process exits,
 and starts again after a host reboot.
 
-The default listener is `0.0.0.0:8080`, while vLLM remains private at
-`127.0.0.1:8000`. Open `http://117.16.245.72:8080` from a browser on a network
-that permits this host and port. The UI requires a manually provisioned account;
-there is no public registration. Create an initial administrator or guest from
-the server terminal. The command prompts for the password so it is never placed
-in shell history or the repository. Passwords must contain at least 8 characters:
+The UI requires a manually provisioned account; there is no public registration.
+Keep deployment addresses, hostnames, ports, and other infrastructure details out
+of this repository and browser conversations. Create an initial administrator or
+guest from the server terminal. The command prompts for the password so it is
+never placed in shell history or the repository. Passwords must contain at least
+8 characters:
 
 ```bash
 /srv/local-ai-agent/venv/bin/python scripts/manage-users.py create admin YOUR_ADMIN_USERNAME
@@ -71,6 +72,10 @@ same 15-minute sliding expiry.
 
 ## Security Boundary
 
+Browser sessions never receive local project files, source code, system status,
+logs, network information, hardware information, service names, configuration,
+or filesystem paths. This boundary applies to administrators and guests alike.
+
 The interface uses HTTP by default. HTTP does not encrypt passwords, chat
 content, or cookies in transit. Do not expose it to the public internet until
 it is placed behind HTTPS. For a public deployment, use a domain name and a
@@ -89,13 +94,15 @@ external evidence:
 
 Search runs only through the Research Agent's bounded `web_search` tool. Korean
 queries prefer Naver when it is configured; global queries use Brave. Deep
-research also includes a small number of Reddit discussion results as
-non-authoritative context, never as sole evidence for factual claims. The answer
-must identify web-verified claims and cite relevant result URLs. If the search
-provider is unavailable, it must state that current verification failed instead
-of presenting model knowledge as a current fact.
+research fetches up to five public HTTPS HTML sources from the bounded result
+set, after rejecting private-network targets, redirects to them, and non-HTML
+responses. Those source texts, not search snippets, are the basis for factual
+claims and adjacent URL citations. Reddit is non-authoritative context only.
+If no source text is available, the answer must label itself a limited
+search-result overview instead of presenting unverified details as facts.
 
-The initial provider is Brave Search. Create an API key with Brave, then place
+The initial provider is Brave Search. The existing **Search** API subscription is
+sufficient; Brave Answers is not used or required. Create an API key with Brave, then place
 it only in the ignored host `.env` file:
 
 ```bash
@@ -115,26 +122,6 @@ Restart the persistent UI after adding or changing the key:
 sudo systemctl restart local-ai-web.service
 ./scripts/web-healthcheck.sh
 ```
-
-## Automatic Web Verification
-
-For `AUTO / Main`, the runtime first asks the model to choose one mode for each
-request: `NO_SEARCH`, `QUICK_SEARCH`, or `DEEP_RESEARCH`. Translation, writing,
-stable concepts, and local workspace/server questions normally remain local.
-Current facts and recent events use quick search; multi-source comparisons and
-high-stakes guidance use deep research.
-
-Automatic search uses the bounded Brave Search API through the Research Agent.
-It sends only the user query, returns at most 5 quick-search or 8 deep-research
-result snippets, and passes title, URL, and description to the model. Add the
-real key only to the ignored host `.env` file, then restart the web UI:
-
-```bash
-BRAVE_SEARCH_API_KEY=your-key
-```
-
-Without this key, requests selected for web verification report that current
-verification is unavailable; they do not silently invent current sources.
 
 Endpoints:
 

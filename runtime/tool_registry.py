@@ -59,7 +59,10 @@ def _research_tools(message: str, search_mode: str, allow_local_tools: bool = Tr
             _command("read_file", ["sed", "-n", "1,220p", "docs/model-serving.md"], cwd=REPO_ROOT),
         ]
     if search_mode != "NO_SEARCH":
-        results.append(_web_search(message, search_mode))
+        web_result = _web_search(message, search_mode)
+        results.append(web_result)
+        if search_mode == "DEEP_RESEARCH" and web_result.success:
+            results.append(_web_sources(web_result.output))
     return results
 
 
@@ -96,3 +99,19 @@ def _web_search(message: str, search_mode: str) -> ToolResult:
         return ToolResult("web_search", True, json.dumps(search(message, search_mode), ensure_ascii=False), None, round((perf_counter() - started) * 1000))
     except (RuntimeError, httpx.HTTPError) as error:
         return ToolResult("web_search", False, "", str(error), round((perf_counter() - started) * 1000))
+
+
+def _web_sources(search_output: str) -> ToolResult:
+    started = perf_counter()
+    try:
+        results = json.loads(search_output)
+        if not isinstance(results, list):
+            raise ValueError("web search returned an invalid result list")
+        from runtime.web_search import fetch_sources
+
+        sources = fetch_sources(results)
+        if not sources:
+            raise RuntimeError("no public HTML sources could be fetched")
+        return ToolResult("web_sources", True, json.dumps(sources, ensure_ascii=False), None, round((perf_counter() - started) * 1000))
+    except (RuntimeError, ValueError, json.JSONDecodeError, httpx.HTTPError) as error:
+        return ToolResult("web_sources", False, "", str(error), round((perf_counter() - started) * 1000))
