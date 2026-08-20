@@ -141,7 +141,12 @@ form.addEventListener("submit", async (event) => {
   } finally { sendButton.disabled = false; input.focus(); }
 });
 
-input.addEventListener("keydown", (event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); form.requestSubmit(); } });
+input.addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && !event.shiftKey && !event.isComposing && event.keyCode !== 229) {
+    event.preventDefault();
+    form.requestSubmit();
+  }
+});
 newChatButton.addEventListener("click", newSession);
 
 async function initialize() {
