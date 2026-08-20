@@ -2,10 +2,15 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
+
+import httpx
+
+from runtime.web_search import search
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -21,16 +26,16 @@ class ToolResult:
     duration_ms: int
 
 
-def run_agent_tools(agent: str, message: str) -> list[dict[str, object]]:
+def run_agent_tools(agent: str, message: str, search_mode: str = "NO_SEARCH") -> list[dict[str, object]]:
     tools = {
         "coding": _coding_tools,
         "research": _research_tools,
         "server": _server_tools,
-    }.get(agent, lambda _: [])
-    return [asdict(result) for result in tools(message)]
+    }.get(agent, lambda _message, _search_mode: [])
+    return [asdict(result) for result in tools(message, search_mode)]
 
 
-def _coding_tools(message: str) -> list[ToolResult]:
+def _coding_tools(message: str, search_mode: str) -> list[ToolResult]:
     return [
         _command("list_files", ["find", ".", "-maxdepth", "2", "-type", "f", "-not", "-path", "./.git/*"], cwd=REPO_ROOT),
         _command("search_files", ["git", "grep", "-n", "Qwen3.8-27B", "--", "README.md", "docs"], cwd=REPO_ROOT),
@@ -40,14 +45,17 @@ def _coding_tools(message: str) -> list[ToolResult]:
     ]
 
 
-def _research_tools(message: str) -> list[ToolResult]:
-    return [
+def _research_tools(message: str, search_mode: str) -> list[ToolResult]:
+    results = [
         _command("search_project_docs", ["find", "docs", "-type", "f", "-name", "*.md", "-print"], cwd=REPO_ROOT),
         _command("read_file", ["sed", "-n", "1,220p", "docs/model-serving.md"], cwd=REPO_ROOT),
     ]
+    if search_mode != "NO_SEARCH":
+        results.append(_web_search(message, search_mode))
+    return results
 
 
-def _server_tools(message: str) -> list[ToolResult]:
+def _server_tools(message: str, search_mode: str) -> list[ToolResult]:
     return [
         _command("nvidia_smi", ["nvidia-smi", "--query-gpu=name,memory.used,memory.total,utilization.gpu", "--format=csv,noheader"]),
         _command("systemctl_status_qwen_vllm", ["systemctl", "is-active", "qwen-vllm.service"]),
@@ -73,3 +81,11 @@ def _command(name: str, command: list[str], cwd: Path | None = None) -> ToolResu
         return ToolResult(name, completed.returncode == 0, output, error, round((perf_counter() - started) * 1000))
     except (OSError, subprocess.TimeoutExpired) as error:
         return ToolResult(name, False, "", str(error), round((perf_counter() - started) * 1000))
+
+
+def _web_search(message: str, search_mode: str) -> ToolResult:
+    started = perf_counter()
+    try:
+        return ToolResult("web_search", True, json.dumps(search(message, search_mode), ensure_ascii=False), None, round((perf_counter() - started) * 1000))
+    except (RuntimeError, httpx.HTTPError) as error:
+        return ToolResult("web_search", False, "", str(error), round((perf_counter() - started) * 1000))

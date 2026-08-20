@@ -80,6 +80,34 @@ certificate.
 
 ## Automatic Web Verification
 
+In **AUTO / Main**, the runtime first decides whether the request needs current
+external evidence:
+
+- **No search**: translation, writing, supplied-text work, stable concepts, and local server or repository questions.
+- **Quick search**: current facts, recent events, prices, availability, schedules, policy changes, and fact checks. Uses at most 5 results.
+- **Deep research**: multi-source comparisons, reports, recommendations, and medical, legal, financial, or contested claims. Uses at most 8 results.
+
+Search runs only through the Research Agent's bounded `web_search` tool. The
+answer must identify web-verified claims and cite relevant result URLs. If the
+search provider is unavailable, it must state that current verification failed
+instead of presenting model knowledge as a current fact.
+
+The initial provider is Brave Search. Create an API key with Brave, then place
+it only in the ignored host `.env` file:
+
+```bash
+BRAVE_SEARCH_API_KEY=your-brave-search-api-key
+```
+
+Restart the persistent UI after adding or changing the key:
+
+```bash
+sudo systemctl restart local-ai-web.service
+./scripts/web-healthcheck.sh
+```
+
+## Automatic Web Verification
+
 For `AUTO / Main`, the runtime first asks the model to choose one mode for each
 request: `NO_SEARCH`, `QUICK_SEARCH`, or `DEEP_RESEARCH`. Translation, writing,
 stable concepts, and local workspace/server questions normally remain local.

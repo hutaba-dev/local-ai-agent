@@ -1,10 +1,13 @@
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from runtime.agent_runtime import AgentRuntime
+from runtime.web_search import search
 from web import app as web_app
 from web.auth import UserStore
 
@@ -27,6 +30,29 @@ class FakeClient:
     def post(self, url: str, json: dict[str, object]) -> FakeResponse:
         self.requests.append({"url": url, "json": json})
         return FakeResponse()
+
+
+class SearchDecisionClient(FakeClient):
+    def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+        self.requests.append({"url": url, "json": json})
+        content = "QUICK_SEARCH" if len(self.requests) == 1 else "web-verified answer"
+        response = FakeResponse()
+        response.json = lambda: {  # type: ignore[method-assign]
+            "choices": [{"message": {"content": content}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+        }
+        return response
+
+
+class BraveResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, object]:
+        return {"web": {"results": [
+            {"title": f"Source {index}", "url": f"https://example.com/{index}", "description": "Snippet"}
+            for index in range(10)
+        ]}}
 
 
 class WebRuntimeTests(unittest.TestCase):
@@ -123,6 +149,24 @@ class WebRuntimeTests(unittest.TestCase):
         response = second_browser.post("/api/chat", json={"message": "안녕", "session_id": session_id})
 
         self.assertEqual(response.status_code, 403)
+
+    def test_auto_current_fact_routes_to_research_and_reports_missing_search_key(self) -> None:
+        runtime = AgentRuntime(client=SearchDecisionClient())
+        with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": ""}):
+            result = runtime.chat("오늘 서울 날씨는 어때?", "auto")
+
+        self.assertEqual(result.route.agent, "research")
+        self.assertEqual(result.route.search_mode, "QUICK_SEARCH")
+        self.assertEqual(result.tools[-1]["name"], "web_search")
+        self.assertFalse(result.tools[-1]["success"])
+        self.assertIn("BRAVE_SEARCH_API_KEY", result.tools[-1]["error"])
+
+    def test_brave_search_limits_quick_results(self) -> None:
+        with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "test-key"}), patch("runtime.web_search.httpx.get", return_value=BraveResponse()) as get:
+            results = search("latest example", "QUICK_SEARCH")
+
+        self.assertEqual(len(results), 5)
+        self.assertEqual(get.call_args.kwargs["params"]["count"], 5)
 
 
 if __name__ == "__main__":

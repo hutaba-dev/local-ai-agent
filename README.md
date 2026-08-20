@@ -91,7 +91,7 @@ switching, and automatic logout after 15 minutes without browser activity.
 Administrators provision `admin` and `guest` accounts from the server terminal.
 A single guest account may be shared; each browser login receives an isolated
 chat session. See [web/README.md](web/README.md) for account creation, the chat
-workflow, session behavior, and HTTPS requirements.
+workflow, session behavior, automatic web verification, and HTTPS requirements.
 
 ## systemd Service
 
