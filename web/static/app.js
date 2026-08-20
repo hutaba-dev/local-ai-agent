@@ -231,7 +231,7 @@ async function initialize() {
     const [agentPayload, health, account] = await Promise.all([request("/api/agents"), request("/health"), request("/api/me")]);
     selector.innerHTML = agentPayload.agents.map((agent) => `<option value="${agent.id}">${agent.label}</option>`).join("");
     accountName.textContent = `${account.username} (${account.role})`;
-    status.textContent = `Connected: ${health.model}`;
+    status.textContent = "Connected";
     status.className = "status online";
     await newSession();
   } catch (error) { status.textContent = "Backend unavailable"; status.className = "status offline"; }

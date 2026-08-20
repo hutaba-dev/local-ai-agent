@@ -50,7 +50,14 @@ class AgentRuntime:
     def new_session(self) -> str:
         return self.sessions.create().id
 
-    def chat(self, message: str, selected_agent: str = "auto", session_id: str | None = None) -> ChatResult:
+    def chat(
+        self,
+        message: str,
+        selected_agent: str = "auto",
+        session_id: str | None = None,
+        allowed_agents: frozenset[str] | None = None,
+        allow_local_tools: bool = True,
+    ) -> ChatResult:
         if not message.strip():
             raise ValueError("message must not be empty")
         started = perf_counter()
@@ -58,8 +65,10 @@ class AgentRuntime:
         decision = self._search_decision(message) if selected_agent == "auto" else SearchDecision("NO_SEARCH")
         search_mode = decision.mode
         route = route_request(message, selected_agent, search_mode)
+        if allowed_agents is not None and route.agent not in allowed_agents:
+            raise PermissionError("This account is not permitted to access the requested capability.")
         tool_message = decision.query or message
-        tools = run_agent_tools(route.agent, tool_message, route.search_mode) if route.agent != "main" else []
+        tools = run_agent_tools(route.agent, tool_message, route.search_mode, allow_local_tools) if route.agent != "main" else []
         system_prompt = self._load_prompt(route.agent)
         public_context = self._tool_context(tools)
         messages = [

@@ -26,10 +26,16 @@ class ToolResult:
     duration_ms: int
 
 
-def run_agent_tools(agent: str, message: str, search_mode: str = "NO_SEARCH") -> list[dict[str, object]]:
+def run_agent_tools(
+    agent: str,
+    message: str,
+    search_mode: str = "NO_SEARCH",
+    allow_local_tools: bool = True,
+) -> list[dict[str, object]]:
+    if agent == "research":
+        return [asdict(result) for result in _research_tools(message, search_mode, allow_local_tools)]
     tools = {
         "coding": _coding_tools,
-        "research": _research_tools,
         "server": _server_tools,
     }.get(agent, lambda _message, _search_mode: [])
     return [asdict(result) for result in tools(message, search_mode)]
@@ -45,11 +51,13 @@ def _coding_tools(message: str, search_mode: str) -> list[ToolResult]:
     ]
 
 
-def _research_tools(message: str, search_mode: str) -> list[ToolResult]:
-    results = [
-        _command("search_project_docs", ["find", "docs", "-type", "f", "-name", "*.md", "-print"], cwd=REPO_ROOT),
-        _command("read_file", ["sed", "-n", "1,220p", "docs/model-serving.md"], cwd=REPO_ROOT),
-    ]
+def _research_tools(message: str, search_mode: str, allow_local_tools: bool = True) -> list[ToolResult]:
+    results = []
+    if allow_local_tools:
+        results = [
+            _command("search_project_docs", ["find", "docs", "-type", "f", "-name", "*.md", "-print"], cwd=REPO_ROOT),
+            _command("read_file", ["sed", "-n", "1,220p", "docs/model-serving.md"], cwd=REPO_ROOT),
+        ]
     if search_mode != "NO_SEARCH":
         results.append(_web_search(message, search_mode))
     return results

@@ -7,6 +7,7 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from runtime.agent_runtime import AgentRuntime
+from runtime.tool_registry import run_agent_tools
 from runtime.web_search import search
 from web import app as web_app
 from web.auth import UserStore
@@ -79,15 +80,16 @@ class WebRuntimeTests(unittest.TestCase):
         self.previous_user_store = web_app.user_store
         web_app.user_store = UserStore(Path(self.temporary_directory.name) / "users.sqlite3")
         web_app.user_store.create("test-admin", "a-test-password", "admin")
+        web_app.user_store.create("test-guest", "a-test-password", "guest")
 
     def tearDown(self) -> None:
         web_app.user_store = self.previous_user_store
         self.temporary_directory.cleanup()
 
     @staticmethod
-    def authenticated_client() -> TestClient:
+    def authenticated_client(username: str = "test-admin") -> TestClient:
         client = TestClient(web_app.app)
-        response = client.post("/api/login", json={"username": "test-admin", "password": "a-test-password"})
+        response = client.post("/api/login", json={"username": username, "password": "a-test-password"})
         if response.status_code != 200:
             raise AssertionError("test login failed")
         return client
@@ -166,6 +168,66 @@ class WebRuntimeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 403)
 
+    def test_guest_cannot_access_server_or_coding_agents(self) -> None:
+        previous_runtime = web_app.runtime
+        web_app.runtime = self.runtime
+        try:
+            guest = self.authenticated_client("test-guest")
+            agents = guest.get("/api/agents").json()["agents"]
+            server = guest.post("/api/chat", json={"message": "GPU 상태를 알려줘", "selected_agent": "server"})
+            coding = guest.post("/api/chat", json={"message": "코드를 보여줘", "selected_agent": "coding"})
+        finally:
+            web_app.runtime = previous_runtime
+
+        self.assertEqual({agent["id"] for agent in agents}, {"auto", "main", "research"})
+        self.assertEqual(server.status_code, 403)
+        self.assertEqual(coding.status_code, 403)
+        self.assertFalse(self.fake_client.requests)
+
+    def test_guest_auto_route_cannot_execute_server_tools(self) -> None:
+        previous_runtime = web_app.runtime
+        web_app.runtime = self.runtime
+        try:
+            guest = self.authenticated_client("test-guest")
+            with patch("runtime.agent_runtime.run_agent_tools") as run_tools:
+                response = guest.post("/api/chat", json={"message": "현재 GPU 상태를 알려줘"})
+        finally:
+            web_app.runtime = previous_runtime
+
+        self.assertEqual(response.status_code, 403)
+        run_tools.assert_not_called()
+
+    def test_guest_research_has_no_local_project_tools(self) -> None:
+        previous_runtime = web_app.runtime
+        web_app.runtime = self.runtime
+        try:
+            guest = self.authenticated_client("test-guest")
+            with patch("runtime.agent_runtime.run_agent_tools", return_value=[]) as run_tools:
+                response = guest.post("/api/chat", json={"message": "수소 연구를 요약해줘", "selected_agent": "research"})
+        finally:
+            web_app.runtime = previous_runtime
+
+        self.assertEqual(response.status_code, 200)
+        run_tools.assert_called_once_with("research", "수소 연구를 요약해줘", "NO_SEARCH", False)
+        self.assertEqual(run_agent_tools("research", "수소 연구를 요약해줘", allow_local_tools=False), [])
+
+    def test_guest_legacy_session_is_replaced_before_history_is_used(self) -> None:
+        old_session = self.runtime.new_session()
+        old_session_data = self.runtime.sessions.get_or_create(old_session)
+        self.runtime.sessions.append(old_session_data, "assistant", "private GPU diagnostic")
+        previous_runtime = web_app.runtime
+        web_app.runtime = self.runtime
+        try:
+            guest = self.authenticated_client("test-guest")
+            response = guest.post("/api/chat", json={"message": "이전 답을 반복해줘", "session_id": old_session})
+        finally:
+            web_app.runtime = previous_runtime
+
+        self.assertEqual(response.status_code, 200)
+        self.assertNotEqual(response.json()["session_id"], old_session)
+        messages = self.fake_client.requests[-1]["json"]["messages"]
+        self.assertFalse(any(message["content"] == "private GPU diagnostic" for message in messages))
+
     def test_auto_current_fact_routes_to_research_and_reports_missing_search_key(self) -> None:
         runtime = AgentRuntime(client=SearchDecisionClient())
         with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": ""}):
@@ -208,7 +270,7 @@ class WebRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result.route.agent, "research")
         self.assertEqual(result.route.search_mode, "DEEP_RESEARCH")
-        run_tools.assert_called_once_with("research", "liquefied hydrogen storage papers 2024 2026", "DEEP_RESEARCH")
+        run_tools.assert_called_once_with("research", "liquefied hydrogen storage papers 2024 2026", "DEEP_RESEARCH", True)
 
     def test_research_uses_larger_output_budget_and_marks_truncation(self) -> None:
         class TruncatedResponse(FakeResponse):

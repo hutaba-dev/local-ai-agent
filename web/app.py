@@ -27,7 +27,12 @@ user_store = configured_user_store()
 session_timeout_minutes = int(os.getenv("WEB_SESSION_IDLE_MINUTES", "15"))
 session_signer = SessionSigner(os.getenv("WEB_SESSION_SECRET", secrets.token_urlsafe(32)), session_timeout_minutes)
 chat_session_owners: dict[str, str] = {}
+chat_session_roles: dict[str, str] = {}
 SESSION_COOKIE = "local_ai_session"
+ROLE_ALLOWED_AGENTS = {
+    "admin": frozenset(AGENT_CHOICES),
+    "guest": frozenset({"auto", "main", "research"}),
+}
 
 
 @app.middleware("http")
@@ -80,6 +85,10 @@ def chat_owner(request: Request) -> str:
     return hashlib.sha256(session_key.encode()).hexdigest()
 
 
+def allowed_agents(user: User) -> frozenset[str]:
+    return ROLE_ALLOWED_AGENTS[user.role]
+
+
 @app.get("/login", response_class=FileResponse)
 def login_page() -> FileResponse:
     return FileResponse(WEB_ROOT / "templates" / "login.html")
@@ -127,20 +136,21 @@ def health() -> dict[str, object]:
         response.raise_for_status()
     except httpx.HTTPError as error:
         raise HTTPException(status_code=503, detail="Qwen backend is unavailable") from error
-    return {"status": "ok", "model": MODEL}
+    return {"status": "ok"}
 
 
 @app.get("/api/agents")
-def agents() -> dict[str, object]:
+def agents(request: Request) -> dict[str, object]:
+    permitted_agents = allowed_agents(current_user(request))
+    available_agents = [
+        {"id": "auto", "label": "AUTO / Main"},
+        {"id": "main", "label": "Main / Secretary"},
+        {"id": "coding", "label": "Coding"},
+        {"id": "research", "label": "Research"},
+        {"id": "server", "label": "Server"},
+    ]
     return {
-        "agents": [
-            {"id": "auto", "label": "AUTO / Main"},
-            {"id": "main", "label": "Main / Secretary"},
-            {"id": "coding", "label": "Coding"},
-            {"id": "research", "label": "Research"},
-            {"id": "server", "label": "Server"},
-        ],
-        "model": "Qwen3.8-27B",
+        "agents": [agent for agent in available_agents if agent["id"] in permitted_agents],
     }
 
 
@@ -148,6 +158,7 @@ def agents() -> dict[str, object]:
 def new_session(request: Request) -> dict[str, str]:
     session_id = runtime.new_session()
     chat_session_owners[session_id] = chat_owner(request)
+    chat_session_roles[session_id] = current_user(request).role
     return {"session_id": session_id}
 
 
@@ -155,14 +166,30 @@ def new_session(request: Request) -> dict[str, str]:
 async def chat(request: ChatRequest, http_request: Request) -> dict[str, object]:
     if request.selected_agent not in AGENT_CHOICES:
         raise HTTPException(status_code=422, detail="unknown agent selection")
+    user = current_user(http_request)
+    if request.selected_agent not in allowed_agents(user):
+        raise HTTPException(status_code=403, detail="account is not permitted to access the requested capability")
     owner = chat_owner(http_request)
-    if request.session_id and chat_session_owners.get(request.session_id) not in {None, owner}:
+    session_id = request.session_id
+    if user.role == "guest" and session_id and chat_session_roles.get(session_id) != "guest":
+        session_id = None
+    if session_id and chat_session_owners.get(session_id) not in {None, owner}:
         raise HTTPException(status_code=403, detail="chat session belongs to another user")
     try:
-        result = await run_in_threadpool(runtime.chat, request.message, request.selected_agent, request.session_id)
+        result = await run_in_threadpool(
+            runtime.chat,
+            request.message,
+            request.selected_agent,
+            session_id,
+            allowed_agents(user),
+            user.role == "admin",
+        )
+    except PermissionError as error:
+        raise HTTPException(status_code=403, detail=str(error)) from error
     except (httpx.HTTPError, ValueError) as error:
         raise HTTPException(status_code=502, detail=str(error)) from error
     chat_session_owners[result.session_id] = owner
+    chat_session_roles[result.session_id] = user.role
     usage = result.usage or {}
     completion_tokens = usage.get("completion_tokens")
     tokens_per_second = None
