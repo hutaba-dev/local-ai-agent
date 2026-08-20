@@ -1,9 +1,12 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 from fastapi.testclient import TestClient
 
 from runtime.agent_runtime import AgentRuntime
 from web import app as web_app
+from web.auth import UserStore
 
 
 class FakeResponse:
@@ -30,6 +33,22 @@ class WebRuntimeTests(unittest.TestCase):
     def setUp(self) -> None:
         self.fake_client = FakeClient()
         self.runtime = AgentRuntime(client=self.fake_client)
+        self.temporary_directory = TemporaryDirectory()
+        self.previous_user_store = web_app.user_store
+        web_app.user_store = UserStore(Path(self.temporary_directory.name) / "users.sqlite3")
+        web_app.user_store.create("test-admin", "a-test-password", "admin")
+
+    def tearDown(self) -> None:
+        web_app.user_store = self.previous_user_store
+        self.temporary_directory.cleanup()
+
+    @staticmethod
+    def authenticated_client() -> TestClient:
+        client = TestClient(web_app.app)
+        response = client.post("/api/login", json={"username": "test-admin", "password": "a-test-password"})
+        if response.status_code != 200:
+            raise AssertionError("test login failed")
+        return client
 
     def test_auto_routes_and_keeps_short_term_session_history(self) -> None:
         first = self.runtime.chat("현재 repository 구조를 실제로 확인해서 설명해줘.", "auto")
@@ -73,7 +92,7 @@ class WebRuntimeTests(unittest.TestCase):
         previous_runtime = web_app.runtime
         web_app.runtime = self.runtime
         try:
-            client = TestClient(web_app.app)
+            client = self.authenticated_client()
             response = client.post("/api/chat", json={"message": "안녕", "selected_agent": "main"})
         finally:
             web_app.runtime = previous_runtime
@@ -87,10 +106,12 @@ class WebRuntimeTests(unittest.TestCase):
     def test_web_ui_assets_are_not_cached(self) -> None:
         client = TestClient(web_app.app)
 
-        index = client.get("/")
+        index = client.get("/", follow_redirects=False)
+        login = client.get("/login")
         script = client.get("/static/app.js")
 
-        self.assertEqual(index.headers["cache-control"], "no-store")
+        self.assertEqual(index.status_code, 303)
+        self.assertEqual(login.headers["cache-control"], "no-store")
         self.assertEqual(script.headers["cache-control"], "no-store")
 
 

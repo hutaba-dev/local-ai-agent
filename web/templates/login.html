@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sign in | Local AI Agent</title>
+    <link rel="stylesheet" href="/static/style.css">
+  </head>
+  <body>
+    <main class="login-shell">
+      <form id="login-form" class="login-form">
+        <p class="eyebrow">LOCAL MULTI-AGENT</p>
+        <h1>Sign in</h1>
+        <label>Username<input id="username" name="username" autocomplete="username" required></label>
+        <label>Password<input id="password" name="password" type="password" autocomplete="current-password" required></label>
+        <p id="login-error" class="login-error" role="alert"></p>
+        <button type="submit">Sign in</button>
+      </form>
+    </main>
+    <script src="/static/login.js"></script>
+  </body>
+</html>

@@ -7,4 +7,9 @@ readonly WEB_HOST="${WEB_HOST:-0.0.0.0}"
 readonly WEB_PORT="${WEB_PORT:-8080}"
 
 cd "${REPO_ROOT}"
+if [[ -f .env ]]; then
+	set -a
+	source .env
+	set +a
+fi
 exec "${VENV_DIR}/bin/python" -m uvicorn web.app:app --host "${WEB_HOST}" --port "${WEB_PORT}"
