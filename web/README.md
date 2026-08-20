@@ -30,6 +30,12 @@ Start the UI from the repository root:
 ./web/run.sh
 ```
 
+`./web/run.sh` is convenient for an interactive local test, but its process
+ends with the terminal session. For normal operation, install and enable
+`infra/systemd/local-ai-web.service` as described in the repository README.
+The service starts after vLLM, restarts automatically if the web process exits,
+and starts again after a host reboot.
+
 The default listener is `0.0.0.0:8080`, while vLLM remains private at
 `127.0.0.1:8000`. Open `http://117.16.245.72:8080` from a browser on a network
 that permits this host and port. The UI requires a manually provisioned account;
@@ -71,6 +77,26 @@ it is placed behind HTTPS. For a public deployment, use a domain name and a
 reverse proxy such as Caddy to terminate TLS, then set `WEB_SECURE_COOKIE=1`.
 An IP address alone is generally not sufficient for a normal publicly trusted
 certificate.
+
+## Automatic Web Verification
+
+For `AUTO / Main`, the runtime first asks the model to choose one mode for each
+request: `NO_SEARCH`, `QUICK_SEARCH`, or `DEEP_RESEARCH`. Translation, writing,
+stable concepts, and local workspace/server questions normally remain local.
+Current facts and recent events use quick search; multi-source comparisons and
+high-stakes guidance use deep research.
+
+Automatic search uses the bounded Brave Search API through the Research Agent.
+It sends only the user query, returns at most 5 quick-search or 8 deep-research
+result snippets, and passes title, URL, and description to the model. Add the
+real key only to the ignored host `.env` file, then restart the web UI:
+
+```bash
+BRAVE_SEARCH_API_KEY=your-key
+```
+
+Without this key, requests selected for web verification report that current
+verification is unavailable; they do not silently invent current sources.
 
 Endpoints:
 

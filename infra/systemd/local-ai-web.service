@@ -1,0 +1,23 @@
+[Unit]
+Description=Local AI Agent authenticated web chat
+After=network-online.target qwen-vllm.service
+Wants=network-online.target
+Requires=qwen-vllm.service
+StartLimitIntervalSec=5min
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/local-ai-agent
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/root/local-ai-agent/web/run.sh
+Restart=always
+RestartSec=5s
+TimeoutStartSec=1min
+TimeoutStopSec=30s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

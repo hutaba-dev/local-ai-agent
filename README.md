@@ -32,6 +32,18 @@ cd /root/local-ai-agent
 
 The browser UI requires a manually created account. See [web/README.md](web/README.md) before exposing port `8080` to anyone else.
 
+For persistent operation, run the browser UI through systemd rather than an
+interactive terminal. The service automatically starts after vLLM, restarts
+after failure, and is enabled across reboots:
+
+```bash
+sudo install -m 0644 infra/systemd/local-ai-web.service /etc/systemd/system/local-ai-web.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now local-ai-web.service
+sudo systemctl status local-ai-web.service
+./scripts/web-healthcheck.sh
+```
+
 ## Install
 
 ```bash
