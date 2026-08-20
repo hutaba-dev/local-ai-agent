@@ -8,6 +8,7 @@ const status = document.querySelector("#connection-status");
 let sessionId = null;
 let composing = false;
 let compositionJustEnded = false;
+let sending = false;
 
 function escapeHtml(value) {
   return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
@@ -147,10 +148,13 @@ async function newSession() {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
+  if (sending) return;
   const message = input.value.trim();
   if (!message) return;
+  sending = true;
   addMessage("user", message, "You");
   input.value = "";
+  input.disabled = true;
   sendButton.disabled = true;
   try {
     const payload = await request("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, selected_agent: selector.value, session_id: sessionId }) });
@@ -158,7 +162,13 @@ form.addEventListener("submit", async (event) => {
     addMessage("assistant", payload.content, payload.activity.routed_agent, payload.activity);
   } catch (error) {
     addMessage("assistant", `Request failed: ${error.message}`, "Runtime");
-  } finally { sendButton.disabled = false; input.focus(); }
+  } finally {
+    input.value = "";
+    input.disabled = false;
+    sendButton.disabled = false;
+    sending = false;
+    input.focus();
+  }
 });
 
 input.addEventListener("compositionstart", () => {
