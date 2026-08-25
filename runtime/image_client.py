@@ -26,6 +26,14 @@ NATURAL_EDIT_PATTERN = re.compile(
     r"\b(?:edit|change|replace|remove|retouch|adjust|straighten|enhance)\b",
     re.IGNORECASE,
 )
+NATURAL_REFINEMENT_PATTERN = re.compile(
+    r"(?:더\s*)?(?:예쁘|사실적|실사|현실적|자연스럽|선명|고화질|고해상도|밝게|어둡게|"
+    r"디테일|정교|화사|생생|부드럽|깔끔|또렷|스타일).{0,24}(?:하게|으로|스럽게|해줘|만들어|만들어줘)?|"
+    r"(?:고화질|고해상도|실사풍|사실적|현실적)(?:로|으로)?|"
+    r"\b(?:more|make it|render it)\b.{0,40}\b(?:beautiful|realistic|photorealistic|detailed|"
+    r"sharp|vivid|natural|high[- ]resolution|high[- ]quality)\b",
+    re.IGNORECASE,
+)
 NATURAL_RESEND_PATTERN = re.compile(
     r"(?:사진|이미지|결과).{0,12}다시\s*(?:보내|보여|올려)|"
     r"다시\s*(?:사진|이미지|결과).{0,12}(?:보내|보여|올려)|"
@@ -100,6 +108,8 @@ def parse_image_command(message: str, source_image_available: bool = False) -> t
         if source_image_available and NATURAL_POSE_PATTERN.search(stripped_message):
             return "pose", stripped_message
         if source_image_available and NATURAL_EDIT_PATTERN.search(stripped_message):
+            return "edit", stripped_message
+        if source_image_available and NATURAL_REFINEMENT_PATTERN.search(stripped_message):
             return "edit", stripped_message
         if NATURAL_GENERATE_PATTERN.search(stripped_message):
             return "image", stripped_message
