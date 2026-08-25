@@ -1,0 +1,23 @@
+[Unit]
+Description=Local SD-Turbo image generation service
+After=network-online.target qwen-vllm.service
+Wants=network-online.target
+Requires=qwen-vllm.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/local-ai-agent
+Environment=PYTHONUNBUFFERED=1
+Environment=HF_HOME=/srv/local-ai-agent/huggingface
+Environment=IMAGE_MODEL_CACHE=/srv/local-ai-agent/huggingface
+ExecStart=/srv/local-ai-agent/venv/bin/python -m uvicorn image_service.app:app --host 127.0.0.1 --port 8001
+Restart=always
+RestartSec=5s
+TimeoutStartSec=1min
+TimeoutStopSec=30s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

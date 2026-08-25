@@ -1,7 +1,7 @@
 [Unit]
 Description=Local AI Agent authenticated web chat
-After=network-online.target qwen-vllm.service
-Wants=network-online.target
+After=network-online.target qwen-vllm.service local-ai-worker-tunnel.service
+Wants=network-online.target local-ai-worker-tunnel.service
 Requires=qwen-vllm.service
 StartLimitIntervalSec=5min
 StartLimitBurst=3
@@ -11,6 +11,7 @@ Type=simple
 User=root
 WorkingDirectory=/root/local-ai-agent
 Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/local-ai-agent/image-worker.env
 ExecStart=/root/local-ai-agent/web/run.sh
 Restart=always
 RestartSec=5s

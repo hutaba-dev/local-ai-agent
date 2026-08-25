@@ -1,0 +1,2 @@
+diffusers==0.36.0
+accelerate==1.12.0

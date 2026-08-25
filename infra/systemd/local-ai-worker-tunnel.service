@@ -1,0 +1,22 @@
+[Unit]
+Description=SSH tunnel to AHN7 image worker
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=5min
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/bin/ssh -NT -o ExitOnForwardFailure=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -L 127.0.0.1:18010:127.0.0.1:8010 -R 127.0.0.1:18000:127.0.0.1:8000 ahn7
+Restart=always
+RestartSec=5s
+TimeoutStartSec=30s
+TimeoutStopSec=10s
+NoNewPrivileges=true
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

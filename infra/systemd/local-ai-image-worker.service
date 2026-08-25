@@ -1,0 +1,28 @@
+[Unit]
+Description=Authenticated remote image capability worker
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=5min
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/srv/local-ai-worker/app
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/local-ai-worker/worker.env
+ExecStart=/srv/local-ai-worker/worker-venv/bin/python -m uvicorn image_worker.app:app --host 127.0.0.1 --port 8010
+Restart=always
+RestartSec=5s
+TimeoutStartSec=1min
+TimeoutStopSec=30s
+KillMode=control-group
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+UMask=0077
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
