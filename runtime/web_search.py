@@ -381,6 +381,11 @@ def _s2_author_queries(query: str) -> tuple[str, ...]:
     korean_match = re.search(r"([가-힣]{2,4})\s*교수", query)
     if korean_match:
         return (korean_match.group(1),)
+    leading_romanized_name = re.match(
+        r"\s*([A-Z][A-Za-z-]*\s+[A-Z][A-Za-z-]*)(?=[이가은는을를와과]\b)", query
+    )
+    if leading_romanized_name:
+        return (leading_romanized_name.group(1).replace("-", " "),)
     match = re.search(
         r"([A-Z][A-Za-z-]*\s+[A-Z][A-Za-z-]*)\s+(?:professor|researcher|academic)\b",
         query,

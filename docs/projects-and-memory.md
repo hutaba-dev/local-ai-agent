@@ -94,6 +94,20 @@ The runtime assembles bounded context in this order:
 
 The current vLLM context limit is 16,384 tokens. Project context is capped at 24,000 characters, with at most 12 memories, 6 file excerpts, and 10 recent messages. The runtime never scans the whole HDD for a request.
 
+## Deep Research Integration
+
+General Chat and Project Chat use the same `AgentRuntime` Deep Research engine. Project Chat adds bounded project context and scoped retrieval before the shared research pipeline; it does not use a reduced project-specific response generator.
+
+Selecting the Research agent explicitly always enters this shared Deep Research engine. The semantic classifier still plans queries, but a `NO_SEARCH` or `QUICK_SEARCH` classification cannot downgrade an explicit Research request. Automatic routing remains classifier-driven. Bounded Project context is available to the classifier only for resolving references such as “this researcher”; it remains user context rather than external evidence.
+
+Deep Research progresses through explicit planning, search, identity resolution, reading, verification, gap analysis, follow-up, and synthesis phases. Each evidence-gap decision is structured. When `ready_to_answer` is false, the runtime executes the proposed follow-up queries in another research round, up to four rounds. A person whose identity is unresolved after the first round receives at least one follow-up round.
+
+Malformed or unavailable gap-analysis output is treated as an unresolved evidence gap, not as permission to answer early. The runtime generates fallback follow-up queries and continues within the same research budget.
+
+For Korean person queries, the original Korean name is retained as an exact quoted search query. Romanized forms are optional additional queries and never replace the original name. Project summaries, memories, and file matches are marked as user workspace context rather than independent external evidence; claims about an external researcher must be supported by fetched web or academic sources.
+
+Only terminal research output is returned to the user. Planner or progress text is rejected as a final answer and receives one terminal synthesis retry; if that retry is also progress text, the request fails instead of returning a successful intermediate response. Every successful Deep Research response executes Analyst, Critic, and Final Synthesis calls. Agent Activity reports the research mode, state history, rounds, queries, tools, source counts, entity confidence, gap status, termination reason, and whether final synthesis executed. Private reasoning is never exposed.
+
 ## Memory Lifecycle
 
 After the assistant response is complete, a Starlette background task asks Qwen for strict structured output:

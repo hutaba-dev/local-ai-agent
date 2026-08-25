@@ -750,7 +750,12 @@ class WebRuntimeTests(unittest.TestCase):
             web_app.runtime = previous_runtime
 
         self.assertEqual(response.status_code, 200)
-        run_tools.assert_called_once_with("research", ("수소 연구를 요약해줘",), "NO_SEARCH", False)
+        self.assertEqual(run_tools.call_count, 4)
+        self.assertEqual(
+            run_tools.call_args_list[0].args,
+            ("research", ("수소 연구를 요약해줘",), "DEEP_RESEARCH", False),
+        )
+        self.assertTrue(all(call.args[-1] is False for call in run_tools.call_args_list))
         self.assertEqual(run_agent_tools("research", "수소 연구를 요약해줘", allow_local_tools=False), [])
 
     def test_admin_browser_research_has_no_local_project_tools(self) -> None:
@@ -764,7 +769,12 @@ class WebRuntimeTests(unittest.TestCase):
             web_app.runtime = previous_runtime
 
         self.assertEqual(response.status_code, 200)
-        run_tools.assert_called_once_with("research", ("수소 연구를 요약해줘",), "NO_SEARCH", False)
+        self.assertEqual(run_tools.call_count, 4)
+        self.assertEqual(
+            run_tools.call_args_list[0].args,
+            ("research", ("수소 연구를 요약해줘",), "DEEP_RESEARCH", False),
+        )
+        self.assertTrue(all(call.args[-1] is False for call in run_tools.call_args_list))
 
     def test_guest_legacy_session_is_replaced_before_history_is_used(self) -> None:
         old_session = self.runtime.new_session()
@@ -825,11 +835,15 @@ class WebRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result.route.agent, "research")
         self.assertEqual(result.route.search_mode, "DEEP_RESEARCH")
-        run_tools.assert_called_once_with(
-            "research",
-            (message, "liquefied hydrogen storage papers 2024 2026", "liquefied hydrogen storage review"),
-            "DEEP_RESEARCH",
-            True,
+        self.assertEqual(run_tools.call_count, 4)
+        self.assertEqual(
+            run_tools.call_args_list[0].args,
+            (
+                "research",
+                (message, "liquefied hydrogen storage papers 2024 2026", "liquefied hydrogen storage review"),
+                "DEEP_RESEARCH",
+                True,
+            ),
         )
 
     def test_deep_research_uses_evidence_analyst_critic_and_revision_passes(self) -> None:
@@ -838,6 +852,7 @@ class WebRuntimeTests(unittest.TestCase):
                 self.requests.append({"url": url, "json": json})
                 responses = (
                     '{"search_mode":"DEEP_RESEARCH","queries":["researcher papers"]}',
+                    '{"missing":[],"uncertain":[],"next_queries":[],"next_tools":[],"ready_to_answer":true,"entity_confidence":"HIGH"}',
                     "analyst draft",
                     "critic feedback",
                     "final revision",
@@ -854,15 +869,208 @@ class WebRuntimeTests(unittest.TestCase):
             )
 
         self.assertEqual(result.content, "final revision")
-        self.assertEqual(len(runtime._client.requests), 4)
-        analyst_input = runtime._client.requests[1]["json"]["messages"][1]["content"]
-        critic_input = runtime._client.requests[2]["json"]["messages"][1]["content"]
-        final_input = runtime._client.requests[3]["json"]["messages"][1]["content"]
+        self.assertEqual(len(runtime._client.requests), 5)
+        analyst_input = runtime._client.requests[2]["json"]["messages"][1]["content"]
+        critic_input = runtime._client.requests[3]["json"]["messages"][1]["content"]
+        final_input = runtime._client.requests[4]["json"]["messages"][1]["content"]
         self.assertIn("Evidence Package", analyst_input)
         self.assertIn("Project decision: pressure is 12 bar", analyst_input)
         self.assertIn("Project decision: pressure is 12 bar", critic_input)
         self.assertIn("Project decision: pressure is 12 bar", final_input)
         self.assertIn("Analyst Draft", critic_input)
+        self.assertTrue(result.research["final_synthesis_executed"])
+        self.assertEqual(result.research["state"], "COMPLETE")
+
+    def test_direct_research_selection_still_classifies_deep_research(self) -> None:
+        class DirectResearchClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                responses = (
+                    '{"search_mode":"NO_SEARCH","queries":[]}',
+                    '{"missing":[],"uncertain":[],"next_queries":[],"next_tools":[],"ready_to_answer":true,"entity_confidence":"HIGH"}',
+                    "analyst", "critic", "완료된 최종 답변",
+                )
+                response = FakeResponse()
+                response.json = lambda: {"choices": [{"message": {"content": responses[len(self.requests) - 1]}}], "usage": {}}  # type: ignore[method-assign]
+                return response
+
+        runtime = AgentRuntime(client=DirectResearchClient())
+        with patch("runtime.agent_runtime.run_agent_tools", return_value=[]):
+            result = runtime.chat("연구자로서의 역량을 근거로 평가해줘", "research")
+
+        self.assertEqual(result.route.search_mode, "DEEP_RESEARCH")
+        self.assertEqual(result.content, "완료된 최종 답변")
+        self.assertEqual(result.llm_calls[0]["purpose"], "research_mode_decision")
+
+    def test_research_classifier_receives_project_context_for_reference_resolution(self) -> None:
+        class ContextClassifierClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                response = FakeResponse()
+                response.json = lambda: {  # type: ignore[method-assign]
+                    "choices": [{"message": {"content": '{"search_mode":"DEEP_RESEARCH","queries":["안호선 교수 연구 실적"]}'}}],
+                    "usage": {},
+                }
+                return response
+
+        client = ContextClassifierClient()
+        runtime = AgentRuntime(client=client)
+
+        decision = runtime._search_decision(
+            "이 연구자가 왜 뛰어난지 근거를 찾아봐",
+            persistent_context="Project subject: 안호선 교수",
+            research_agent_selected=True,
+        )
+
+        classifier_input = client.requests[0]["json"]["messages"][1]["content"]
+        self.assertEqual(decision.mode, "DEEP_RESEARCH")
+        self.assertIn("Research agent selected: True", classifier_input)
+        self.assertIn("Project subject: 안호선 교수", classifier_input)
+        self.assertIn("not external evidence", classifier_input)
+
+    def test_unready_gap_executes_followup_round_before_final_synthesis(self) -> None:
+        class FollowupClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                responses = (
+                    '{"search_mode":"DEEP_RESEARCH","queries":["first query"]}',
+                    '{"missing":["identity"],"uncertain":[],"next_queries":["second query"],"next_tools":["web_search"],"ready_to_answer":false,"entity_confidence":"UNRESOLVED"}',
+                    '{"missing":[],"uncertain":[],"next_queries":[],"next_tools":[],"ready_to_answer":true,"entity_confidence":"HIGH"}',
+                    "analyst", "critic", "최종 평가",
+                )
+                response = FakeResponse()
+                response.json = lambda: {"choices": [{"message": {"content": responses[len(self.requests) - 1]}}], "usage": {}}  # type: ignore[method-assign]
+                return response
+
+        runtime = AgentRuntime(client=FollowupClient())
+        with patch("runtime.agent_runtime.run_agent_tools", return_value=[]) as run_tools:
+            result = runtime.chat("안호선 교수의 연구 역량을 평가해줘", "auto")
+
+        self.assertEqual(run_tools.call_count, 2)
+        self.assertEqual(run_tools.call_args_list[1].args[1], ("second query",))
+        self.assertEqual(len(result.research["rounds"]), 2)
+        self.assertFalse(result.research["rounds"][0]["ready_to_answer"])
+        self.assertTrue(result.research["final_synthesis_executed"])
+        self.assertEqual(result.research["state_history"][0], "PLANNING")
+        self.assertIn("FOLLOWUP", result.research["state_history"])
+        self.assertEqual(result.research["state_history"][-2:], ["SYNTHESIZING", "COMPLETE"])
+        self.assertEqual(result.content, "최종 평가")
+
+    def test_invalid_gap_output_triggers_followup_instead_of_early_completion(self) -> None:
+        class InvalidGapClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                responses = (
+                    '{"search_mode":"DEEP_RESEARCH","queries":["first query"]}',
+                    "Let me search more specifically.",
+                    '{"missing":[],"uncertain":[],"next_queries":[],"next_tools":[],'
+                    '"ready_to_answer":true,"entity_confidence":"HIGH"}',
+                    "analyst", "critic", "최종 평가",
+                )
+                response = FakeResponse()
+                response.json = lambda: {"choices": [{"message": {"content": responses[len(self.requests) - 1]}}], "usage": {}}  # type: ignore[method-assign]
+                return response
+
+        runtime = AgentRuntime(client=InvalidGapClient())
+        with patch("runtime.agent_runtime.run_agent_tools", return_value=[]) as run_tools:
+            result = runtime.chat("안호선 교수의 연구 역량을 평가해줘", "research")
+
+        self.assertEqual(run_tools.call_count, 2)
+        self.assertEqual(result.research["rounds"][0]["entity_confidence"], "UNRESOLVED")
+        self.assertFalse(result.research["rounds"][0]["ready_to_answer"])
+        self.assertEqual(result.research["state"], "COMPLETE")
+        self.assertTrue(result.research["final_synthesis_executed"])
+
+    def test_intermediate_research_progress_cannot_be_final_response(self) -> None:
+        class ProgressClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                responses = (
+                    '{"search_mode":"DEEP_RESEARCH","queries":["evidence"]}',
+                    '{"missing":[],"uncertain":[],"next_queries":[],"next_tools":[],"ready_to_answer":true,"entity_confidence":"HIGH"}',
+                    "analyst", "critic",
+                    "I'll investigate this. Let me search more specifically.",
+                    "## 결론\n검증된 근거에 따른 최종 답변입니다.",
+                )
+                response = FakeResponse()
+                response.json = lambda: {"choices": [{"message": {"content": responses[len(self.requests) - 1]}}], "usage": {}}  # type: ignore[method-assign]
+                return response
+
+        runtime = AgentRuntime(client=ProgressClient())
+        with patch("runtime.agent_runtime.run_agent_tools", return_value=[]):
+            result = runtime.chat("근거를 찾아 평가해줘", "auto")
+
+        self.assertNotIn("I'll investigate", result.content)
+        self.assertEqual(result.llm_calls[-1]["purpose"], "final_synthesis_retry")
+        self.assertTrue(result.research["final_synthesis_executed"])
+
+    def test_repeated_research_progress_output_fails_instead_of_completing(self) -> None:
+        class RepeatedProgressClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                responses = (
+                    '{"search_mode":"DEEP_RESEARCH","queries":["evidence"]}',
+                    '{"missing":[],"uncertain":[],"next_queries":[],"next_tools":[],'
+                    '"ready_to_answer":true,"entity_confidence":"HIGH"}',
+                    "analyst", "critic",
+                    "I'll investigate this. Let me search more specifically.",
+                    "I need more information. I'll check another source.",
+                )
+                response = FakeResponse()
+                response.json = lambda: {"choices": [{"message": {"content": responses[len(self.requests) - 1]}}], "usage": {}}  # type: ignore[method-assign]
+                return response
+
+        runtime = AgentRuntime(client=RepeatedProgressClient())
+        with patch("runtime.agent_runtime.run_agent_tools", return_value=[]):
+            with self.assertRaisesRegex(ValueError, "terminal final answer"):
+                runtime.chat("근거를 찾아 평가해줘", "research")
+
+    def test_general_and_project_chat_use_same_deep_research_runtime(self) -> None:
+        class EquivalentClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                responses = (
+                    '{"search_mode":"DEEP_RESEARCH","queries":["researcher evidence"]}',
+                    '{"missing":[],"uncertain":[],"next_queries":[],"next_tools":[],"ready_to_answer":true,"entity_confidence":"HIGH"}',
+                    "analyst", "critic", "최종 답변",
+                )
+                response = FakeResponse()
+                response.json = lambda: {"choices": [{"message": {"content": responses[len(self.requests) - 1]}}], "usage": {}}  # type: ignore[method-assign]
+                return response
+
+        question = "연구자에 대해서 찾아보고 연구자로서의 역량을 평가해줘"
+        project_scope = object()
+        with patch("runtime.agent_runtime.run_agent_tools", return_value=[]) as run_tools:
+            general = AgentRuntime(client=EquivalentClient()).chat(question, "auto")
+            project = AgentRuntime(client=EquivalentClient()).chat(
+                question, "auto", persistent_context="Prior project note", project_scope=project_scope  # type: ignore[arg-type]
+            )
+
+        self.assertEqual(general.route.search_mode, project.route.search_mode)
+        self.assertEqual(general.content, project.content)
+        self.assertEqual([call["purpose"] for call in general.llm_calls], [call["purpose"] for call in project.llm_calls])
+        self.assertEqual(len(general.research["rounds"]), len(project.research["rounds"]))
+        self.assertEqual(run_tools.call_args_list[0].args[:4], run_tools.call_args_list[1].args[:4])
+        self.assertIs(run_tools.call_args_list[1].args[4], project_scope)
+
+    def test_korean_person_name_is_preserved_as_exact_query(self) -> None:
+        queries = AgentRuntime._initial_research_queries(
+            "안호선 교수가 왜 뛰어난지 근거를 찾아봐",
+            ("Ahn Ho Seon publications",),
+        )
+
+        self.assertEqual(queries[0], '"안호선"')
+        self.assertIn("안호선 교수가 왜 뛰어난지 근거를 찾아봐", queries)
+        self.assertIn("Ahn Ho Seon publications", queries)
+
+    def test_generic_researcher_phrases_are_not_treated_as_korean_names(self) -> None:
+        overseas = AgentRuntime._initial_research_queries(
+            "Geoffrey Hinton이 왜 유명한 해외 연구자인지 평가해줘", ()
+        )
+        sparse = AgentRuntime._initial_research_queries("정보가 거의 없는 연구자를 조사해줘", ())
+
+        self.assertNotIn('"해외"', overseas)
+        self.assertNotIn('"없는"', sparse)
 
     def test_research_uses_larger_output_budget_and_marks_truncation(self) -> None:
         class TruncatedResponse(FakeResponse):
@@ -879,7 +1087,7 @@ class WebRuntimeTests(unittest.TestCase):
         client = TruncatedClient()
         result = AgentRuntime(client=client).chat("논문을 분석해줘", "research")
 
-        self.assertEqual(client.requests[0]["json"]["max_tokens"], 4096)
+        self.assertEqual(client.requests[-1]["json"]["max_tokens"], 4096)
         self.assertIn("truncated", result.content)
 
     def test_brave_search_limits_quick_results(self) -> None:
@@ -967,6 +1175,12 @@ class WebRuntimeTests(unittest.TestCase):
 
     def test_s2_author_queries_extracts_korean_professor_name(self) -> None:
         self.assertEqual(_s2_author_queries("안호선교수 연구 역량"), ("안호선",))
+
+    def test_s2_author_queries_extracts_romanized_name_before_korean_particle(self) -> None:
+        self.assertEqual(
+            _s2_author_queries("Geoffrey Hinton이 왜 유명한 해외 연구자인지 평가해줘"),
+            ("Geoffrey Hinton",),
+        )
 
     def test_s2_author_selection_prefers_full_name_over_initials(self) -> None:
         selected = _select_s2_author(

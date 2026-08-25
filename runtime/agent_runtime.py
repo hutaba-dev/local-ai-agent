@@ -7,6 +7,7 @@ import os
 import re
 import base64
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from time import perf_counter
 from typing import Callable, TypeVar
@@ -22,13 +23,19 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_DIR = REPO_ROOT / "agents"
 MODEL = os.getenv("OPENAI_MODEL", "qwen3.8-27b")
 BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
-MAX_TOOL_ITERATIONS = 1
+MAX_RESEARCH_ROUNDS = 4
 DEFAULT_MAX_TOKENS = 1024
 RESEARCH_MAX_TOKENS = 4096
-CRITIC_MAX_TOKENS = 1200
+ANALYST_MAX_TOKENS = 2000
+CRITIC_MAX_TOKENS = 800
 SEARCH_MODES = ("NO_SEARCH", "QUICK_SEARCH", "DEEP_RESEARCH")
 IP_ADDRESS_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 HOSTNAME_VALUE_PATTERN = re.compile(r"(?i)(hostname|host name|호스트명)\s*[:：]?\s*[a-z0-9][a-z0-9.-]*")
+KOREAN_PERSON_PATTERN = re.compile(r"(?P<name>[가-힣]{2,5})\s*(?:교수|박사)")
+PERSON_RESEARCH_PATTERN = re.compile(r"(?:교수|박사|연구자|\bprofessor\b|\bresearcher\b)", re.IGNORECASE)
+RESEARCH_PROGRESS_PATTERN = re.compile(
+    r"(?i)^\s*(?:i(?:'ll| will| need\b)|let me|the (?:initial|first) search|먼저 찾아|더 찾아|조사해 ?보겠|확인해 ?보겠)"
+)
 
 
 @dataclass(frozen=True)
@@ -42,12 +49,36 @@ class ChatResult:
     usage: dict[str, int] | None
     llm_calls: list[dict[str, object]]
     stages: list[dict[str, object]]
+    research: dict[str, object]
 
 
 @dataclass(frozen=True)
 class SearchDecision:
     mode: str
     queries: tuple[str, ...] = ()
+
+
+class ResearchState(str, Enum):
+    PLANNING = "PLANNING"
+    SEARCHING = "SEARCHING"
+    IDENTIFYING = "IDENTIFYING"
+    READING = "READING"
+    VERIFYING = "VERIFYING"
+    GAP_ANALYSIS = "GAP_ANALYSIS"
+    FOLLOWUP = "FOLLOWUP"
+    SYNTHESIZING = "SYNTHESIZING"
+    COMPLETE = "COMPLETE"
+    FAILED = "FAILED"
+
+
+@dataclass(frozen=True)
+class ResearchGap:
+    missing: tuple[str, ...]
+    uncertain: tuple[str, ...]
+    next_queries: tuple[str, ...]
+    next_tools: tuple[str, ...]
+    ready_to_answer: bool
+    entity_confidence: str
 
 
 T = TypeVar("T")
@@ -123,8 +154,15 @@ class AgentRuntime:
         session = self.sessions.get_or_create(session_id)
         decision = SearchDecision("NO_SEARCH") if images else latency.stage(
             "research_mode_decision",
-            lambda: self._search_decision(message, latency),
-        ) if selected_agent == "auto" else SearchDecision("NO_SEARCH")
+            lambda: self._search_decision(
+                message,
+                latency,
+                persistent_context=persistent_context,
+                research_agent_selected=selected_agent == "research",
+            ),
+        ) if selected_agent in {"auto", "research"} else SearchDecision("NO_SEARCH")
+        if selected_agent == "research" and decision.mode != "DEEP_RESEARCH":
+            decision = SearchDecision("DEEP_RESEARCH", decision.queries or (message,))
         search_mode = decision.mode
         route = route_request(message, selected_agent, search_mode)
         if allowed_agents is not None and route.agent not in allowed_agents:
@@ -133,21 +171,32 @@ class AgentRuntime:
                 search_mode = "NO_SEARCH"
             else:
                 raise PermissionError("This account is not permitted to access the requested capability.")
-        tool_message = (message, *decision.queries) if search_mode == "DEEP_RESEARCH" else (decision.queries or (message,))
-        tools = latency.stage(
-            "research_round_1_tools",
-            lambda: (
-                run_agent_tools(route.agent, tool_message, route.search_mode, allow_local_tools, project_scope)
-                if project_scope is not None
-                else run_agent_tools(route.agent, tool_message, route.search_mode, allow_local_tools)
-            ),
-        ) if route.agent != "main" or project_scope is not None else []
         system_prompt = self._load_prompt(route.agent)
+        research: dict[str, object] = {
+            "mode": route.search_mode,
+            "state": ResearchState.COMPLETE.value,
+            "rounds": [],
+            "entity_confidence": "NOT_APPLICABLE",
+            "gap_status": "NOT_APPLICABLE",
+            "final_synthesis_executed": False,
+            "termination_reason": "non_deep_response",
+        }
         if route.agent == "research" and route.search_mode == "DEEP_RESEARCH":
-            answer, payload = self._synthesize_research(
-                message, tools, system_prompt, latency, persistent_context
+            tools, answer, payload, research = self._run_deep_research(
+                message,
+                decision.queries,
+                system_prompt,
+                latency,
+                allow_local_tools,
+                persistent_context,
+                project_scope,
             )
         else:
+            tool_message = decision.queries or (message,)
+            tools = latency.stage(
+                "research_round_1_tools",
+                lambda: self._run_tools(route.agent, tool_message, route.search_mode, allow_local_tools, project_scope),
+            ) if route.agent != "main" or project_scope is not None else []
             public_context = self._tool_context(tools)
             user_content: str | list[dict[str, object]] = message
             if images:
@@ -192,7 +241,203 @@ class AgentRuntime:
             usage if isinstance(usage, dict) else None,
             latency.llm_calls,
             latency.stages,
+            research,
         )
+
+    @staticmethod
+    def _run_tools(
+        agent: str,
+        queries: str | tuple[str, ...],
+        search_mode: str,
+        allow_local_tools: bool,
+        project_scope: ProjectToolScope | None,
+    ) -> list[dict[str, object]]:
+        if project_scope is not None:
+            return run_agent_tools(agent, queries, search_mode, allow_local_tools, project_scope)
+        return run_agent_tools(agent, queries, search_mode, allow_local_tools)
+
+    def _run_deep_research(
+        self,
+        question: str,
+        planned_queries: tuple[str, ...],
+        system_prompt: str,
+        latency: LatencyRecorder,
+        allow_local_tools: bool,
+        persistent_context: str,
+        project_scope: ProjectToolScope | None,
+    ) -> tuple[list[dict[str, object]], str, dict[str, object], dict[str, object]]:
+        all_tools: list[dict[str, object]] = []
+        round_activity: list[dict[str, object]] = []
+        state_history = [ResearchState.PLANNING.value]
+        queries = self._initial_research_queries(question, planned_queries)
+        person_query = PERSON_RESEARCH_PATTERN.search(question) is not None
+        entity_confidence = "UNKNOWN"
+        gap_status = "NOT_EVALUATED"
+        termination_reason = "research_budget_exhausted"
+
+        for round_number in range(1, MAX_RESEARCH_ROUNDS + 1):
+            state_history.append(ResearchState.SEARCHING.value)
+            if person_query:
+                state_history.append(ResearchState.IDENTIFYING.value)
+            round_tools = latency.stage(
+                f"research_round_{round_number}_tools",
+                lambda queries=queries: self._run_tools(
+                    "research", queries, "DEEP_RESEARCH", allow_local_tools, project_scope
+                ),
+            )
+            all_tools.extend(round_tools)
+            state_history.extend((ResearchState.READING.value, ResearchState.VERIFYING.value))
+            state_history.append(ResearchState.GAP_ANALYSIS.value)
+            gap = latency.stage(
+                f"research_round_{round_number}_gap_analysis",
+                lambda: self._research_gap(question, queries, all_tools, system_prompt, latency),
+            )
+            entity_confidence = gap.entity_confidence
+            gap_status = "READY" if gap.ready_to_answer else "FOLLOWUP_REQUIRED"
+            round_activity.append({
+                "round": round_number,
+                "queries": list(queries),
+                "tools": [str(tool.get("name", "")) for tool in round_tools],
+                "sources_fetched": self._source_count(round_tools),
+                "entity_confidence": entity_confidence,
+                "missing": list(gap.missing),
+                "uncertain": list(gap.uncertain),
+                "next_queries": list(gap.next_queries),
+                "next_tools": list(gap.next_tools),
+                "ready_to_answer": gap.ready_to_answer,
+            })
+            identity_unresolved = person_query and entity_confidence in {
+                "UNKNOWN", "LOW", "UNRESOLVED", "AMBIGUOUS"
+            }
+            if gap.ready_to_answer and not (round_number == 1 and identity_unresolved):
+                termination_reason = "evidence_ready"
+                break
+            if round_number == MAX_RESEARCH_ROUNDS:
+                break
+            queries = gap.next_queries or self._fallback_followup_queries(question)
+            if not queries:
+                termination_reason = "no_followup_queries"
+                break
+            state_history.append(ResearchState.FOLLOWUP.value)
+
+        state_history.append(ResearchState.SYNTHESIZING.value)
+        answer, payload = latency.stage(
+            "final_synthesis",
+            lambda: self._synthesize_research(question, all_tools, system_prompt, latency, persistent_context),
+        )
+        state_history.append(ResearchState.COMPLETE.value)
+        return all_tools, answer, payload, {
+            "mode": "DEEP_RESEARCH",
+            "state": ResearchState.COMPLETE.value,
+            "state_history": state_history,
+            "rounds": round_activity,
+            "entity_confidence": entity_confidence,
+            "gap_status": gap_status,
+            "final_synthesis_executed": True,
+            "termination_reason": termination_reason,
+        }
+
+    @staticmethod
+    def _initial_research_queries(question: str, planned_queries: tuple[str, ...]) -> tuple[str, ...]:
+        queries: list[str] = []
+        person_match = KOREAN_PERSON_PATTERN.search(question)
+        if person_match:
+            queries.append(f'"{person_match.group("name")}"')
+        queries.extend((question, *planned_queries))
+        return tuple(dict.fromkeys(query.strip()[:500] for query in queries if query.strip()))
+
+    @staticmethod
+    def _fallback_followup_queries(question: str) -> tuple[str, ...]:
+        person_match = KOREAN_PERSON_PATTERN.search(question)
+        if not person_match:
+            return (f"{question} primary sources", f"{question} independent verification")
+        name = person_match.group("name")
+        return (
+            f'"{name}" 교수 대학 연구',
+            f'"{name}" 논문 연구실적',
+            f'"{name}" official university profile',
+        )
+
+    def _research_gap(
+        self,
+        question: str,
+        round_queries: tuple[str, ...],
+        tools: list[dict[str, object]],
+        system_prompt: str,
+        latency: LatencyRecorder,
+    ) -> ResearchGap:
+        evidence_package = self._evidence_package(tools)
+        prompt = (
+            "Evaluate research evidence coverage without answering the user. Return exactly one JSON object: "
+            '{"missing":[],"uncertain":[],"next_queries":[],"next_tools":[],"ready_to_answer":false,'
+            '"entity_confidence":"HIGH|MEDIUM|LOW|UNRESOLVED|AMBIGUOUS|NOT_APPLICABLE"}. '
+            "A wrong-name or same-name result means identity resolution is required, not that the target does not exist. "
+            "For a person, require affiliation/topic cross-check and favor official profiles plus academic metadata. "
+            "Preserve the original Korean name exactly in follow-up queries; romanizations are additional aliases only. "
+            "Set ready_to_answer=false whenever identity or a material evidence gap remains. Do not include prose.\n\n"
+            f"Question:\n{question}\n\nQueries executed:\n{json.dumps(round_queries, ensure_ascii=False)}\n\n"
+            f"External Evidence Package:\n{json.dumps(evidence_package, ensure_ascii=False)}"
+        )
+        try:
+            content, _ = self._complete(
+                [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
+                700,
+                latency,
+                "evidence_gap_analysis",
+                temperature=0,
+            )
+            return self._parse_research_gap(content)
+        except (httpx.HTTPError, ValueError):
+            return ResearchGap(
+                ("gap analysis unavailable",), (), self._fallback_followup_queries(question), (), False,
+                "UNRESOLVED" if PERSON_RESEARCH_PATTERN.search(question) else "UNKNOWN",
+            )
+
+    @staticmethod
+    def _parse_research_gap(content: str) -> ResearchGap:
+        decoder = json.JSONDecoder()
+        for index, character in enumerate(content):
+            if character != "{":
+                continue
+            try:
+                value, _ = decoder.raw_decode(content[index:])
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(value, dict) or not isinstance(value.get("ready_to_answer"), bool):
+                continue
+
+            def strings(key: str, limit: int = 8) -> tuple[str, ...]:
+                items = value.get(key)
+                if not isinstance(items, list):
+                    return ()
+                return tuple(item.strip()[:500] for item in items[:limit] if isinstance(item, str) and item.strip())
+
+            confidence = value.get("entity_confidence")
+            if confidence not in {"HIGH", "MEDIUM", "LOW", "UNRESOLVED", "AMBIGUOUS", "NOT_APPLICABLE"}:
+                confidence = "UNKNOWN"
+            return ResearchGap(
+                strings("missing"),
+                strings("uncertain"),
+                strings("next_queries", 4),
+                strings("next_tools", 4),
+                value["ready_to_answer"],
+                confidence,
+            )
+        raise ValueError("model did not return a valid research gap decision")
+
+    @staticmethod
+    def _source_count(tools: list[dict[str, object]]) -> int:
+        total = 0
+        for tool in tools:
+            if not tool.get("success") or tool.get("name") not in {"web_sources", "academic_papers"}:
+                continue
+            try:
+                output = json.loads(str(tool.get("output", "")))
+            except json.JSONDecodeError:
+                continue
+            if isinstance(output, list):
+                total += len(output)
+        return total
 
     @staticmethod
     def _max_tokens(route: Route) -> int:
@@ -233,6 +478,7 @@ class AgentRuntime:
         package_json = json.dumps(evidence_package, ensure_ascii=False)
         analyst_prompt = (
             "You are the Analyst / Synthesizer. Use only the supplied Evidence Package. "
+            "Project context is user workspace context, not independently verified evidence; never use it to prove an external claim. "
             "Do not merely summarize facts. Explain what each evidence item means for the requested evaluation. "
             "Do not judge from publication or citation counts alone: assess topic consistency, development, originality, "
             "representative-work significance, recent activity, collaboration, and leadership where evidence exists. "
@@ -241,7 +487,7 @@ class AgentRuntime:
         )
         draft, _ = self._complete(
             [{"role": "system", "content": system_prompt}, {"role": "user", "content": analyst_prompt}],
-            RESEARCH_MAX_TOKENS,
+            ANALYST_MAX_TOKENS,
             latency,
             "analyst_synthesis",
         )
@@ -261,15 +507,35 @@ class AgentRuntime:
         revision_prompt = (
             "Write the final research answer in the user's language. Use the Analyst Draft and Critic Feedback, "
             "but treat the Evidence Package as the sole factual authority. Do not add facts absent from it or expose this workflow. "
+            "Return a completed answer, never a plan, progress update, promise to search, or follow-up instruction. "
+            "Do not assume praise in the question is true; state when the evidence is insufficient for that characterization. "
             "Connect facts to meaning, comparative judgment, limitations, and a clear overall assessment. Preserve URL citations.\n\n"
             f"Question:\n{question}\n\nEvidence Package:\n{package_json}\n\nAnalyst Draft:\n{draft}\n\nCritic Feedback:\n{critique}"
         )
-        return self._complete(
+        answer, payload = self._complete(
             [{"role": "system", "content": system_prompt}, {"role": "user", "content": revision_prompt}],
             RESEARCH_MAX_TOKENS,
             latency,
             "final_revision",
         )
+        if not RESEARCH_PROGRESS_PATTERN.search(answer):
+            return answer, payload
+        repair_prompt = (
+            "The prior output was a research progress message, which is not a valid final answer. "
+            "Using only the Evidence Package, write the completed terminal research answer now in the user's language. "
+            "Include identity confidence, evidence-based findings, limitations, overall assessment, and source URLs. "
+            "Do not describe future work or the research process.\n\n"
+            f"Question:\n{question}\n\nEvidence Package:\n{package_json}"
+        )
+        repaired_answer, repaired_payload = self._complete(
+            [{"role": "system", "content": system_prompt}, {"role": "user", "content": repair_prompt}],
+            RESEARCH_MAX_TOKENS,
+            latency,
+            "final_synthesis_retry",
+        )
+        if RESEARCH_PROGRESS_PATTERN.search(repaired_answer):
+            raise ValueError("deep research did not produce a terminal final answer")
+        return repaired_answer, repaired_payload
 
     def _complete(
         self,
@@ -353,8 +619,12 @@ class AgentRuntime:
         package: dict[str, object] = {
             "identity": {}, "career": {}, "metrics": {}, "research_topics": [],
             "representative_works": [], "recent_activity": [], "leadership": [],
-            "collaboration": [], "limitations": [], "sources": [], "project_workspace": {},
-            "persistent_project_context": persistent_context,
+            "collaboration": [], "limitations": [], "sources": [],
+            "project_context": {
+                "provenance": "user_workspace_context_not_external_evidence",
+                "content": persistent_context[:6000],
+                "workspace_search": {},
+            },
         }
         for tool in tools:
             if not tool.get("success"):
@@ -371,21 +641,83 @@ class AgentRuntime:
                     package["metrics"] = {key: author.get(key) for key in ("paper_count", "citation_count", "h_index")}
                 papers = output.get("representative_papers")
                 if isinstance(papers, list):
-                    package["representative_works"].extend(papers)
+                    package["representative_works"].extend(
+                        AgentRuntime._compact_work(paper) for paper in papers if isinstance(paper, dict)
+                    )
                 if output.get("identity_status") == "ambiguous":
                     package["limitations"].append({"identity_status": "ambiguous", "same_name_candidate_count": output.get("same_name_candidate_count")})
             elif tool.get("name") == "academic_papers" and isinstance(output, list):
-                package["representative_works"].extend(output)
+                package["representative_works"].extend(
+                    AgentRuntime._compact_work(paper) for paper in output if isinstance(paper, dict)
+                )
             elif tool.get("name") == "web_sources" and isinstance(output, list):
                 package["sources"].extend(
-                    {key: item.get(key) for key in ("title", "url", "text")}
+                    {
+                        "title": str(item.get("title", ""))[:300],
+                        "url": str(item.get("url", ""))[:1000],
+                        "text": str(item.get("text", ""))[:1200],
+                    }
                     for item in output if isinstance(item, dict)
                 )
             elif tool.get("name") == "project_hybrid_search" and isinstance(output, dict):
-                package["project_workspace"] = output
+                project_context = package["project_context"]
+                if isinstance(project_context, dict):
+                    project_context["workspace_search"] = {
+                        "excerpt": json.dumps(output, ensure_ascii=False)[:4000]
+                    }
+        package["representative_works"] = AgentRuntime._deduplicate_records(
+            package["representative_works"], ("doi", "url", "title"), 12
+        )
+        package["sources"] = AgentRuntime._deduplicate_records(package["sources"], ("url", "title"), 6)
         return package
 
-    def _search_decision(self, message: str, latency: LatencyRecorder | None = None) -> SearchDecision:
+    @staticmethod
+    def _compact_work(work: dict[str, object]) -> dict[str, object]:
+        compact: dict[str, object] = {}
+        for key in (
+            "title", "url", "doi", "year", "publication_year", "cited_by_count", "citation_count",
+            "venue", "journal", "authors", "abstract", "tldr",
+        ):
+            value = work.get(key)
+            if isinstance(value, str):
+                compact[key] = value[:800]
+            elif isinstance(value, (int, float, bool)) or value is None:
+                compact[key] = value
+            elif isinstance(value, list):
+                compact[key] = value[:8]
+            elif isinstance(value, dict):
+                compact[key] = {nested_key: nested_value for nested_key, nested_value in list(value.items())[:8]}
+        return compact
+
+    @staticmethod
+    def _deduplicate_records(records: object, keys: tuple[str, ...], limit: int) -> list[dict[str, object]]:
+        if not isinstance(records, list):
+            return []
+        unique: list[dict[str, object]] = []
+        seen: set[str] = set()
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            identity = next(
+                (str(record[key]).strip().lower() for key in keys if record.get(key)),
+                json.dumps(record, ensure_ascii=False, sort_keys=True)[:500],
+            )
+            if identity in seen:
+                continue
+            seen.add(identity)
+            unique.append(record)
+            if len(unique) == limit:
+                break
+        return unique
+
+    def _search_decision(
+        self,
+        message: str,
+        latency: LatencyRecorder | None = None,
+        *,
+        persistent_context: str = "",
+        research_agent_selected: bool = False,
+    ) -> SearchDecision:
         decision_prompt = (
             "Decide whether this request needs external web evidence before answering. "
             "Return exactly one JSON object and no other text in this form: "
@@ -393,16 +725,31 @@ class AgentRuntime:
             "Use NO_SEARCH for writing, translation, supplied-text work, stable concepts, or local server/repository questions. "
             "Use QUICK_SEARCH for a current fact, recent event, price, availability, schedule, policy, or fact check. "
             "Use DEEP_RESEARCH for a multi-source comparison, report, recommendation, academic or technical source search, "
-            "medical/legal/financial guidance, or contested claim. For QUICK_SEARCH provide exactly one concise query. "
+            "medical/legal/financial guidance, contested claim, or an evidence-based evaluation of why a person is notable, "
+            "capable, famous, or highly regarded. Requests to evaluate a researcher, analyze achievements, find supporting grounds, "
+            "or investigate deeply are DEEP_RESEARCH even when phrased conversationally or referring to a person from prior context as "
+            "'this researcher'. Korean examples such as '왜 뛰어난지', '근거를 찾아봐', '연구자로서 평가', '실적 분석', "
+            "'능력을 판단', and '왜 유명한지' require DEEP_RESEARCH when they ask for evidence or evaluation. "
+            "A direct Research agent selection is a strong signal for DEEP_RESEARCH when the request asks to find, verify, evaluate, or analyze evidence. "
+            "For QUICK_SEARCH provide exactly one concise query. "
             "For DEEP_RESEARCH provide 2 to 4 complementary queries covering the question's major evidence needs; include a query for "
-            "primary or official sources and, when relevant, a query for academic papers. "
+            "primary or official sources and, when relevant, a query for academic papers. Preserve a Korean person's original name exactly "
+            "in at least one query; romanizations may only be additional queries. Treat praise in the request as a hypothesis to test. "
             "Do not answer the request yet."
         )
         try:
+            classifier_input = message
+            if persistent_context or research_agent_selected:
+                classifier_input = (
+                    f"Research agent selected: {research_agent_selected}\n"
+                    f"User request: {message}\n"
+                    "Bounded project context for resolving references only; it is not external evidence:\n"
+                    f"{persistent_context[:3000]}"
+                )
             content, _ = self._complete(
                 [
                     {"role": "system", "content": decision_prompt},
-                    {"role": "user", "content": message},
+                    {"role": "user", "content": classifier_input},
                 ],
                 256,
                 latency,

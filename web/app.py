@@ -815,7 +815,8 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             "end_to_end_tokens_per_second": end_to_end_tokens_per_second,
             "llm_calls": result.llm_calls,
             "stages": result.stages,
-            "research_rounds": 1 if result.route.search_mode == "DEEP_RESEARCH" else 0,
+            "research_rounds": len(result.research.get("rounds", [])),
+            "research": result.research,
             "whole_request_usage": {
                 "input_tokens": total_input_tokens,
                 "output_tokens": total_output_tokens,

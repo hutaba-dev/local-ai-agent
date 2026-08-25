@@ -201,6 +201,12 @@ function activityElement(activity) {
   const usage = activity.usage || {};
   const wholeUsage = activity.whole_request_usage || {};
   const finalCall = activity.final_call || {};
+  const research = activity.research || {};
+  const researchRounds = (research.rounds || []).map((round) => (
+    `<div>Round ${escapeHtml(String(round.round))}: ${escapeHtml((round.queries || []).join(" | "))}<br>` +
+    `Tools: ${escapeHtml((round.tools || []).join(", ") || "none")}; sources: ${escapeHtml(String(round.sources_fetched ?? 0))}; ` +
+    `entity: ${escapeHtml(round.entity_confidence || "UNKNOWN")}; gap: ${round.ready_to_answer ? "ready" : "follow-up"}</div>`
+  )).join("") || "N/A";
   const llmCalls = (activity.llm_calls || []).map((call) => (
     `<div>#${escapeHtml(String(call.call_id))} ${escapeHtml(call.purpose)}: ${formatMs(call.total_llm_latency_ms)}${call.decode_tokens_per_second ? `, ${escapeHtml(String(call.decode_tokens_per_second))} tok/s decode` : ""}</div>`
   )).join("") || "No model calls recorded";
@@ -214,7 +220,12 @@ function activityElement(activity) {
     ["Final synthesis input", usage.prompt_tokens ?? "N/A"], ["Final synthesis output", usage.completion_tokens ?? "N/A"],
     ["Final synthesis TTFT", formatMs(finalCall.ttft_ms)], ["Final synthesis decode", formatMs(finalCall.generation_time_ms)],
     ["Final synthesis decode speed", finalCall.decode_tokens_per_second ? `${finalCall.decode_tokens_per_second} tok/s` : "N/A"],
-    ["Research rounds", activity.research_rounds ? `${activity.research_rounds} / 1` : "N/A"],
+    ["Research mode", research.mode || "N/A"], ["Research state", research.state || "N/A"],
+    ["State history", (research.state_history || []).join(" → ") || "N/A"],
+    ["Research rounds", activity.research_rounds || "N/A"], ["Round detail", researchRounds],
+    ["Entity confidence", research.entity_confidence || "N/A"], ["Gap status", research.gap_status || "N/A"],
+    ["Final synthesis executed", research.final_synthesis_executed ? "YES" : "NO"],
+    ["Termination", research.termination_reason || "N/A"],
     ["LLM calls", wholeUsage.llm_call_count ?? 0], ["Whole LLM input", wholeUsage.input_tokens ?? 0],
     ["Whole LLM output", wholeUsage.output_tokens ?? 0], ["Stages", stages], ["LLM timing", llmCalls], ["Tools", tools],
   ];
