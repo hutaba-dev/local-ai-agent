@@ -28,6 +28,9 @@ DEFAULT_MAX_TOKENS = 1024
 RESEARCH_MAX_TOKENS = 4096
 ANALYST_MAX_TOKENS = 2000
 CRITIC_MAX_TOKENS = 800
+MAX_EVIDENCE_JSON_CHARS = 12_000
+MAX_ANALYST_DRAFT_CHARS = 6_000
+MAX_CRITIQUE_CHARS = 2_400
 SEARCH_MODES = ("NO_SEARCH", "QUICK_SEARCH", "DEEP_RESEARCH")
 IP_ADDRESS_PATTERN = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 HOSTNAME_VALUE_PATTERN = re.compile(r"(?i)(hostname|host name|호스트명)\s*[:：]?\s*[a-z0-9][a-z0-9.-]*")
@@ -486,7 +489,7 @@ class AgentRuntime:
         persistent_context: str = "",
     ) -> tuple[str, dict[str, object]]:
         evidence_package = self._evidence_package(tools, persistent_context)
-        package_json = json.dumps(evidence_package, ensure_ascii=False)
+        package_json = self._bounded_evidence_json(evidence_package)
         analyst_prompt = (
             "You are the Analyst / Synthesizer. Use only the supplied Evidence Package. "
             "Project context is user workspace context, not independently verified evidence; never use it to prove an external claim. "
@@ -504,12 +507,13 @@ class AgentRuntime:
             latency,
             "analyst_synthesis",
         )
+        bounded_draft = self._bounded_text(draft, MAX_ANALYST_DRAFT_CHARS)
         critic_prompt = (
             "You are the Critic. Review the Analyst Draft only against the Evidence Package. "
             "Do not add facts. Identify: unsupported claims, excessive praise or criticism, citation-metric overinterpretation, "
             "identity confusion, unsourced numbers, shallow representative-work explanations, inadequate answer to the question, "
             "repetition, and missing limitations or counterarguments. Return concise actionable revision notes.\n\n"
-            f"Evidence Package:\n{package_json}\n\nAnalyst Draft:\n{draft}"
+            f"Evidence Package:\n{package_json}\n\nAnalyst Draft:\n{bounded_draft}"
         )
         critique, _ = self._complete(
             [{"role": "system", "content": system_prompt}, {"role": "user", "content": critic_prompt}],
@@ -517,6 +521,7 @@ class AgentRuntime:
             latency,
             "critic",
         )
+        bounded_critique = self._bounded_text(critique, MAX_CRITIQUE_CHARS)
         revision_prompt = (
             "Write the final research answer in the user's language. Use the Analyst Draft and Critic Feedback, "
             "but treat the Evidence Package as the sole factual authority. Do not add facts absent from it or expose this workflow. "
@@ -524,7 +529,7 @@ class AgentRuntime:
             "Do not assume praise in the question is true; state when the evidence is insufficient for that characterization. "
             "Report database-specific publication/citation metrics separately and explain material coverage conflicts. "
             "Connect facts to meaning, comparative judgment, limitations, and a clear overall assessment. Preserve URL citations.\n\n"
-            f"Question:\n{question}\n\nEvidence Package:\n{package_json}\n\nAnalyst Draft:\n{draft}\n\nCritic Feedback:\n{critique}"
+            f"Question:\n{question}\n\nEvidence Package:\n{package_json}\n\nAnalyst Draft:\n{bounded_draft}\n\nCritic Feedback:\n{bounded_critique}"
         )
         answer, payload = self._complete(
             [{"role": "system", "content": system_prompt}, {"role": "user", "content": revision_prompt}],
@@ -550,6 +555,49 @@ class AgentRuntime:
         if RESEARCH_PROGRESS_PATTERN.search(repaired_answer):
             raise ValueError("deep research did not produce a terminal final answer")
         return repaired_answer, repaired_payload
+
+    @staticmethod
+    def _bounded_text(value: str, limit: int) -> str:
+        if len(value) <= limit:
+            return value
+        head_length = limit * 2 // 3
+        tail_length = limit - head_length
+        return f"{value[:head_length]}\n...[truncated for context budget]...\n{value[-tail_length:]}"
+
+    @staticmethod
+    def _bounded_evidence_json(package: dict[str, object]) -> str:
+        bounded = json.loads(json.dumps(package, ensure_ascii=False))
+        project_context = bounded.get("project_context")
+        if isinstance(project_context, dict) and isinstance(project_context.get("content"), str):
+            project_context["content"] = project_context["content"][:3000]
+        for work in bounded.get("representative_works", []):
+            if isinstance(work, dict):
+                for key in ("abstract", "tldr"):
+                    if isinstance(work.get(key), str):
+                        work[key] = work[key][:500]
+        for source in bounded.get("sources", []):
+            if isinstance(source, dict) and isinstance(source.get("text"), str):
+                source["text"] = source["text"][:600]
+        bounded["evidence_truncated_for_context"] = False
+        serialized = json.dumps(bounded, ensure_ascii=False)
+        if len(serialized) <= MAX_EVIDENCE_JSON_CHARS:
+            return serialized
+        bounded["evidence_truncated_for_context"] = True
+        works = bounded.get("representative_works")
+        sources = bounded.get("sources")
+        while len(serialized) > MAX_EVIDENCE_JSON_CHARS and isinstance(works, list) and len(works) > 6:
+            works.pop()
+            serialized = json.dumps(bounded, ensure_ascii=False)
+        while len(serialized) > MAX_EVIDENCE_JSON_CHARS and isinstance(sources, list) and len(sources) > 3:
+            sources.pop()
+            serialized = json.dumps(bounded, ensure_ascii=False)
+        while len(serialized) > MAX_EVIDENCE_JSON_CHARS and isinstance(works, list) and works:
+            works.pop()
+            serialized = json.dumps(bounded, ensure_ascii=False)
+        while len(serialized) > MAX_EVIDENCE_JSON_CHARS and isinstance(sources, list) and sources:
+            sources.pop()
+            serialized = json.dumps(bounded, ensure_ascii=False)
+        return serialized
 
     def _complete(
         self,

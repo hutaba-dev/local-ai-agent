@@ -58,6 +58,21 @@ class AcademicIntelligenceTests(unittest.TestCase):
         self.assertTrue(all(call.kwargs["headers"]["X-ELS-APIKey"] == "key" for call in get.call_args_list))
         self.assertTrue(all(call.kwargs["headers"]["X-ELS-Insttoken"] == "token" for call in get.call_args_list))
 
+    def test_scopus_ignores_non_ascii_institution_token_placeholder(self) -> None:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"search-results": {"entry": []}}
+        with patch.dict(
+            os.environ,
+            {"SCOPUS_API_KEY": "real-ascii-key", "SCOPUS_INST_TOKEN": "발급받은_기관_토큰"},
+            clear=True,
+        ), patch("runtime.academic_intelligence.httpx.get", return_value=response) as get:
+            scopus_search_authors("AUTHLASTNAME(Ahn)")
+
+        headers = get.call_args.kwargs["headers"]
+        self.assertEqual(headers["X-ELS-APIKey"], "real-ascii-key")
+        self.assertNotIn("X-ELS-Insttoken", headers)
+
     def test_wos_adapters_use_starter_and_researcher_endpoints(self) -> None:
         response = Mock()
         response.raise_for_status.return_value = None

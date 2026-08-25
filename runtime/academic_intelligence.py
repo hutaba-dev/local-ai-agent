@@ -113,13 +113,24 @@ def _provider_failure(source: str, error: BaseException) -> AcademicSourceResult
 
 
 def _scopus_headers() -> dict[str, str] | None:
-    api_key = os.getenv("SCOPUS_API_KEY")
-    if not api_key:
+    api_key = _ascii_credential(os.getenv("SCOPUS_API_KEY"))
+    if api_key is None:
         return None
     headers = {"X-ELS-APIKey": api_key}
-    if institutional_token := os.getenv("SCOPUS_INST_TOKEN"):
+    if institutional_token := _ascii_credential(os.getenv("SCOPUS_INST_TOKEN")):
         headers["X-ELS-Insttoken"] = institutional_token
     return headers
+
+
+def _ascii_credential(value: str | None) -> str | None:
+    candidate = value.strip() if isinstance(value, str) else ""
+    if not candidate or candidate.casefold().startswith("replace-with-"):
+        return None
+    try:
+        candidate.encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    return candidate
 
 
 def scopus_search_authors(query: str, count: int = 10) -> dict[str, object]:

@@ -881,6 +881,45 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertTrue(result.research["final_synthesis_executed"])
         self.assertEqual(result.research["state"], "COMPLETE")
 
+    def test_deep_research_bounds_large_evidence_and_revision_drafts(self) -> None:
+        class LargePipelineClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                responses = (
+                    '{"search_mode":"DEEP_RESEARCH","queries":["researcher papers"]}',
+                    '{"missing":[],"uncertain":[],"next_queries":[],"next_tools":[],"ready_to_answer":true,"entity_confidence":"HIGH"}',
+                    "A" * 20_000,
+                    "B" * 10_000,
+                    "bounded final revision",
+                )
+                response = FakeResponse()
+                response.json = lambda: {"choices": [{"message": {"content": responses[len(self.requests) - 1]}}], "usage": {}}  # type: ignore[method-assign]
+                return response
+
+        works = [
+            {"title": f"Paper {index}", "doi": f"10.1000/{index}", "abstract": "X" * 10_000}
+            for index in range(12)
+        ]
+        tools = [{
+            "name": "academic_intelligence",
+            "success": True,
+            "output": json.dumps({
+                "researcher": {"canonical_name": "Researcher", "identity_confidence": "HIGH"},
+                "representative_papers": works,
+            }),
+            "error": None,
+        }]
+        runtime = AgentRuntime(client=LargePipelineClient())
+        with patch("runtime.agent_runtime.run_agent_tools", return_value=tools):
+            result = runtime.chat("연구자 역량을 평가해줘", "research")
+
+        critic_input = runtime._client.requests[3]["json"]["messages"][1]["content"]
+        final_input = runtime._client.requests[4]["json"]["messages"][1]["content"]
+        self.assertLess(len(critic_input), 20_500)
+        self.assertLess(len(final_input), 23_500)
+        self.assertIn("truncated for context budget", critic_input)
+        self.assertEqual(result.content, "bounded final revision")
+
     def test_direct_research_selection_still_classifies_deep_research(self) -> None:
         class DirectResearchClient(FakeClient):
             def post(self, url: str, json: dict[str, object]) -> FakeResponse:
