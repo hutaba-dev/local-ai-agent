@@ -7,7 +7,26 @@
     <link rel="stylesheet" href="/static/style.css">
   </head>
   <body>
-    <main class="app-shell">
+    <button id="sidebar-toggle" class="sidebar-toggle" type="button" title="Open workspace navigation" aria-label="Open workspace navigation">☰</button>
+    <div id="sidebar-scrim" class="sidebar-scrim" hidden></div>
+    <aside id="project-sidebar" class="project-sidebar" aria-label="Workspace navigation">
+      <div class="sidebar-heading">
+        <strong>Workspace</strong>
+        <span id="project-storage-status" class="storage-state checking">Checking storage</span>
+      </div>
+      <div class="sidebar-actions">
+        <button id="general-new-chat" class="secondary" type="button">+ New Chat</button>
+        <button id="new-project" type="button">+ New Project</button>
+      </div>
+      <nav>
+        <p class="nav-label">GENERAL</p>
+        <button id="general-chat" class="nav-item active" type="button">General Chat</button>
+        <p class="nav-label">PROJECTS</p>
+        <div id="project-list" class="project-list"></div>
+      </nav>
+    </aside>
+
+    <main class="app-shell with-sidebar">
       <header class="topbar">
         <div>
           <p class="eyebrow">LOCAL MULTI-AGENT TEST</p>
@@ -24,18 +43,74 @@
         </div>
       </header>
 
-      <section id="messages" class="messages" aria-live="polite">
-        <article class="message assistant">
-          <div class="message-label">Main / Secretary</div>
-          <div class="markdown">Start a conversation to test the local agent runtime.</div>
-        </article>
+      <section id="project-header" class="project-header" hidden>
+        <div>
+          <p class="eyebrow">PERSISTENT PROJECT</p>
+          <h2 id="project-name"></h2>
+          <p id="project-description" class="project-description"></p>
+        </div>
+        <button id="project-new-chat" class="secondary" type="button">+ New Chat</button>
       </section>
 
-      <form id="chat-form" class="composer">
-        <textarea id="message-input" rows="3" maxlength="12000" placeholder="Message the local agents" required></textarea>
-        <button id="send-button" type="submit">Send</button>
-      </form>
+      <nav id="workspace-tabs" class="workspace-tabs" hidden aria-label="Project workspace">
+        <button class="active" data-view="chat" type="button">Chat</button>
+        <button data-view="files" type="button">Files</button>
+        <button data-view="memory" type="button">Memory</button>
+        <button data-view="activity" type="button">Activity</button>
+      </nav>
+
+      <section id="chat-view" class="workspace-view">
+        <div id="conversation-context" class="conversation-context" hidden></div>
+        <section id="messages" class="messages" aria-live="polite">
+          <article class="message assistant">
+            <div class="message-label">Main / Secretary</div>
+            <div class="markdown">Start a conversation to test the local agent runtime.</div>
+          </article>
+        </section>
+
+        <form id="chat-form" class="composer">
+          <div class="composer-main">
+            <div id="attachments" class="attachments" aria-live="polite"></div>
+            <textarea id="message-input" rows="3" maxlength="12000" placeholder="Message the local agents"></textarea>
+          </div>
+          <input id="file-input" type="file" accept=".txt,.md,.py,.js,.ts,.css,.html,.csv,.json,.pdf,.docx,.xlsx,.pptx,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff,.mp4,.mov,.webm,.mkv,.avi" multiple hidden>
+          <button id="attach-button" class="icon-button" type="button" title="Attach files" aria-label="Attach files">📎</button>
+          <button id="send-button" type="submit">Send</button>
+        </form>
+      </section>
+
+      <section id="files-view" class="workspace-view project-panel" hidden>
+        <div class="panel-toolbar">
+          <div><h2>Files</h2><p>Persistent project sources and generated artifacts.</p></div>
+          <label class="button-label">Upload<input id="project-file-input" type="file" multiple hidden></label>
+        </div>
+        <input id="file-search" type="search" placeholder="Search indexed project files" aria-label="Search project files">
+        <div id="project-files" class="data-list"></div>
+      </section>
+
+      <section id="memory-view" class="workspace-view project-panel" hidden>
+        <h2>Project Memory</h2>
+        <div id="project-memory"></div>
+      </section>
+
+      <section id="activity-view" class="workspace-view project-panel" hidden>
+        <h2>Activity</h2>
+        <div id="project-activity" class="data-list"></div>
+      </section>
     </main>
+
+    <dialog id="new-project-dialog">
+      <form id="new-project-form" method="dialog">
+        <h2>New Project</h2>
+        <label>Project Name<input id="new-project-name" maxlength="120" required></label>
+        <label>Description<textarea id="new-project-description" maxlength="2000" rows="4"></textarea></label>
+        <p id="new-project-error" class="login-error"></p>
+        <div class="dialog-actions">
+          <button id="cancel-project" class="secondary" type="button">Cancel</button>
+          <button type="submit">Create Project</button>
+        </div>
+      </form>
+    </dialog>
     <script src="/static/app.js"></script>
   </body>
 </html>

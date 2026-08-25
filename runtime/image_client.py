@@ -14,43 +14,11 @@ IMAGE_API_URL = os.getenv("IMAGE_API_URL", "http://127.0.0.1:8001").rstrip("/")
 POSE_API_URL = os.getenv("POSE_API_URL", "http://127.0.0.1:8002").rstrip("/")
 IMAGE_WORKER_URL = os.getenv("IMAGE_WORKER_URL", "").rstrip("/")
 IMAGE_WORKER_TOKEN = os.getenv("IMAGE_WORKER_TOKEN", "")
-NATURAL_GENERATE_PATTERN = re.compile(
-    r"(?:그림|이미지|일러스트|사진).{0,24}(?:그려|그려줘|그려주|만들어|만들어줘|생성해|생성해줘)|"
-    r"(?:그려|그려줘|그려주|만들어|만들어줘|생성해|생성해줘).{0,24}(?:그림|이미지|일러스트|사진)|"
-    r"\b(?:draw|generate|create|make)\b.{0,40}\b(?:image|picture|illustration|artwork|photo)\b|"
-    r"\b(?:image|picture|illustration|artwork|photo)\b.{0,40}\b(?:draw|generate|create|make)\b",
-    re.IGNORECASE,
-)
-NATURAL_EDIT_PATTERN = re.compile(
-    r"수정|편집|보정|바꿔|바꾸|변경|지워|제거|없애|고쳐|"
-    r"\b(?:edit|change|replace|remove|retouch|adjust|straighten|enhance)\b",
-    re.IGNORECASE,
-)
-NATURAL_REFINEMENT_PATTERN = re.compile(
-    r"(?:더\s*)?(?:예쁘|사실적|실사|현실적|자연스럽|선명|고화질|고해상도|밝게|어둡게|"
-    r"디테일|정교|화사|생생|부드럽|깔끔|또렷|스타일).{0,24}(?:하게|으로|스럽게|해줘|만들어|만들어줘)?|"
-    r"(?:고화질|고해상도|실사풍|사실적|현실적)(?:로|으로)?|"
-    r"\b(?:more|make it|render it)\b.{0,40}\b(?:beautiful|realistic|photorealistic|detailed|"
-    r"sharp|vivid|natural|high[- ]resolution|high[- ]quality)\b",
-    re.IGNORECASE,
-)
-NATURAL_RESEND_PATTERN = re.compile(
-    r"(?:사진|이미지|결과).{0,12}다시\s*(?:보내|보여|올려)|"
-    r"다시\s*(?:사진|이미지|결과).{0,12}(?:보내|보여|올려)|"
-    r"\b(?:resend|show|send)\b.{0,12}\b(?:image|photo|result)\b",
-    re.IGNORECASE,
-)
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "qwen3.8-27b")
 ORIGINAL_RESTORE_PATTERN = re.compile(
     r"원래|되돌|복원|처음\s*(?:사진|이미지|얼굴|모습)|"
     r"\b(?:original|restore|revert|reset)\b",
-    re.IGNORECASE,
-)
-NATURAL_POSE_PATTERN = re.compile(
-    r"고개.{0,16}(?:똑바로|정면)|(?:똑바로|정면).{0,16}고개|"
-    r"(?:얼굴|사진).{0,24}(?:똑바로|정면|증명사진)|(?:똑바로|정면|증명사진).{0,24}(?:얼굴|사진)|"
-    r"얼굴.{0,16}기울.{0,24}똑바로|기울.{0,24}똑바로\s*(?:보|바라보)|"
-    r"바라보.{0,12}(?:정면|카메라)|(?:정면|카메라).{0,12}바라보|"
-    r"\b(?:front-facing|frontal|straighten (?:the )?head|face the camera)\b",
     re.IGNORECASE,
 )
 
@@ -103,17 +71,8 @@ def parse_image_command(message: str, source_image_available: bool = False) -> t
     stripped_message = message.strip()
     command, separator, prompt = stripped_message.partition(" ")
     if command not in {"/image", "/edit"}:
-        if source_image_available and NATURAL_RESEND_PATTERN.search(stripped_message):
-            return "resend", stripped_message
-        if source_image_available and NATURAL_POSE_PATTERN.search(stripped_message):
-            return "pose", stripped_message
-        if source_image_available and NATURAL_EDIT_PATTERN.search(stripped_message):
-            return "edit", stripped_message
-        if source_image_available and NATURAL_REFINEMENT_PATTERN.search(stripped_message):
-            return "edit", stripped_message
-        if NATURAL_GENERATE_PATTERN.search(stripped_message):
-            return "image", stripped_message
-        return None
+        intent = infer_image_intent(stripped_message, source_image_available)
+        return None if intent == "chat" else (intent, stripped_message)
     if not separator or not prompt.strip():
         raise ValueError(f"{command} 뒤에 프롬프트를 입력하세요.")
     return command[1:], prompt.strip()
@@ -121,3 +80,42 @@ def parse_image_command(message: str, source_image_available: bool = False) -> t
 
 def prefers_original_source(message: str) -> bool:
     return bool(ORIGINAL_RESTORE_PATTERN.search(message))
+
+
+def infer_image_intent(message: str, source_image_available: bool = False) -> str:
+    instruction = """Determine the user's present intent in a conversation that can generate and edit images.
+Decide from the meaning, discourse context, and speech act rather than matching keywords.
+Return exactly one lowercase label:
+- image: a present request to create or draw a new image from a description.
+- edit: a present request to alter, improve, restyle, add, remove, or regenerate the image.
+- pose: a present request involving the subject's head direction, gaze, or front-facing pose. This takes priority when combined with other image changes.
+- resend: a present request to display or send the existing image again without changing it.
+- chat: all ordinary conversation, including commentary, feedback, future preferences, explanations, questions, and acknowledgements.
+Only choose an image action when the user is asking for that action to be performed now. Editing, pose correction, and resending require an available source image; otherwise choose chat. If the intent is ambiguous, choose chat."""
+    try:
+        response = httpx.post(
+            f"{OPENAI_BASE_URL}/chat/completions",
+            json={
+                "model": OPENAI_MODEL,
+                "messages": [
+                    {"role": "system", "content": instruction},
+                    {
+                        "role": "user",
+                        "content": f"Source image available: {'yes' if source_image_available else 'no'}\nUser message: {message}",
+                    },
+                ],
+                "temperature": 0,
+                "max_tokens": 16,
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            timeout=30,
+        )
+        response.raise_for_status()
+        content = response.json()["choices"][0]["message"]["content"]
+        label = str(content).strip().lower().rstrip(".")
+        allowed = {"image", "chat"}
+        if source_image_available:
+            allowed.update({"edit", "pose", "resend"})
+        return label if label in allowed else "chat"
+    except (OSError, httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
+        return "chat"

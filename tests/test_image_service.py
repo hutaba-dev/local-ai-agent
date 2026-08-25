@@ -45,45 +45,53 @@ class ImageServiceTests(unittest.TestCase):
     def test_parses_generation_and_edit_commands(self) -> None:
         self.assertEqual(parse_image_command("/image a glass tower"), ("image", "a glass tower"))
         self.assertEqual(parse_image_command("/edit  배경을 밤으로 "), ("edit", "배경을 밤으로"))
-        natural_generation = "예쁜 여자가 물을 마시는 그림을 그려줘. 일본 애니메이션 스타일로."
-        self.assertEqual(parse_image_command(natural_generation), ("image", natural_generation))
-        english_generation = "Create an image of a glass tower at sunset."
-        self.assertEqual(parse_image_command(english_generation), ("image", english_generation))
-        continuation_edits = [
-            "더 예쁘고 사실적으로... 고화질로",
-            "더 사실적으로 만들어줘",
-            "make it more photorealistic and detailed",
-        ]
-        for continuation_edit in continuation_edits:
-            self.assertEqual(
-                parse_image_command(continuation_edit, source_image_available=True),
-                ("edit", continuation_edit),
-            )
-            self.assertIsNone(parse_image_command(continuation_edit, source_image_available=False))
-        natural_edit = "고개를 똑바로 보게 바꿔주고, 배경도 자연스럽게 보정해줘."
-        self.assertEqual(parse_image_command(natural_edit, source_image_available=True), ("pose", natural_edit))
-        pose_feedback = [
-            "아니 얼굴이 기울었잖아. 똑바로 보는 것으로 바꿔달라구",
-            "이제 얼굴 모양은 됐고 정면을 바라보는 모습으로 바꿔달라고. 지금 고개가 약간 기울었잖아",
-            "얼굴을 증명사진처럼 정면을 쳐다보게 바꿔달라고.",
-            "고개가 약간 기울어져 있으니 똑바로 바라보게 수정해줘.",
-        ]
-        for feedback in pose_feedback:
-            self.assertEqual(parse_image_command(feedback, source_image_available=True), ("pose", feedback))
-        self.assertEqual(
-            parse_image_command("사진 다시 보내줘야지", source_image_available=True),
-            ("resend", "사진 다시 보내줘야지"),
-        )
-        self.assertIsNone(parse_image_command(natural_edit))
-        self.assertIsNone(parse_image_command("이 사진을 설명해줘", source_image_available=True))
-        self.assertIsNone(parse_image_command("일본 애니메이션 그림의 역사를 설명해줘"))
-        self.assertIsNone(parse_image_command("이미지 생성 방법을 알려줘"))
-        self.assertIsNone(parse_image_command("좋아, 고마워", source_image_available=True))
-        self.assertIsNone(parse_image_command("일반 대화"))
+        with patch("runtime.image_client.infer_image_intent", return_value="image"):
+            natural_generation = "예쁜 여자가 물을 마시는 그림을 그려줘. 일본 애니메이션 스타일로."
+            self.assertEqual(parse_image_command(natural_generation), ("image", natural_generation))
+            english_generation = "Create an image of a glass tower at sunset."
+            self.assertEqual(parse_image_command(english_generation), ("image", english_generation))
+        with patch("runtime.image_client.infer_image_intent", return_value="chat"):
+            self.assertIsNone(parse_image_command("일본 애니메이션 그림의 역사를 설명해줘"))
+            self.assertIsNone(parse_image_command("이미지 생성 방법을 알려줘"))
+            self.assertIsNone(parse_image_command("일반 대화"))
         self.assertTrue(prefers_original_source("원래 얼굴로 되돌려줘"))
         self.assertFalse(prefers_original_source("배경을 조금 더 밝게 수정해줘"))
         with self.assertRaisesRegex(ValueError, "프롬프트"):
             parse_image_command("/image")
+
+    def test_continuation_intent_distinguishes_actions_from_conversation(self) -> None:
+        cases = {
+            "더 예쁘고 사실적으로... 고화질로": "edit",
+            "정면을 보게 해줘": "pose",
+            "고개가 기울어져 있으니 똑바로 바라보게 수정해줘": "pose",
+            "결과 다시 보여줘": "resend",
+            "사진 다시 보내줘야지": "resend",
+            "앞으로는 고화질이라고 하면 이런식이어야해.": "chat",
+            "고화질이 무슨 뜻이야?": "chat",
+            "이 사진을 설명해줘": "chat",
+        }
+        for message, intent in cases.items():
+            with self.subTest(message=message), patch(
+                "runtime.image_client.infer_image_intent", return_value=intent
+            ) as infer:
+                expected = None if intent == "chat" else (intent, message)
+                self.assertEqual(parse_image_command(message, source_image_available=True), expected)
+                infer.assert_called_once_with(message, True)
+
+    def test_continuation_intent_classifier_is_conservative(self) -> None:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"choices": [{"message": {"content": "CHAT"}}]}
+        with patch("runtime.image_client.httpx.post", return_value=response) as post:
+            intent = image_client.infer_image_intent("앞으로는 고화질이라고 하면 이런식이어야해.", True)
+        self.assertEqual(intent, "chat")
+        instruction = post.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertIn("speech act rather than matching keywords", instruction)
+        self.assertIn("If the intent is ambiguous, choose chat", instruction)
+
+        with patch("runtime.image_client.httpx.post", side_effect=OSError("offline")):
+            self.assertEqual(image_client.infer_image_intent("더 예쁘고 사실적으로", True), "chat")
+            self.assertEqual(image_client.infer_image_intent("오늘 날씨 어때?"), "chat")
 
     def test_source_image_is_normalized_to_model_size(self) -> None:
         image = image_app._source_image(base64.b64encode(png_bytes()).decode())

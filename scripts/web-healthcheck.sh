@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-readonly WEB_HEALTH_URL="${WEB_HEALTH_URL:-http://127.0.0.1:8080/health}"
+readonly WEB_HEALTH_URL="${WEB_HEALTH_URL:-http://127.0.0.1:7000/health}"
 readonly ATTEMPTS="${WEB_HEALTH_ATTEMPTS:-10}"
 
 for attempt in $(seq 1 "${ATTEMPTS}"); do

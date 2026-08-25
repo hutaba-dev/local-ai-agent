@@ -10,6 +10,7 @@ from time import perf_counter
 
 import httpx
 
+from runtime.project_tools import ProjectTools
 from runtime.web_search import academic_papers, search_many, semantic_scholar_evidence, unpaywall_oa_locations
 
 
@@ -27,19 +28,55 @@ class ToolResult:
     details: dict[str, object] | None = None
 
 
+@dataclass(frozen=True)
+class ProjectToolScope:
+    tools: ProjectTools
+    owner_id: str
+    project_id: str
+
+
 def run_agent_tools(
     agent: str,
     message: str | tuple[str, ...],
     search_mode: str = "NO_SEARCH",
     allow_local_tools: bool = True,
+    project_scope: ProjectToolScope | None = None,
 ) -> list[dict[str, object]]:
+    results: list[ToolResult] = []
     if agent == "research":
-        return [asdict(result) for result in _research_tools(message, search_mode, allow_local_tools)]
-    tools = {
-        "coding": _coding_tools,
-        "server": _server_tools,
-    }.get(agent, lambda _message, _search_mode: [])
-    return [asdict(result) for result in tools(message, search_mode)]
+        results.extend(_research_tools(message, search_mode, allow_local_tools))
+    elif allow_local_tools:
+        tools = {
+            "coding": _coding_tools,
+            "server": _server_tools,
+        }.get(agent, lambda _message, _search_mode: [])
+        results.extend(tools(message, search_mode))
+    if project_scope is not None:
+        results.append(_project_search(message, project_scope))
+    return [asdict(result) for result in results]
+
+
+def _project_search(message: str | tuple[str, ...], scope: ProjectToolScope) -> ToolResult:
+    started = perf_counter()
+    query = message[0] if isinstance(message, tuple) else message
+    try:
+        output = scope.tools.hybrid_search(scope.owner_id, scope.project_id, query)
+        return ToolResult(
+            "project_hybrid_search",
+            True,
+            json.dumps(output, ensure_ascii=False),
+            None,
+            round((perf_counter() - started) * 1000),
+            {"semantic_available": bool(output["semantic_available"])},
+        )
+    except (RuntimeError, ValueError) as error:
+        return ToolResult(
+            "project_hybrid_search",
+            False,
+            "",
+            str(error),
+            round((perf_counter() - started) * 1000),
+        )
 
 
 def _coding_tools(message: str, search_mode: str) -> list[ToolResult]:

@@ -21,6 +21,8 @@ flowchart LR
 - Requests are serialized while an answer is running, preventing duplicate trailing-character submissions.
 - Markdown headings, lists, quotes, inline code, and fenced code blocks render in the chat.
 - Code blocks include `Copy code`. For normal prose, select only the needed text to reveal `Copy selection`.
+- `/image <prompt>` generates a 512×512 PNG with the local SD-Turbo service. Attach one image and send
+	`/edit <instruction>` for image-to-image editing. Generated images include a download link and reproducible seed.
 - `New Chat` creates a fresh short-term session. Long-term memory is not changed.
 
 ## Accounts And Sessions
@@ -39,13 +41,14 @@ and starts again after a host reboot.
 
 The UI requires a manually provisioned account; there is no public registration.
 Keep deployment addresses, hostnames, ports, and other infrastructure details out
-of this repository and browser conversations. Create an initial administrator or
+of this repository and browser conversations. Create an administrator, manager or
 guest from the server terminal. The command prompts for the password so it is
 never placed in shell history or the repository. Passwords must contain at least
 8 characters:
 
 ```bash
 /srv/local-ai-agent/venv/bin/python scripts/manage-users.py create admin YOUR_ADMIN_USERNAME
+/srv/local-ai-agent/venv/bin/python scripts/manage-users.py create manager MANAGER_USERNAME
 /srv/local-ai-agent/venv/bin/python scripts/manage-users.py create guest GUEST_USERNAME
 ```
 
@@ -66,9 +69,13 @@ chat session ID. Shared credentials do not provide individual attribution or
 per-person revocation.
 
 The header shows the active account. **Switch account** logs out and returns to
-the login screen. A browser with no click, keyboard, input, scroll, or touch
-activity for 15 minutes is logged out automatically. The server cookie uses the
-same 15-minute sliding expiry.
+the login screen. Administrator sessions use a 24-hour sliding expiry, manager
+sessions use a 30-minute sliding expiry, and guest sessions use a 15-minute
+sliding expiry. Override these with `WEB_ADMIN_SESSION_IDLE_MINUTES`,
+`WEB_MANAGER_SESSION_IDLE_MINUTES`, and `WEB_SESSION_IDLE_MINUTES`. Managers
+have the same web agent access as administrators. Guest accounts cannot upload
+files; the attachment control is hidden and the upload endpoint independently
+rejects them.
 
 ## Security Boundary
 

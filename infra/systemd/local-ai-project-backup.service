@@ -1,0 +1,11 @@
+[Unit]
+Description=Back up Local AI project metadata database
+After=srv-local\x2dai\x2dbackup.mount
+Wants=srv-local\x2dai\x2dbackup.mount
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/root/local-ai-agent
+ExecStart=/srv/local-ai-agent/venv/bin/python /root/local-ai-agent/scripts/backup-projects.py
+UMask=0077

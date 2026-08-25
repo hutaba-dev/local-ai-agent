@@ -1,5 +1,7 @@
 # Distributed Image Worker
 
+Persistent Projects, conversations, files, artifacts, and long-term memory are owned by KIM. See [projects-and-memory.md](projects-and-memory.md). AHN7 remains an image-only compute worker and does not retain Project state.
+
 ## Architecture
 
 The Main Server remains the only user-facing host. Web and Telegram call

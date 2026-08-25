@@ -3,15 +3,51 @@ const form = document.querySelector("#chat-form");
 const input = document.querySelector("#message-input");
 const selector = document.querySelector("#agent-select");
 const sendButton = document.querySelector("#send-button");
+const attachButton = document.querySelector("#attach-button");
+const fileInput = document.querySelector("#file-input");
+const attachmentsElement = document.querySelector("#attachments");
 const newChatButton = document.querySelector("#new-chat");
 const logoutButton = document.querySelector("#logout");
 const accountName = document.querySelector("#account-name");
 const status = document.querySelector("#connection-status");
+const sidebar = document.querySelector("#project-sidebar");
+const sidebarToggle = document.querySelector("#sidebar-toggle");
+const sidebarScrim = document.querySelector("#sidebar-scrim");
+const projectStorageStatus = document.querySelector("#project-storage-status");
+const projectListElement = document.querySelector("#project-list");
+const generalChatButton = document.querySelector("#general-chat");
+const generalNewChatButton = document.querySelector("#general-new-chat");
+const newProjectButton = document.querySelector("#new-project");
+const newProjectDialog = document.querySelector("#new-project-dialog");
+const newProjectForm = document.querySelector("#new-project-form");
+const newProjectName = document.querySelector("#new-project-name");
+const newProjectDescription = document.querySelector("#new-project-description");
+const newProjectError = document.querySelector("#new-project-error");
+const cancelProjectButton = document.querySelector("#cancel-project");
+const projectHeader = document.querySelector("#project-header");
+const projectNameElement = document.querySelector("#project-name");
+const projectDescriptionElement = document.querySelector("#project-description");
+const projectNewChatButton = document.querySelector("#project-new-chat");
+const workspaceTabs = document.querySelector("#workspace-tabs");
+const conversationContext = document.querySelector("#conversation-context");
+const projectFileInput = document.querySelector("#project-file-input");
+const fileSearch = document.querySelector("#file-search");
+const projectFilesElement = document.querySelector("#project-files");
+const projectMemoryElement = document.querySelector("#project-memory");
+const projectActivityElement = document.querySelector("#project-activity");
 let sessionId = null;
+let continuationImageId = null;
+let projects = [];
+let currentProject = null;
+let currentConversation = null;
+let currentView = "chat";
+let canUseProjects = false;
 let composing = false;
 let sending = false;
+let uploading = false;
+let attachments = [];
 let selectedAssistantText = "";
-const IDLE_TIMEOUT_MS = 15 * 60 * 1000;
+let idleTimeoutMs = 15 * 60 * 1000;
 let idleTimer;
 
 const selectionCopyButton = document.createElement("button");
@@ -74,6 +110,32 @@ function addMessage(role, content, label, activity) {
   messages.append(article);
   article.scrollIntoView({ behavior: "smooth", block: "end" });
   article.querySelectorAll(".copy-code").forEach((button) => button.addEventListener("click", (event) => copyText(decodeURIComponent(event.currentTarget.dataset.copy), event.currentTarget, "Copied")));
+  return article;
+}
+
+function addGeneratedImages(article, images) {
+  for (const image of images || []) {
+    const link = document.createElement("a");
+    link.className = "generated-image";
+    link.href = image.data_url;
+    link.download = image.filename;
+    link.innerHTML = `<img src="${image.data_url}" alt="Generated image"><span>Download PNG</span>`;
+    article.append(link);
+  }
+}
+
+function addMessageAttachments(article, items) {
+  if (!items.length) return;
+  const container = document.createElement("div");
+  container.className = "message-attachments";
+  container.innerHTML = items.map((attachment) => (
+    `<figure class="message-attachment${attachment.thumbnail_data_url ? " image" : " file"}">` +
+    `${attachment.thumbnail_data_url ? `<img src="${escapeHtml(attachment.thumbnail_data_url)}" alt="Attached image ${escapeHtml(attachment.filename)}">` : ""}` +
+    `<figcaption>${escapeHtml(attachment.filename)}${attachment.truncated ? " (trimmed)" : ""}</figcaption>` +
+    `</figure>`
+  )).join("");
+  article.append(container);
+  article.scrollIntoView({ behavior: "smooth", block: "end" });
 }
 
 async function copyText(value, button, successLabel) {
@@ -183,8 +245,266 @@ async function request(path, options = {}) {
     window.location.replace("/login");
     throw new Error("login required");
   }
-  if (!response.ok) throw new Error(payload.detail || "Request failed");
+  if (!response.ok) {
+    const error = new Error(payload.detail || "Request failed");
+    error.status = response.status;
+    throw error;
+  }
   return payload;
+}
+
+function closeSidebar() {
+  sidebar.classList.remove("open");
+  sidebarScrim.hidden = true;
+}
+
+function projectRequestBody(value) {
+  return { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(value) };
+}
+
+function renderProjectNavigation() {
+  generalChatButton.classList.toggle("active", !currentProject);
+  projectListElement.innerHTML = projects.map((project) => {
+    const active = currentProject?.id === project.id;
+    const conversations = active ? (currentProject.conversations || []).map((conversation) => (
+      `<button class="nav-item${currentConversation?.id === conversation.id ? " active" : ""}" type="button" data-conversation-id="${escapeHtml(conversation.id)}">${escapeHtml(conversation.title)}</button>`
+    )).join("") : "";
+    return `<div><button class="nav-item project-nav${active ? " active" : ""}" type="button" data-project-id="${escapeHtml(project.id)}">${active ? "▾" : "▸"} ${escapeHtml(project.name)}</button>${active ? `<div class="conversation-list">${conversations}</div>` : ""}</div>`;
+  }).join("") || `<p class="empty-state">No projects yet.</p>`;
+  projectListElement.querySelectorAll("[data-project-id]").forEach((button) => button.addEventListener("click", () => openProject(button.dataset.projectId)));
+  projectListElement.querySelectorAll("[data-conversation-id]").forEach((button) => button.addEventListener("click", () => openConversation(button.dataset.conversationId)));
+}
+
+async function loadProjects() {
+  if (!canUseProjects) return;
+  const payload = await request("/api/projects");
+  projects = payload.projects;
+  const storage = payload.storage;
+  projectStorageStatus.textContent = storage.online
+    ? `ONLINE · ${formatBytes(storage.total_bytes)} total · ${formatBytes(storage.free_bytes)} free`
+    : "STORAGE OFFLINE";
+  projectStorageStatus.className = `storage-state ${storage.online ? "online" : "offline"}`;
+  newProjectButton.disabled = !storage.online;
+  renderProjectNavigation();
+}
+
+async function openProject(projectId, conversationId = null) {
+  currentProject = await request(`/api/projects/${encodeURIComponent(projectId)}`);
+  projects = projects.map((project) => project.id === currentProject.id ? currentProject : project);
+  projectHeader.hidden = false;
+  workspaceTabs.hidden = false;
+  projectNameElement.textContent = currentProject.name;
+  projectDescriptionElement.textContent = currentProject.description || "No description";
+  let conversation = currentProject.conversations.find((item) => item.id === conversationId) || currentProject.conversations[0];
+  if (!conversation) {
+    conversation = await request(`/api/projects/${encodeURIComponent(projectId)}/conversations`, projectRequestBody({ title: "Overall research" }));
+    currentProject.conversations.unshift(conversation);
+  }
+  currentConversation = conversation;
+  continuationImageId = null;
+  sessionId = null;
+  renderProjectNavigation();
+  await openConversation(conversation.id);
+  setView("chat");
+  closeSidebar();
+}
+
+async function openConversation(conversationId) {
+  if (!currentProject) return;
+  currentConversation = currentProject.conversations.find((item) => item.id === conversationId);
+  if (!currentConversation) return;
+  const payload = await request(`/api/projects/${encodeURIComponent(currentProject.id)}/conversations/${encodeURIComponent(conversationId)}/messages`);
+  messages.innerHTML = "";
+  for (const message of payload.messages) {
+    addMessage(message.role, message.content, message.role === "user" ? "You" : "main");
+  }
+  if (!payload.messages.length) addMessage("assistant", "This conversation shares the project's files, summary, and durable memory.", "Project Workspace");
+  conversationContext.hidden = false;
+  conversationContext.textContent = `Project: ${currentProject.name} · Conversation: ${currentConversation.title}`;
+  sessionId = null;
+  continuationImageId = null;
+  renderProjectNavigation();
+  closeSidebar();
+}
+
+async function createProjectConversation() {
+  if (!currentProject) return;
+  const conversation = await request(
+    `/api/projects/${encodeURIComponent(currentProject.id)}/conversations`,
+    projectRequestBody({ title: `Conversation ${currentProject.conversations.length + 1}` }),
+  );
+  currentProject.conversations.unshift(conversation);
+  await openConversation(conversation.id);
+  setView("chat");
+}
+
+async function openGeneralChat() {
+  currentProject = null;
+  currentConversation = null;
+  projectHeader.hidden = true;
+  workspaceTabs.hidden = true;
+  conversationContext.hidden = true;
+  renderProjectNavigation();
+  setView("chat");
+  await newSession();
+  closeSidebar();
+}
+
+function setView(view) {
+  currentView = view;
+  document.querySelectorAll(".workspace-view").forEach((element) => { element.hidden = element.id !== `${view}-view`; });
+  workspaceTabs.querySelectorAll("button").forEach((button) => button.classList.toggle("active", button.dataset.view === view));
+  if (view === "files") loadProjectFiles();
+  if (view === "memory") loadProjectMemory();
+  if (view === "activity") loadProjectActivity();
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return "0 B";
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  const index = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return `${(bytes / (1024 ** index)).toFixed(index > 1 ? 1 : 0)} ${units[index]}`;
+}
+
+function formatDate(value) {
+  return new Date(value).toLocaleString();
+}
+
+async function loadProjectFiles() {
+  if (!currentProject) return;
+  const payload = await request(`/api/projects/${encodeURIComponent(currentProject.id)}/files`);
+  const query = fileSearch.value.trim().toLowerCase();
+  const files = payload.files.filter((file) => !query || file.original_name.toLowerCase().includes(query));
+  projectFilesElement.innerHTML = files.map((file) => (
+    `<div class="data-row" data-file-id="${escapeHtml(file.id)}"><div class="data-row-main"><strong>${escapeHtml(file.original_name)}</strong><span>${escapeHtml(file.mime_type)} · ${formatBytes(file.size)} · ${escapeHtml(file.index_status)}${file.artifact_id ? " · artifact" : ""}</span></div><span class="data-meta">${escapeHtml(formatDate(file.created_at))}</span><div class="data-actions"><a href="/api/projects/${encodeURIComponent(currentProject.id)}/files/${encodeURIComponent(file.id)}">Download</a><button class="danger" type="button" data-delete-file>Delete</button></div></div>`
+  )).join("") || `<p class="empty-state">No matching files.</p>`;
+  projectFilesElement.querySelectorAll("[data-delete-file]").forEach((button) => button.addEventListener("click", async () => {
+    const row = button.closest("[data-file-id]");
+    if (button.dataset.confirm !== "true") {
+      button.dataset.confirm = "true";
+      button.textContent = "Confirm delete";
+      return;
+    }
+    await request(`/api/projects/${encodeURIComponent(currentProject.id)}/files/${encodeURIComponent(row.dataset.fileId)}`, { method: "DELETE" });
+    await loadProjectFiles();
+  }));
+}
+
+async function uploadProjectFiles(files) {
+  if (!currentProject || !currentConversation) return;
+  for (const file of files) {
+    const body = new FormData();
+    body.append("file", file);
+    body.append("project_id", currentProject.id);
+    body.append("conversation_id", currentConversation.id);
+    const uploaded = await request("/api/upload", { method: "POST", body });
+    await request(`/api/upload/${encodeURIComponent(uploaded.attachment_id)}`, { method: "DELETE" });
+  }
+  projectFileInput.value = "";
+  await loadProjectFiles();
+}
+
+async function loadProjectMemory() {
+  if (!currentProject) return;
+  const payload = await request(`/api/projects/${encodeURIComponent(currentProject.id)}/memories`);
+  const groups = Object.groupBy ? Object.groupBy(payload.memories, (memory) => memory.type) : payload.memories.reduce((result, memory) => { (result[memory.type] ||= []).push(memory); return result; }, {});
+  const groupHtml = Object.entries(groups).map(([type, items]) => `<section class="memory-group"><h3>${escapeHtml(type.toUpperCase())}</h3>${items.map((memory) => (
+    `<div class="data-row memory-row${memory.active ? "" : " inactive"}" data-memory-id="${escapeHtml(memory.id)}"><div class="data-row-main"><strong>${escapeHtml(memory.content)}</strong><span>${escapeHtml(memory.confidence)} · updated ${escapeHtml(formatDate(memory.updated_at))}${memory.active ? "" : " · superseded/inactive"}</span></div><div class="data-actions"><button type="button" data-edit-memory>Edit</button><button class="danger" type="button" data-delete-memory>Delete</button></div></div>`
+  )).join("")}</section>`).join("");
+  projectMemoryElement.innerHTML = `<section class="memory-summary"><h3>PROJECT SUMMARY</h3><p>${escapeHtml(payload.summary || "No summary yet.")}</p></section>${groupHtml || `<p class="empty-state">No durable memories yet.</p>`}`;
+  projectMemoryElement.querySelectorAll("[data-edit-memory]").forEach((button) => button.addEventListener("click", async () => {
+    const row = button.closest("[data-memory-id]");
+    const contentElement = row.querySelector("strong");
+    if (button.dataset.editing !== "true") {
+      button.dataset.editing = "true";
+      button.textContent = "Save";
+      contentElement.contentEditable = "true";
+      contentElement.focus();
+      return;
+    }
+    const content = contentElement.textContent.trim();
+    if (!content) return;
+    await request(`/api/projects/${encodeURIComponent(currentProject.id)}/memories/${encodeURIComponent(row.dataset.memoryId)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ content, active: true }) });
+    await loadProjectMemory();
+  }));
+  projectMemoryElement.querySelectorAll("[data-delete-memory]").forEach((button) => button.addEventListener("click", async () => {
+    const row = button.closest("[data-memory-id]");
+    if (button.dataset.confirm !== "true") {
+      button.dataset.confirm = "true";
+      button.textContent = "Confirm delete";
+      return;
+    }
+    await request(`/api/projects/${encodeURIComponent(currentProject.id)}/memories/${encodeURIComponent(row.dataset.memoryId)}`, { method: "DELETE" });
+    await loadProjectMemory();
+  }));
+}
+
+async function loadProjectActivity() {
+  if (!currentProject) return;
+  const payload = await request(`/api/projects/${encodeURIComponent(currentProject.id)}/activity`);
+  projectActivityElement.innerHTML = payload.events.map((event) => (
+    `<div class="data-row"><div class="data-row-main"><strong>${escapeHtml(event.event_type.replaceAll("_", " "))}</strong><span>${escapeHtml(event.actor)}</span></div><span class="data-meta">${escapeHtml(formatDate(event.created_at))}</span><span></span></div>`
+  )).join("") || `<p class="empty-state">No activity yet.</p>`;
+}
+
+function renderAttachments() {
+  attachmentsElement.innerHTML = attachments.map((attachment) => (
+    `<span class="attachment-chip" data-id="${escapeHtml(attachment.attachment_id)}">` +
+    `${attachment.thumbnail_data_url ? `<img src="${escapeHtml(attachment.thumbnail_data_url)}" alt="Preview of ${escapeHtml(attachment.filename)}">` : ""}` +
+    `<span>${escapeHtml(attachment.filename)}${attachment.truncated ? " (trimmed)" : ""}</span>` +
+    `<button type="button" title="Remove attachment" aria-label="Remove ${escapeHtml(attachment.filename)}">×</button></span>`
+  )).join("");
+  attachmentsElement.hidden = attachments.length === 0;
+  attachmentsElement.querySelectorAll("button").forEach((button) => button.addEventListener("click", async () => {
+    const chip = button.closest(".attachment-chip");
+    const attachmentId = chip.dataset.id;
+    await request(`/api/upload/${encodeURIComponent(attachmentId)}`, { method: "DELETE" });
+    attachments = attachments.filter((attachment) => attachment.attachment_id !== attachmentId);
+    renderAttachments();
+  }));
+}
+
+async function uploadFiles(files) {
+  const availableSlots = 3 - attachments.length;
+  if (files.length > availableSlots) {
+    addMessage("assistant", "You can attach up to three files per message.", "Upload");
+    return;
+  }
+  const videoExtensions = ["mp4", "mov", "webm", "mkv", "avi"];
+  const imageExtensions = ["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"];
+  const oversized = files.find((file) => {
+    const extension = file.name.split(".").pop().toLowerCase();
+    const limit = videoExtensions.includes(extension) ? 100 : imageExtensions.includes(extension) ? 20 : 10;
+    return file.size > limit * 1024 * 1024;
+  });
+  if (oversized) {
+    addMessage("assistant", `${oversized.name} exceeds the upload limit for its file type.`, "Upload");
+    return;
+  }
+  uploading = true;
+  attachButton.disabled = true;
+  sendButton.disabled = true;
+  try {
+    for (const file of files) {
+      const body = new FormData();
+      body.append("file", file);
+      if (currentProject && currentConversation) {
+        body.append("project_id", currentProject.id);
+        body.append("conversation_id", currentConversation.id);
+      }
+      const attachment = await request("/api/upload", { method: "POST", body });
+      attachments.push(attachment);
+      renderAttachments();
+    }
+  } catch (error) {
+    addMessage("assistant", `Upload failed: ${error.message}`, "Upload");
+  } finally {
+    fileInput.value = "";
+    attachButton.disabled = false;
+    sendButton.disabled = false;
+    uploading = false;
+    input.focus();
+  }
 }
 
 async function logout() {
@@ -195,12 +515,22 @@ async function logout() {
 
 function resetIdleTimer() {
   clearTimeout(idleTimer);
-  idleTimer = setTimeout(logout, IDLE_TIMEOUT_MS);
+  idleTimer = setTimeout(logout, idleTimeoutMs);
 }
 
 async function newSession() {
+  if (currentProject) {
+    await createProjectConversation();
+    return;
+  }
   const payload = await request("/api/new-session", { method: "POST" });
   sessionId = payload.session_id;
+  const discardedAttachmentIds = attachments.map((attachment) => attachment.attachment_id);
+  if (continuationImageId) discardedAttachmentIds.push(continuationImageId);
+  await Promise.all(discardedAttachmentIds.map((attachmentId) => request(`/api/upload/${encodeURIComponent(attachmentId)}`, { method: "DELETE" })));
+  attachments = [];
+  continuationImageId = null;
+  renderAttachments();
   messages.innerHTML = "";
   addMessage("assistant", "New short-term session created. Long-term memory is not changed.", "Main / Secretary");
   input.focus();
@@ -208,20 +538,35 @@ async function newSession() {
 
 form.addEventListener("submit", async (event) => {
   event.preventDefault();
-  if (sending) return;
-  const message = input.value.trim();
-  if (!message) return;
+  if (sending || uploading) return;
+  const typedMessage = input.value.trim();
+  if (!typedMessage && attachments.length === 0) return;
+  const message = typedMessage || "Analyze the attached document(s).";
+  const submittedAttachments = [...attachments];
+  const submittedAttachmentIds = new Set(submittedAttachments.map((attachment) => attachment.attachment_id));
+  attachments = attachments.filter((attachment) => !submittedAttachmentIds.has(attachment.attachment_id));
+  renderAttachments();
   sending = true;
-  addMessage("user", message, "You");
+  const userArticle = addMessage("user", message, "You");
+  addMessageAttachments(userArticle, submittedAttachments);
   input.value = "";
   input.disabled = true;
   sendButton.disabled = true;
   try {
-    const payload = await request("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, selected_agent: selector.value, session_id: sessionId }) });
+    const payload = await request("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, selected_agent: selector.value, session_id: sessionId, attachment_ids: submittedAttachments.map((attachment) => attachment.attachment_id), continuation_image_id: continuationImageId, project_id: currentProject?.id || null, conversation_id: currentConversation?.id || null }) });
     sessionId = payload.session_id;
-    addMessage("assistant", payload.content, payload.activity.routed_agent, payload.activity);
+    if (payload.continuation_image_id) continuationImageId = payload.continuation_image_id;
+    const article = addMessage("assistant", payload.content, payload.activity.routed_agent, payload.activity);
+    addGeneratedImages(article, payload.generated_images);
   } catch (error) {
-    addMessage("assistant", `Request failed: ${error.message}`, "Runtime");
+    if (error.status === 404 && (submittedAttachments.length || continuationImageId)) {
+      continuationImageId = null;
+      addMessage("assistant", "The attachment is no longer available. Please attach the file again.", "Runtime");
+    } else {
+      attachments = [...submittedAttachments, ...attachments];
+      renderAttachments();
+      addMessage("assistant", `Request failed: ${error.message}`, "Runtime");
+    }
   } finally {
     input.value = "";
     input.disabled = false;
@@ -246,6 +591,30 @@ input.addEventListener("keydown", (event) => {
   form.requestSubmit();
 });
 newChatButton.addEventListener("click", newSession);
+generalNewChatButton.addEventListener("click", openGeneralChat);
+generalChatButton.addEventListener("click", openGeneralChat);
+projectNewChatButton.addEventListener("click", createProjectConversation);
+workspaceTabs.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => setView(button.dataset.view)));
+sidebarToggle.addEventListener("click", () => { sidebar.classList.add("open"); sidebarScrim.hidden = false; });
+sidebarScrim.addEventListener("click", closeSidebar);
+newProjectButton.addEventListener("click", () => { newProjectError.textContent = ""; newProjectDialog.showModal(); newProjectName.focus(); });
+cancelProjectButton.addEventListener("click", () => newProjectDialog.close());
+newProjectForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  try {
+    const project = await request("/api/projects", projectRequestBody({ name: newProjectName.value.trim(), description: newProjectDescription.value.trim() }));
+    projects.unshift(project);
+    newProjectDialog.close();
+    newProjectForm.reset();
+    await openProject(project.id);
+  } catch (error) {
+    newProjectError.textContent = error.message;
+  }
+});
+projectFileInput.addEventListener("change", () => uploadProjectFiles([...projectFileInput.files]).catch((error) => { projectFilesElement.innerHTML = `<p class="empty-state">Upload failed: ${escapeHtml(error.message)}</p>`; }));
+fileSearch.addEventListener("input", loadProjectFiles);
+attachButton.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => uploadFiles([...fileInput.files]));
 logoutButton.addEventListener("click", logout);
 for (const eventName of ["pointerdown", "keydown", "input", "scroll", "touchstart"]) {
   document.addEventListener(eventName, resetIdleTimer, { passive: true });
@@ -260,10 +629,22 @@ async function initialize() {
     const [agentPayload, health, account] = await Promise.all([request("/api/agents"), request("/health"), request("/api/me")]);
     selector.innerHTML = agentPayload.agents.map((agent) => `<option value="${agent.id}">${agent.label}</option>`).join("");
     accountName.textContent = `${account.username} (${account.role})`;
+    attachButton.hidden = !account.can_upload;
+    fileInput.disabled = !account.can_upload;
+    canUseProjects = account.can_use_projects;
+    newProjectButton.hidden = !canUseProjects;
+    if (canUseProjects) await loadProjects();
+    else {
+      projectStorageStatus.textContent = "Unavailable for this account";
+      projectStorageStatus.className = "storage-state offline";
+    }
+    idleTimeoutMs = account.session_idle_timeout_seconds * 1000;
+    resetIdleTimer();
     status.textContent = "Connected";
     status.className = "status online";
     await newSession();
   } catch (error) { status.textContent = "Backend unavailable"; status.className = "status offline"; }
 }
+renderAttachments();
 resetIdleTimer();
 initialize();

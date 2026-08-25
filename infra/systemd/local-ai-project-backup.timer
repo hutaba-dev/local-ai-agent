@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily Local AI project metadata backup
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15min
+Unit=local-ai-project-backup.service
+
+[Install]
+WantedBy=timers.target

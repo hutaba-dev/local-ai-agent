@@ -15,8 +15,8 @@ from web.auth import configured_user_store
 def main() -> None:
     parser = argparse.ArgumentParser(description="Create a Local AI Agent web account")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    create_parser = subparsers.add_parser("create", help="create an admin or guest account")
-    create_parser.add_argument("role", choices=("admin", "guest"))
+    create_parser = subparsers.add_parser("create", help="create an admin, manager or guest account")
+    create_parser.add_argument("role", choices=("admin", "manager", "guest"))
     create_parser.add_argument("username")
     password_parser = subparsers.add_parser("set-password", help="replace an existing account password")
     password_parser.add_argument("username")

@@ -1,7 +1,7 @@
 [Unit]
 Description=Local AI Agent authenticated web chat
-After=network-online.target qwen-vllm.service local-ai-worker-tunnel.service
-Wants=network-online.target local-ai-worker-tunnel.service
+After=network-online.target qwen-vllm.service local-ai-worker-tunnel.service srv-local\x2dai\x2ddata.mount
+Wants=network-online.target local-ai-worker-tunnel.service srv-local\x2dai\x2ddata.mount
 Requires=qwen-vllm.service
 StartLimitIntervalSec=5min
 StartLimitBurst=3

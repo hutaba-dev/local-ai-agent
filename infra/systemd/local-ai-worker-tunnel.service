@@ -2,8 +2,7 @@
 Description=SSH tunnel to AHN7 image worker
 After=network-online.target
 Wants=network-online.target
-StartLimitIntervalSec=5min
-StartLimitBurst=5
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple

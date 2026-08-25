@@ -16,6 +16,7 @@ from pathlib import Path
 
 USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{2,39}$")
 PASSWORD_MIN_LENGTH = 8
+ROLES = frozenset({"admin", "manager", "guest"})
 
 
 @dataclass(frozen=True)
@@ -30,15 +31,31 @@ class UserStore:
         self.database_path = database_path
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
-            connection.execute(
-                """CREATE TABLE IF NOT EXISTS users (
-                    username TEXT PRIMARY KEY,
-                    password_hash TEXT NOT NULL,
-                    role TEXT NOT NULL CHECK(role IN ('admin', 'guest')),
-                    active INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL
-                )"""
-            )
+            schema = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'users'"
+            ).fetchone()
+            if schema is None:
+                self._create_table(connection)
+            elif "'manager'" not in schema[0]:
+                connection.execute("ALTER TABLE users RENAME TO users_before_manager_role")
+                self._create_table(connection)
+                connection.execute(
+                    """INSERT INTO users(username, password_hash, role, active, created_at)
+                    SELECT username, password_hash, role, active, created_at FROM users_before_manager_role"""
+                )
+                connection.execute("DROP TABLE users_before_manager_role")
+
+    @staticmethod
+    def _create_table(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """CREATE TABLE users (
+                username TEXT PRIMARY KEY,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('admin', 'manager', 'guest')),
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )"""
+        )
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.database_path)
@@ -69,8 +86,8 @@ class UserStore:
 
     def create(self, username: str, password: str, role: str) -> User:
         self._validate(username, password)
-        if role not in {"admin", "guest"}:
-            raise ValueError("role must be admin or guest")
+        if role not in ROLES:
+            raise ValueError("role must be admin, manager or guest")
         try:
             with self._connect() as connection:
                 connection.execute(
@@ -101,12 +118,27 @@ class UserStore:
 
 
 class SessionSigner:
-    def __init__(self, secret: str, lifetime_minutes: int = 15) -> None:
+    def __init__(
+        self,
+        secret: str,
+        lifetime_minutes: int = 15,
+        admin_lifetime_minutes: int = 24 * 60,
+        manager_lifetime_minutes: int = 30,
+    ) -> None:
         self.secret = secret.encode()
         self.lifetime = timedelta(minutes=lifetime_minutes)
+        self.admin_lifetime = timedelta(minutes=admin_lifetime_minutes)
+        self.manager_lifetime = timedelta(minutes=manager_lifetime_minutes)
+
+    def lifetime_for(self, role: str) -> timedelta:
+        if role == "admin":
+            return self.admin_lifetime
+        if role == "manager":
+            return self.manager_lifetime
+        return self.lifetime
 
     def create(self, user: User, nonce: str | None = None) -> str:
-        expires = int((datetime.now(UTC) + self.lifetime).timestamp())
+        expires = int((datetime.now(UTC) + self.lifetime_for(user.role)).timestamp())
         payload = f"{user.username}:{user.role}:{nonce or secrets.token_urlsafe(16)}:{expires}".encode()
         encoded = base64.urlsafe_b64encode(payload).decode().rstrip("=")
         signature = hmac.new(self.secret, encoded.encode(), hashlib.sha256).hexdigest()
@@ -122,7 +154,7 @@ class SessionSigner:
         try:
             padded = encoded + "=" * (-len(encoded) % 4)
             username, role, nonce, expires = base64.urlsafe_b64decode(padded).decode().split(":")
-            if role not in {"admin", "guest"} or int(expires) < int(datetime.now(UTC).timestamp()):
+            if role not in ROLES or int(expires) < int(datetime.now(UTC).timestamp()):
                 return None
             return username, role, nonce, int(expires)
         except (UnicodeDecodeError, ValueError):
