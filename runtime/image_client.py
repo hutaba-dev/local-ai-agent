@@ -14,6 +14,13 @@ IMAGE_API_URL = os.getenv("IMAGE_API_URL", "http://127.0.0.1:8001").rstrip("/")
 POSE_API_URL = os.getenv("POSE_API_URL", "http://127.0.0.1:8002").rstrip("/")
 IMAGE_WORKER_URL = os.getenv("IMAGE_WORKER_URL", "").rstrip("/")
 IMAGE_WORKER_TOKEN = os.getenv("IMAGE_WORKER_TOKEN", "")
+NATURAL_GENERATE_PATTERN = re.compile(
+    r"(?:그림|이미지|일러스트|사진).{0,24}(?:그려|그려줘|그려주|만들어|만들어줘|생성해|생성해줘)|"
+    r"(?:그려|그려줘|그려주|만들어|만들어줘|생성해|생성해줘).{0,24}(?:그림|이미지|일러스트|사진)|"
+    r"\b(?:draw|generate|create|make)\b.{0,40}\b(?:image|picture|illustration|artwork|photo)\b|"
+    r"\b(?:image|picture|illustration|artwork|photo)\b.{0,40}\b(?:draw|generate|create|make)\b",
+    re.IGNORECASE,
+)
 NATURAL_EDIT_PATTERN = re.compile(
     r"수정|편집|보정|바꿔|바꾸|변경|지워|제거|없애|고쳐|"
     r"\b(?:edit|change|replace|remove|retouch|adjust|straighten|enhance)\b",
@@ -94,6 +101,8 @@ def parse_image_command(message: str, source_image_available: bool = False) -> t
             return "pose", stripped_message
         if source_image_available and NATURAL_EDIT_PATTERN.search(stripped_message):
             return "edit", stripped_message
+        if NATURAL_GENERATE_PATTERN.search(stripped_message):
+            return "image", stripped_message
         return None
     if not separator or not prompt.strip():
         raise ValueError(f"{command} 뒤에 프롬프트를 입력하세요.")
