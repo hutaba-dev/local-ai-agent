@@ -305,6 +305,7 @@ class AgentRuntime:
                 "next_queries": list(gap.next_queries),
                 "next_tools": list(gap.next_tools),
                 "ready_to_answer": gap.ready_to_answer,
+                "academic_intelligence": self._academic_activity(round_tools),
             })
             identity_unresolved = person_query and entity_confidence in {
                 "UNKNOWN", "LOW", "UNRESOLVED", "AMBIGUOUS"
@@ -373,6 +374,8 @@ class AgentRuntime:
             '"entity_confidence":"HIGH|MEDIUM|LOW|UNRESOLVED|AMBIGUOUS|NOT_APPLICABLE"}. '
             "A wrong-name or same-name result means identity resolution is required, not that the target does not exist. "
             "For a person, require affiliation/topic cross-check and favor official profiles plus academic metadata. "
+            "Never treat one database author record as the complete publication corpus. Compare source coverage and identifiers; "
+            "a large publication, citation, affiliation, timeline, or subject conflict requires follow-up verification. "
             "Preserve the original Korean name exactly in follow-up queries; romanizations are additional aliases only. "
             "Set ready_to_answer=false whenever identity or a material evidence gap remains. Do not include prose.\n\n"
             f"Question:\n{question}\n\nQueries executed:\n{json.dumps(round_queries, ensure_ascii=False)}\n\n"
@@ -440,6 +443,14 @@ class AgentRuntime:
         return total
 
     @staticmethod
+    def _academic_activity(tools: list[dict[str, object]]) -> dict[str, object]:
+        tool = next((item for item in tools if item.get("name") == "academic_intelligence"), None)
+        if tool is None:
+            return {}
+        details = tool.get("details")
+        return dict(details) if isinstance(details, dict) else {}
+
+    @staticmethod
     def _max_tokens(route: Route) -> int:
         return RESEARCH_MAX_TOKENS if route.agent == "research" else DEFAULT_MAX_TOKENS
 
@@ -479,6 +490,8 @@ class AgentRuntime:
         analyst_prompt = (
             "You are the Analyst / Synthesizer. Use only the supplied Evidence Package. "
             "Project context is user workspace context, not independently verified evidence; never use it to prove an external claim. "
+            "For researcher evaluation, preserve bibliometric metrics by source, explain coverage differences, and do not sum database counts. "
+            "A split, incomplete, or misresolved author profile cannot define the researcher's total output. "
             "Do not merely summarize facts. Explain what each evidence item means for the requested evaluation. "
             "Do not judge from publication or citation counts alone: assess topic consistency, development, originality, "
             "representative-work significance, recent activity, collaboration, and leadership where evidence exists. "
@@ -509,6 +522,7 @@ class AgentRuntime:
             "but treat the Evidence Package as the sole factual authority. Do not add facts absent from it or expose this workflow. "
             "Return a completed answer, never a plan, progress update, promise to search, or follow-up instruction. "
             "Do not assume praise in the question is true; state when the evidence is insufficient for that characterization. "
+            "Report database-specific publication/citation metrics separately and explain material coverage conflicts. "
             "Connect facts to meaning, comparative judgment, limitations, and a clear overall assessment. Preserve URL citations.\n\n"
             f"Question:\n{question}\n\nEvidence Package:\n{package_json}\n\nAnalyst Draft:\n{draft}\n\nCritic Feedback:\n{critique}"
         )
@@ -620,6 +634,8 @@ class AgentRuntime:
             "identity": {}, "career": {}, "metrics": {}, "research_topics": [],
             "representative_works": [], "recent_activity": [], "leadership": [],
             "collaboration": [], "limitations": [], "sources": [],
+            "metrics_by_source": {}, "publication_coverage": {}, "coverage_conflicts": [],
+            "academic_source_status": {}, "academic_pipeline": [],
             "project_context": {
                 "provenance": "user_workspace_context_not_external_evidence",
                 "content": persistent_context[:6000],
@@ -634,7 +650,35 @@ class AgentRuntime:
                 output = json.loads(str(tool.get("output", "")))
             except json.JSONDecodeError:
                 continue
-            if tool.get("name") == "semantic_scholar" and isinstance(output, dict):
+            if tool.get("name") == "academic_intelligence" and isinstance(output, dict):
+                researcher = output.get("researcher")
+                if isinstance(researcher, dict):
+                    package["identity"] = {
+                        key: researcher.get(key)
+                        for key in (
+                            "canonical_name", "native_name", "affiliations", "identifiers",
+                            "identity_confidence", "identity_sources", "candidate_count",
+                        )
+                    }
+                coverage = output.get("coverage")
+                if isinstance(coverage, dict):
+                    package["publication_coverage"] = coverage
+                    package["metrics_by_source"] = {
+                        source: {
+                            key: values.get(key)
+                            for key in ("reported_document_count", "publication_count", "citation_count", "h_index")
+                        }
+                        for source, values in coverage.items() if isinstance(values, dict)
+                    }
+                package["academic_source_status"] = output.get("source_status", {})
+                package["coverage_conflicts"] = output.get("conflicts", [])
+                package["academic_pipeline"] = output.get("pipeline", [])
+                papers = output.get("representative_papers")
+                if isinstance(papers, list):
+                    package["representative_works"].extend(
+                        AgentRuntime._compact_work(paper) for paper in papers if isinstance(paper, dict)
+                    )
+            elif tool.get("name") == "semantic_scholar" and isinstance(output, dict):
                 author = output.get("author")
                 if isinstance(author, dict):
                     package["identity"] = {key: author.get(key) for key in ("name", "affiliations", "author_id")}

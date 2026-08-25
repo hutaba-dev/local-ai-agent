@@ -1219,19 +1219,26 @@ class WebRuntimeTests(unittest.TestCase):
         semantic.assert_called_once()
         unpaywall.assert_not_called()
 
-    def test_deep_research_runs_s2_fallback_when_openalex_has_no_match(self) -> None:
+    def test_deep_research_researcher_query_uses_multi_source_orchestrator(self) -> None:
+        intelligence = {
+            "researcher": {"identity_confidence": "MEDIUM", "identity_sources": ["openalex", "semantic_scholar"]},
+            "source_status": {"scopus": "UNAVAILABLE", "web_of_science": "UNAVAILABLE", "openalex": "AVAILABLE_FULL"},
+            "coverage": {"openalex": {"publication_count": 8}}, "conflicts": [],
+            "merged_publication_count": 8, "representative_papers": [], "cache_hit": False,
+            "selection_policy": {"providers_called": ["openalex", "semantic_scholar", "orcid", "crossref"]},
+        }
         with patch(
             "runtime.tool_registry._web_search", return_value=ToolResult("web_search", True, "[]", None, 0)
         ), patch("runtime.tool_registry._web_sources", return_value=ToolResult("web_sources", False, "", "empty", 0)), patch(
-            "runtime.tool_registry._academic_papers", return_value=ToolResult("academic_papers", False, "", "empty", 0)
-        ), patch(
-            "runtime.tool_registry.semantic_scholar_evidence", return_value={"author": {}, "representative_papers": []}
-        ) as semantic:
+            "runtime.tool_registry.academic_intelligence", return_value=intelligence
+        ) as orchestrator:
             results = _research_tools(("안호선교수 연구 역량을 평가해줘",), "DEEP_RESEARCH", False)
 
-        self.assertEqual(results[-1].name, "semantic_scholar")
+        self.assertEqual(results[-1].name, "academic_intelligence")
         self.assertTrue(results[-1].success)
-        semantic.assert_called_once()
+        self.assertEqual(results[-1].details["execution"], "parallel")
+        self.assertIn("orcid", results[-1].details["providers_called"])
+        orchestrator.assert_called_once()
 
     def test_gap_selection_uses_unpaywall_when_public_source_evidence_is_sparse(self) -> None:
         papers = json.dumps([{"title": "Paper", "doi": "10.1000/example", "cited_by_count": 10}] * 3)

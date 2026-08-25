@@ -202,11 +202,26 @@ function activityElement(activity) {
   const wholeUsage = activity.whole_request_usage || {};
   const finalCall = activity.final_call || {};
   const research = activity.research || {};
-  const researchRounds = (research.rounds || []).map((round) => (
-    `<div>Round ${escapeHtml(String(round.round))}: ${escapeHtml((round.queries || []).join(" | "))}<br>` +
-    `Tools: ${escapeHtml((round.tools || []).join(", ") || "none")}; sources: ${escapeHtml(String(round.sources_fetched ?? 0))}; ` +
-    `entity: ${escapeHtml(round.entity_confidence || "UNKNOWN")}; gap: ${round.ready_to_answer ? "ready" : "follow-up"}</div>`
-  )).join("") || "N/A";
+  const researchRounds = (research.rounds || []).map((round) => {
+    const academic = round.academic_intelligence || {};
+    const sourceStatus = Object.entries(academic.source_status || {})
+      .map(([source, status]) => `${source}: ${status}`).join(", ");
+    const publicationCandidates = Object.entries(academic.publication_candidates || {})
+      .map(([source, count]) => `${source}: ${count}`).join(", ");
+    const academicDetail = sourceStatus
+      ? `<br>Academic sources: ${escapeHtml(sourceStatus)}<br>` +
+        `Providers called: ${escapeHtml((academic.providers_called || []).join(", ") || "none")}; ` +
+        `Publication candidates: ${escapeHtml(publicationCandidates || "none")}; ` +
+        `identity sources: ${escapeHtml((academic.identity_sources || []).join(", ") || "none")}; ` +
+        `identity confidence: ${escapeHtml(academic.identity_confidence || "UNKNOWN")}; ` +
+        `coverage conflicts: ${escapeHtml(String(academic.coverage_conflicts ?? 0))}; ` +
+        `merged corpus: ${escapeHtml(String(academic.merged_verified_corpus ?? 0))}; ` +
+        `representative papers: ${escapeHtml(String(academic.representative_papers ?? 0))}`
+      : "";
+    return `<div>Round ${escapeHtml(String(round.round))}: ${escapeHtml((round.queries || []).join(" | "))}<br>` +
+      `Tools: ${escapeHtml((round.tools || []).join(", ") || "none")}; sources: ${escapeHtml(String(round.sources_fetched ?? 0))}; ` +
+      `entity: ${escapeHtml(round.entity_confidence || "UNKNOWN")}; gap: ${round.ready_to_answer ? "ready" : "follow-up"}${academicDetail}</div>`;
+  }).join("") || "N/A";
   const llmCalls = (activity.llm_calls || []).map((call) => (
     `<div>#${escapeHtml(String(call.call_id))} ${escapeHtml(call.purpose)}: ${formatMs(call.total_llm_latency_ms)}${call.decode_tokens_per_second ? `, ${escapeHtml(String(call.decode_tokens_per_second))} tok/s decode` : ""}</div>`
   )).join("") || "No model calls recorded";

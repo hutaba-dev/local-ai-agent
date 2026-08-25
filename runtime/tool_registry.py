@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -11,6 +12,7 @@ from time import perf_counter
 import httpx
 
 from runtime.project_tools import ProjectTools
+from runtime.academic_intelligence import academic_intelligence
 from runtime.web_search import academic_papers, search_many, semantic_scholar_evidence, unpaywall_oa_locations
 
 
@@ -101,13 +103,16 @@ def _research_tools(message: str, search_mode: str, allow_local_tools: bool = Tr
         results.append(web_result)
         if search_mode == "DEEP_RESEARCH" and web_result.success:
             results.append(_web_sources(web_result.output))
-            academic_result = _academic_papers(_queries(message))
-            results.append(academic_result)
-            results.extend(_academic_evidence_gaps(
-                _queries(message),
-                academic_result.output if academic_result.success else "[]",
-                results,
-            ))
+            if _is_researcher_query(_queries(message)):
+                results.append(_academic_intelligence(_researcher_query(_queries(message))))
+            else:
+                academic_result = _academic_papers(_queries(message))
+                results.append(academic_result)
+                results.extend(_academic_evidence_gaps(
+                    _queries(message),
+                    academic_result.output if academic_result.success else "[]",
+                    results,
+                ))
     return results
 
 
@@ -208,6 +213,50 @@ def _academic_papers(queries: tuple[str, ...]) -> ToolResult:
             duration_ms,
             {"execution": "sequential", "wall_time_ms": duration_ms, "failure_reason": _failure_reason(error), "requests": diagnostics if "diagnostics" in locals() else []},
         )
+
+
+def _academic_intelligence(query: str) -> ToolResult:
+    started = perf_counter()
+    try:
+        intelligence = academic_intelligence(query)
+        duration_ms = round((perf_counter() - started) * 1000)
+        coverage = intelligence.get("coverage")
+        details = {
+            "execution": "parallel",
+            "wall_time_ms": duration_ms,
+            "source_status": intelligence.get("source_status", {}),
+            "providers_called": intelligence.get("selection_policy", {}).get("providers_called", []),
+            "identity_sources": intelligence.get("researcher", {}).get("identity_sources", []),
+            "identity_confidence": intelligence.get("researcher", {}).get("identity_confidence", "UNKNOWN"),
+            "publication_candidates": {
+                source: values.get("reported_document_count") or values.get("publication_count", 0)
+                for source, values in coverage.items()
+                if isinstance(values, dict)
+            } if isinstance(coverage, dict) else {},
+            "coverage_conflicts": len(intelligence.get("conflicts", [])),
+            "merged_verified_corpus": intelligence.get("merged_publication_count", 0),
+            "representative_papers": len(intelligence.get("representative_papers", [])),
+            "cache_hit": intelligence.get("cache_hit", False),
+        }
+        return ToolResult(
+            "academic_intelligence", True, json.dumps(intelligence, ensure_ascii=False), None, duration_ms, details
+        )
+    except (RuntimeError, ValueError, httpx.HTTPError) as error:
+        duration_ms = round((perf_counter() - started) * 1000)
+        return ToolResult(
+            "academic_intelligence", False, "", str(error), duration_ms,
+            {"execution": "parallel", "wall_time_ms": duration_ms, "failure_reason": _failure_reason(error)},
+        )
+
+
+def _is_researcher_query(queries: tuple[str, ...]) -> bool:
+    text = " ".join(queries)
+    return bool(re.search(
+        r"(?:교수|박사|연구자|학자|\bprofessor\b|\bresearcher\b|\bacademic\b|\bscientist\b|"
+        r"h[- ]?index|citation count|피인용|연구 역량|학술 실적)",
+        text,
+        re.IGNORECASE,
+    ))
 
 
 def _academic_evidence_gaps(
