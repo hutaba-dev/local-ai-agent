@@ -24,6 +24,8 @@ fi
 
 readonly VENV_DIR="${VENV_DIR:-/srv/local-ai-agent/venv}"
 readonly VLLM_BIN="${VENV_DIR}/bin/vllm"
+readonly TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-1}"
+readonly DISABLE_CUSTOM_ALL_REDUCE="${DISABLE_CUSTOM_ALL_REDUCE:-0}"
 
 if [[ ! -x "${VLLM_BIN}" ]]; then
   printf 'vLLM is not installed at %s. Run scripts/install.sh first.\n' "${VLLM_BIN}" >&2
@@ -32,15 +34,22 @@ fi
 
 mkdir -p "${HF_HOME}" "${HF_HUB_CACHE}" "${VLLM_CACHE_ROOT}" "${LOG_DIR}"
 
+extra_args=()
+if [[ "${DISABLE_CUSTOM_ALL_REDUCE}" == "1" ]]; then
+  extra_args+=(--disable-custom-all-reduce)
+fi
+
 exec "${VLLM_BIN}" serve "${MODEL}" \
   --served-model-name "${SERVED_MODEL_NAME}" \
   --host "${HOST}" \
   --port "${PORT}" \
   --dtype "${DTYPE}" \
+  --tensor-parallel-size "${TENSOR_PARALLEL_SIZE}" \
   --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
   --max-model-len "${MAX_MODEL_LEN}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
   --reasoning-parser qwen3 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder \
-  --download-dir "${HF_HUB_CACHE}"
+  --download-dir "${HF_HUB_CACHE}" \
+  "${extra_args[@]}"

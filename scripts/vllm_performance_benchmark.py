@@ -52,8 +52,10 @@ def _telemetry_loop(stop: threading.Event, telemetry: Telemetry) -> None:
             text=True,
             check=False,
         )
-        fields = result.stdout.strip().split(", ")
-        if len(fields) == 6:
+        for line in result.stdout.splitlines():
+            fields = line.split(", ")
+            if len(fields) != 6:
+                continue
             try:
                 gpu_util, power, graphics, memory, vram, temperature = (float(value) for value in fields)
                 telemetry.gpu_utilization.append(gpu_util)
