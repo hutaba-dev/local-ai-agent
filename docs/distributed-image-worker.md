@@ -18,9 +18,13 @@ SD-Turbo prompt optimization is preserved without exposing either API.
 
 ## Image Quality Control
 
-KIM owns image intent, structured prompt planning, and the post-generation quality gate. Small localized changes use `image.edit` and preserve the source image. Severe face, anatomy, action, composition, core-object, or style failures abandon the failed anchor and call `image.generate` from scratch using the retained original request.
+KIM owns image intent, scene specification, creative brief synthesis, prompt planning, visual preference application, optional reference research, candidate ranking, and the post-generation quality gate. The scene spec includes subject design, action, emotion, composition, camera, lighting, background, hair, wardrobe, expression, color palette, must-have objects, aesthetic constraints, and failure constraints. Generic action and style profiles add reusable pose and rendering guidance without hard-coding a particular character.
 
-Generated images are checked once for subject, action, face, anatomy, core object, and style. When multiple major checks fail, KIM allows one source-free regenerate with a simpler composition and then returns the result without further looping. AHN7 remains stateless and image-only throughout this process.
+Small localized changes use `image.edit` and preserve the source image. Severe face, anatomy, action, composition, core-object, style, or appeal failures are converted to structured failure labels, abandon the failed anchor, and call `image.generate` from scratch using the retained original request.
+
+KIM scores subject correctness, action readability, face quality, anatomy, core-object correctness, style, and overall appeal from 0 to 10. A severe failure triggers one diagnosis-aware source-free regenerate. Quality-sensitive person requests without a reference may instead generate two candidates, score both, and return the higher-ranked candidate. Both paths enforce a maximum of two internal generation attempts.
+
+Explicit visual-reference requests use up to three strict-safe-search thumbnails. KIM analyzes only reusable pose, composition, camera, palette, linework, facial-rendering, wardrobe-category, and background-density cues; it does not copy identities, characters, logos, artists, or designs. Explicit non-sensitive visual preferences can be stored as Project `preference` memory and reused by later Project image requests. AHN7 remains stateless and image-only throughout this process.
 
 Requests require a bearer token stored only in root-owned environment files:
 

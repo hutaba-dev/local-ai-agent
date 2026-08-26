@@ -14,7 +14,7 @@ from runtime.agent_runtime import AgentRuntime, LatencyRecorder
 from runtime.image_client import GeneratedImage, ImagePromptPlan, ImageQualityAssessment
 from runtime.projects import ProjectStore
 from runtime.tool_registry import ToolResult, _academic_evidence_gaps, _research_tools, _researcher_query, run_agent_tools
-from runtime.web_search import fetch_sources, search
+from runtime.web_search import fetch_sources, search, visual_search
 from web import app as web_app
 from web.auth import UserStore
 from web.uploads import ExtractedUpload
@@ -68,6 +68,18 @@ class BraveResponse:
             {"title": f"Source {index}", "url": f"https://example.com/{index}", "description": "Snippet"}
             for index in range(10)
         ]}}
+
+
+class BraveImageResponse:
+    def raise_for_status(self) -> None:
+        return None
+
+    def json(self) -> dict[str, object]:
+        return {"results": [{
+            "title": f"Visual {index}",
+            "url": f"https://example.com/visual/{index}",
+            "thumbnail": {"src": f"https://images.example.com/{index}.jpg"},
+        } for index in range(6)]}
 
 
 class NaverResponse:
@@ -688,6 +700,94 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(image_activity["mode"], "regenerate")
         self.assertEqual(image_activity["retry_policy"], "internal regenerate")
 
+    def test_quality_sensitive_generation_selects_best_of_two_candidates(self) -> None:
+        client = self.authenticated_client()
+        plan = ImagePromptPlan(
+            "polished portrait", "person", "walking", "anime", "high", "high", "none",
+            quality_sensitive=True,
+        )
+        weaker = ImageQualityAssessment(
+            True, True, (), "acceptable", (("face", 6), ("overall_appeal", 6)), 6.0, "accept"
+        )
+        stronger = ImageQualityAssessment(
+            True, True, (), "strong", (("face", 9), ("overall_appeal", 9)), 9.0, "accept"
+        )
+        candidates = [
+            GeneratedImage(b"weaker", 31, "generate", "generate-31.png"),
+            GeneratedImage(b"stronger", 32, "generate", "generate-32.png"),
+        ]
+
+        with patch("web.app.build_image_prompt", return_value=plan), patch(
+            "web.app.assess_image_quality", side_effect=[weaker, stronger]
+        ), patch("web.app.create_image", side_effect=candidates) as create:
+            response = client.post("/api/chat", json={"message": "/image attractive anime character walking"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(create.call_count, 2)
+        self.assertEqual(response.json()["generated_images"][0]["filename"], "generate-32.png")
+        activity = response.json()["activity"]["image"]
+        self.assertEqual(activity["mode"], "generate")
+        self.assertEqual(activity["retry_policy"], "candidate selection")
+        self.assertEqual([candidate["score"] for candidate in activity["candidates"]], [6.0, 9.0])
+
+    def test_project_preferences_and_explicit_reference_research_feed_scene_planner(self) -> None:
+        client = self.authenticated_client()
+        project_id = client.post("/api/projects", json={"name": "Visual preferences"}).json()["id"]
+        conversation_id = client.post(
+            f"/api/projects/{project_id}/conversations", json={"title": "Image"}
+        ).json()["id"]
+        client.post(f"/api/projects/{project_id}/memories", json={
+            "type": "preference", "content": "Prefers clean anime faces and readable full-body action",
+        })
+        generated = GeneratedImage(b"image", 41, "generate", "generate-41.png")
+        references = [{
+            "provider": "brave", "title": "Pose reference", "url": "https://example.com/reference",
+            "description": "Clear three-quarter walking pose and restrained background",
+        }]
+
+        with patch("web.app.visual_search", side_effect=RuntimeError("visual unavailable")), patch(
+            "web.app.search", return_value=references
+        ) as search_reference, patch(
+            "web.app.build_image_prompt", side_effect=planned_prompt
+        ) as planner, patch("web.app.assess_image_quality", return_value=PASSED_IMAGE_QUALITY), patch(
+            "web.app.create_image", return_value=generated
+        ):
+            response = client.post("/api/chat", json={
+                "message": "/image 검색해서 참고한 애니메이션 인물 전신을 그려줘",
+                "project_id": project_id,
+                "conversation_id": conversation_id,
+            })
+
+        self.assertEqual(response.status_code, 200)
+        search_reference.assert_called_once()
+        self.assertIn("clean anime faces", planner.call_args.kwargs["preference_context"])
+        self.assertIn("Clear three-quarter walking pose", planner.call_args.kwargs["reference_cues"])
+        activity = response.json()["activity"]["image"]
+        self.assertTrue(activity["preferences_applied"])
+        self.assertEqual(activity["reference_research"]["source_count"], 1)
+
+    def test_explicit_visual_preference_is_saved_after_project_image_generation(self) -> None:
+        client = self.authenticated_client()
+        project_id = client.post("/api/projects", json={"name": "Image memory"}).json()["id"]
+        conversation_id = client.post(
+            f"/api/projects/{project_id}/conversations", json={"title": "Preferences"}
+        ).json()["id"]
+        generated = GeneratedImage(b"image", 51, "generate", "generate-51.png")
+        preference = "앞으로 그림은 항상 깔끔한 애니 스타일과 자연스러운 인체를 선호해"
+
+        with patch("web.app.build_image_prompt", side_effect=planned_prompt), patch(
+            "web.app.assess_image_quality", return_value=PASSED_IMAGE_QUALITY
+        ), patch("web.app.create_image", return_value=generated):
+            response = client.post("/api/chat", json={
+                "message": f"/image {preference}",
+                "project_id": project_id,
+                "conversation_id": conversation_id,
+            })
+
+        memories = client.get(f"/api/projects/{project_id}/memories").json()["memories"]
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(any(memory["type"] == "preference" and memory["content"] == f"/image {preference}" for memory in memories))
+
     def test_front_facing_feedback_uses_identity_preserving_pose_service(self) -> None:
         client = self.authenticated_client()
         extracted = ExtractedUpload(
@@ -1207,6 +1307,17 @@ class WebRuntimeTests(unittest.TestCase):
 
         self.assertEqual(len(results), 5)
         self.assertEqual(get.call_args.kwargs["params"]["count"], 5)
+
+    def test_visual_search_is_bounded_and_uses_strict_safesearch(self) -> None:
+        with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "test-key"}), patch(
+            "runtime.web_search.httpx.get", return_value=BraveImageResponse()
+        ) as get:
+            results = visual_search("anime pose reference", 3)
+
+        self.assertEqual(len(results), 3)
+        self.assertEqual(get.call_args.args[0], "https://api.search.brave.com/res/v1/images/search")
+        self.assertEqual(get.call_args.kwargs["params"]["safesearch"], "strict")
+        self.assertEqual(get.call_args.kwargs["params"]["count"], 3)
 
     def test_korean_deep_research_uses_naver_and_reddit(self) -> None:
         responses = [NaverResponse(), RedditResponse()]

@@ -1,48 +1,54 @@
 {
   "evaluation_metrics": [
-    "face_quality",
-    "anatomy",
-    "action_readability",
-    "core_object_presence",
+    "face_attractiveness",
+    "facial_coherence",
+    "body_coherence",
+    "pose_readability",
+    "object_correctness",
     "style_fidelity",
-    "retry_correctness",
-    "edit_vs_regenerate_decision"
+    "prompt_quality",
+    "retry_decision_quality"
   ],
   "cases": [
   {
-    "id": "person-riding-skateboard",
-    "prompt": "A student riding a skateboard outdoors",
-    "expected": {"action": "riding a skateboard", "core_object": "skateboard", "composition": "full body"}
+    "id": "attractive-student-riding-skateboard",
+    "prompt": "예쁜 여학생이 스케이트보드를 타는 장면",
+    "expected": {"action": "riding a skateboard", "core_object": "skateboard", "composition": "full body", "quality_priority": "face anatomy action"}
   },
   {
-    "id": "person-riding-bicycle",
-    "prompt": "A person riding a bicycle on a city path",
-    "expected": {"action": "riding a bicycle", "core_object": "bicycle", "composition": "full body"}
+    "id": "attractive-student-riding-bicycle",
+    "prompt": "예쁜 여학생이 자전거를 타는 장면",
+    "expected": {"action": "riding a bicycle", "core_object": "bicycle", "composition": "full body", "quality_priority": "face anatomy action"}
   },
   {
-    "id": "girl-running",
-    "prompt": "A girl running through a park",
-    "expected": {"action": "running", "core_object": "none", "composition": "full body"}
+    "id": "handsome-man-walking",
+    "prompt": "잘생긴 남자가 도시를 걷는 장면",
+    "expected": {"action": "walking", "core_object": "none", "composition": "full or three-quarter body", "quality_priority": "face anatomy gait"}
   },
   {
-    "id": "man-dancing",
-    "prompt": "A man dancing on a clean stage",
-    "expected": {"action": "dancing", "core_object": "none", "composition": "full body"}
+    "id": "anime-full-body-person",
+    "prompt": "애니메이션풍 인물 전신",
+    "expected": {"action": "standing", "core_object": "none", "composition": "full body", "quality_priority": "design anatomy style"}
   },
   {
-    "id": "woman-sitting-at-desk",
-    "prompt": "A woman sitting naturally at a desk and writing",
-    "expected": {"action": "sitting and writing", "core_object": "desk", "composition": "readable seated pose"}
+    "id": "anime-face-closeup",
+    "prompt": "애니메이션풍 얼굴 클로즈업",
+    "expected": {"action": "portrait", "core_object": "none", "composition": "face close-up", "quality_priority": "face attractiveness coherence style"}
   },
   {
-    "id": "anime-portrait",
-    "prompt": "A polished Japanese anime-style portrait with an attractive face",
-    "expected": {"action": "portrait", "core_object": "none", "composition": "face clearly visible"}
+    "id": "photorealistic-portrait",
+    "prompt": "실사풍 인물 초상",
+    "expected": {"action": "portrait", "core_object": "none", "composition": "portrait", "quality_priority": "natural face lighting realism"}
   },
   {
-    "id": "anime-full-body-action",
-    "prompt": "A polished Japanese anime-style full-body character jumping",
-    "expected": {"action": "jumping", "core_object": "none", "composition": "full body"}
+    "id": "person-action-with-background",
+    "prompt": "배경이 포함된 인물 액션 장면",
+    "expected": {"action": "dynamic action", "core_object": "none", "composition": "subject and environment readable", "quality_priority": "action hierarchy anatomy"}
+  },
+  {
+    "id": "aesthetic-character-without-reference",
+    "prompt": "reference 없이 미감 좋은 캐릭터 생성",
+    "expected": {"action": "character design", "core_object": "none", "composition": "art-directed character view", "quality_priority": "creative brief appeal coherence"}
   }
   ]
 }

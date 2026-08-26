@@ -15,6 +15,7 @@ from urllib.parse import urljoin, urlparse
 import httpx
 
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
+BRAVE_IMAGE_ENDPOINT = "https://api.search.brave.com/res/v1/images/search"
 NAVER_ENDPOINT = "https://openapi.naver.com/v1/search/webkr.json"
 REDDIT_ENDPOINT = "https://www.reddit.com/search.json"
 OPENALEX_WORKS_ENDPOINT = "https://api.openalex.org/works"
@@ -99,6 +100,48 @@ def search_many(queries: tuple[str, ...], mode: str) -> list[dict[str, str]]:
     if not unique:
         raise RuntimeError("; ".join(errors) or "no search results were returned")
     return unique[:24]
+
+
+def visual_search(query: str, result_count: int = 3) -> list[dict[str, str]]:
+    """Return bounded Brave image references for private art-direction analysis."""
+    if not os.getenv("BRAVE_SEARCH_API_KEY"):
+        raise RuntimeError("configure BRAVE_SEARCH_API_KEY for visual reference search")
+    response = httpx.get(
+        BRAVE_IMAGE_ENDPOINT,
+        headers={"Accept": "application/json", "X-Subscription-Token": os.environ["BRAVE_SEARCH_API_KEY"]},
+        params={"q": query, "count": min(max(result_count, 1), 4), "safesearch": "strict"},
+        timeout=12,
+    )
+    response.raise_for_status()
+    references = []
+    for item in response.json().get("results", [])[:result_count]:
+        thumbnail = item.get("thumbnail") if isinstance(item, dict) else None
+        thumbnail_url = thumbnail.get("src") if isinstance(thumbnail, dict) else None
+        if isinstance(item, dict) and isinstance(item.get("title"), str) and isinstance(thumbnail_url, str):
+            references.append({
+                "title": item["title"][:200],
+                "url": str(item.get("url", ""))[:1_000],
+                "thumbnail_url": thumbnail_url[:2_000],
+            })
+    return references
+
+
+def fetch_visual_thumbnails(references: list[dict[str, str]], limit: int = 3) -> tuple[tuple[str, str, bytes], ...]:
+    """Fetch small public image-search thumbnails with SSRF and size bounds."""
+    images = []
+    for reference in references[:limit]:
+        url = reference.get("thumbnail_url")
+        if not isinstance(url, str):
+            continue
+        try:
+            response, _final_url = _safe_fetch_binary(url)
+            content_type = response.headers.get("content-type", "").split(";", 1)[0].lower()
+            if content_type not in {"image/jpeg", "image/png", "image/webp"} or len(response.content) > 2_000_000:
+                continue
+            images.append((reference.get("title", "visual reference"), content_type, response.content))
+        except (OSError, ValueError, httpx.HTTPError):
+            continue
+    return tuple(images)
 
 
 def _query_terms(query: str) -> tuple[str, ...]:
@@ -526,6 +569,27 @@ def _safe_fetch(url: str) -> tuple[httpx.Response, str]:
         response = httpx.get(
             current_url,
             headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"},
+            timeout=12,
+            follow_redirects=False,
+        )
+        if response.is_redirect:
+            location = response.headers.get("location")
+            if not location:
+                raise ValueError("redirect had no location")
+            current_url = urljoin(current_url, location)
+            continue
+        response.raise_for_status()
+        return response, current_url
+    raise ValueError("too many redirects")
+
+
+def _safe_fetch_binary(url: str) -> tuple[httpx.Response, str]:
+    current_url = url
+    for _ in range(4):
+        _validate_public_https_url(current_url)
+        response = httpx.get(
+            current_url,
+            headers={"User-Agent": USER_AGENT, "Accept": "image/jpeg,image/png,image/webp"},
             timeout=12,
             follow_redirects=False,
         )

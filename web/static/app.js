@@ -216,6 +216,10 @@ function activityElement(activity) {
   const image = activity.image || {};
   const imageIntent = image.prompt_intent || {};
   const imageQuality = image.quality_gate || {};
+  const imageScores = Object.entries(imageQuality.scores || {}).map(([criterion, score]) => `${criterion}: ${score}/10`).join(", ");
+  const imageCandidates = (image.candidates || []).map((candidate) => (
+    `#${candidate.candidate} seed ${candidate.seed}: ${candidate.score}/10${candidate.passed ? " pass" : " retry"}`
+  )).join("; ");
   const researchRounds = (research.rounds || []).map((round) => {
     const academic = round.academic_intelligence || {};
     const sourceStatus = Object.entries(academic.source_status || {})
@@ -268,8 +272,26 @@ function activityElement(activity) {
       ["Face priority", escapeHtml(imageIntent.face_priority || "N/A")],
       ["Anatomy priority", escapeHtml(imageIntent.anatomy_priority || "N/A")],
       ["Must-have object", escapeHtml(imageIntent.must_have_object || "N/A")],
+      ["Composition", escapeHtml(imageIntent.composition || "N/A")],
+      ["Camera", escapeHtml(imageIntent.camera || "N/A")],
+      ["Lighting", escapeHtml(imageIntent.lighting || "N/A")],
+      ["Background", escapeHtml(imageIntent.background || "N/A")],
+      ["Subject design", escapeHtml(imageIntent.subject_design || "N/A")],
+      ["Hair", escapeHtml(imageIntent.hair || "N/A")],
+      ["Wardrobe", escapeHtml(imageIntent.wardrobe || "N/A")],
+      ["Expression", escapeHtml(imageIntent.expression || "N/A")],
+      ["Color palette", escapeHtml(imageIntent.color_palette || "N/A")],
+      ["Creative brief", escapeHtml(imageIntent.creative_brief || "N/A")],
+      ["Profiles", escapeHtml(`${imageIntent.action_profile || "generic"} / ${imageIntent.style_profile || "generic"}`)],
       ["Retry policy", escapeHtml(image.retry_policy || "N/A")],
+      ["Feedback labels", escapeHtml((image.feedback_labels || []).join(", ") || "none")],
+      ["Preference memory", image.preferences_applied ? "applied" : "none"],
+      ["Reference research", image.reference_research?.used ? `${escapeHtml(String(image.reference_research.source_count))} sources` : "not used"],
+      ["Candidates", escapeHtml(imageCandidates || "single")],
       ["Quality gate", escapeHtml(imageQuality.checked ? (imageQuality.passed ? "passed" : "failed after retry") : "unavailable")],
+      ["Quality scores", escapeHtml(imageScores || "N/A")],
+      ["Overall appeal", imageQuality.overall_score ? `${escapeHtml(String(imageQuality.overall_score))}/10` : "N/A"],
+      ["Decision", escapeHtml(imageQuality.decision || "N/A")],
       ["Quality findings", escapeHtml((imageQuality.failures || []).join(", ") || imageQuality.summary || "none")],
     );
   }

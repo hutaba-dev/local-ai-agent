@@ -21,17 +21,22 @@ from starlette.concurrency import run_in_threadpool
 
 from runtime.agent_runtime import BASE_URL, MODEL, AgentRuntime
 from runtime.image_client import (
+    analyze_visual_references,
     assess_image_quality,
     build_image_prompt,
     correct_portrait_pose,
     create_image,
+    feedback_failure_labels,
+    is_explicit_visual_preference,
     parse_image_command,
     prefers_original_source,
+    requests_reference_research,
 )
 from runtime.projects import ProjectNotFoundError, ProjectPathError, ProjectStorageOfflineError, ProjectStore
 from runtime.project_tools import ProjectTools
 from runtime.router import AGENT_CHOICES
 from runtime.tool_registry import ProjectToolScope
+from runtime.web_search import fetch_visual_thumbnails, search, visual_search
 from web.auth import SessionSigner, User, configured_user_store
 from web.uploads import ExtractedUpload, IMAGE_EXTENSIONS, UploadError, extract_text, image_thumbnail_data_url, max_upload_bytes, safe_filename
 
@@ -699,18 +704,86 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
                     "edit": "small correction preserving the existing image",
                     "regenerate": "severe quality failure; abandoned the previous image",
                 }[mode]
+                preference_context = ""
+                if request.project_id:
+                    preferences = [
+                        str(memory["content"])
+                        for memory in project_store.list_memories(user.username, request.project_id, active_only=True)
+                        if memory["type"] == "preference"
+                    ][:8]
+                    preference_context = "; ".join(preferences)[:2_000]
+                reference_cues = ""
+                reference_sources: list[dict[str, str]] = []
+                if requests_reference_research(prompt):
+                    try:
+                        visual_references = await run_in_threadpool(
+                            visual_search,
+                            f"{original_request or prompt} visual pose composition style reference",
+                        )
+                        reference_images = await run_in_threadpool(fetch_visual_thumbnails, visual_references)
+                        reference_cues = await run_in_threadpool(
+                            analyze_visual_references, original_request or prompt, reference_images
+                        )
+                        reference_sources = [
+                            {"title": item["title"], "url": item["url"], "description": "visual reference"}
+                            for item in visual_references
+                        ]
+                    except (RuntimeError, httpx.HTTPError):
+                        try:
+                            reference_sources = await run_in_threadpool(
+                                search,
+                                f"{original_request or prompt} visual pose composition style reference",
+                                "QUICK_SEARCH",
+                            )
+                            reference_cues = "; ".join(
+                                f"{result['title']}: {result['description']}" for result in reference_sources[:3]
+                            )[:2_000]
+                        except RuntimeError:
+                            reference_sources = []
+                structured_feedback = feedback_failure_labels(prompt) if mode == "regenerate" else ()
                 prompt_plan = await run_in_threadpool(
                     build_image_prompt,
                     prompt,
                     editing=mode == "edit",
                     original_request=original_request,
-                    quality_feedback=prompt if mode == "regenerate" else "",
+                    quality_feedback=(
+                        f"labels: {', '.join(structured_feedback)}; user feedback: {prompt}"
+                        if structured_feedback else prompt if mode == "regenerate" else ""
+                    ),
+                    preference_context=preference_context,
+                    reference_cues=reference_cues,
                 )
-                generated = await run_in_threadpool(create_image, prompt_plan.prompt, source_image)
                 quality_request = original_request or prompt
-                quality = await run_in_threadpool(assess_image_quality, quality_request, generated.content)
                 retry_count = 0
-                if quality.checked and not quality.passed:
+                candidate_reviews: list[dict[str, object]] = []
+                candidate_count = 2 if mode == "image" and source_image is None and prompt_plan.quality_sensitive else 1
+                candidates = []
+                for candidate_number in range(1, candidate_count + 1):
+                    candidate = await run_in_threadpool(create_image, prompt_plan.prompt, source_image)
+                    candidate_quality = await run_in_threadpool(
+                        assess_image_quality, quality_request, candidate.content
+                    )
+                    candidates.append((candidate, candidate_quality))
+                    candidate_reviews.append({
+                        "candidate": candidate_number,
+                        "seed": candidate.seed,
+                        "score": candidate_quality.overall_score,
+                        "passed": candidate_quality.passed,
+                        "failures": list(candidate_quality.failures),
+                    })
+                generated, quality = max(
+                    candidates,
+                    key=lambda candidate: (
+                        candidate[1].passed,
+                        candidate[1].overall_score if candidate[1].checked else 0,
+                    ),
+                )
+                if candidate_count > 1:
+                    retry_count = 1
+                    decision_reason = (
+                        "quality-sensitive person request; selected the highest-scoring of two generated candidates"
+                    )
+                elif quality.checked and not quality.passed:
                     failure_summary = ", ".join(quality.failures)
                     if quality.summary:
                         failure_summary = f"{failure_summary}. {quality.summary}"
@@ -720,9 +793,18 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
                         original_request=quality_request,
                         quality_feedback=failure_summary,
                         simplify_composition=True,
+                        preference_context=preference_context,
+                        reference_cues=reference_cues,
                     )
                     generated = await run_in_threadpool(create_image, prompt_plan.prompt, None)
                     quality = await run_in_threadpool(assess_image_quality, quality_request, generated.content)
+                    candidate_reviews.append({
+                        "candidate": 2,
+                        "seed": generated.seed,
+                        "score": quality.overall_score,
+                        "passed": quality.passed,
+                        "failures": list(quality.failures),
+                    })
                     retry_count = 1
                     decision_reason = "quality gate found multiple major failures; regenerated from scratch"
         except httpx.HTTPError as error:
@@ -738,11 +820,14 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         continuation_image_id = secrets.token_urlsafe(24)
         original_image = source_attachment.images[-1][2] if source_attachment and mode in {"edit", "pose"} else generated.content
         retained_request = original_request or prompt
+        candidate_selection = bool(prompt_plan and 'candidate_count' in locals() and candidate_count > 1)
+        internal_regenerate = mode == "regenerate" or (retry_count > 0 and not candidate_selection)
         image_context = {
             "original_request": retained_request,
             "attempt": previous_attempt + 1 + retry_count,
-            "last_mode": "regenerate" if mode == "regenerate" or retry_count else generated.mode,
+            "last_mode": "regenerate" if internal_regenerate else generated.mode,
             "quality_failures": list(quality.failures) if quality else [],
+            "feedback_labels": list(structured_feedback) if mode == "regenerate" else [],
         }
         save_attachment(
             continuation_image_id,
@@ -766,6 +851,15 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         )
         project_artifact = None
         if request.project_id and request.conversation_id:
+            if is_explicit_visual_preference(request.message):
+                project_store.add_memory(
+                    user.username,
+                    request.project_id,
+                    "preference",
+                    request.message,
+                    source_type="conversation",
+                    source_id=request.conversation_id,
+                )
             project_artifact = project_store.save_file(
                 user.username,
                 request.project_id,
@@ -782,7 +876,7 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             project_store.add_message(
                 user.username, request.project_id, request.conversation_id, "assistant", assistant_content
             )
-        effective_mode = "regenerate" if mode == "regenerate" or retry_count else generated.mode
+        effective_mode = "regenerate" if internal_regenerate else generated.mode
         image_activity = {
             "mode": effective_mode,
             "reason": decision_reason,
@@ -793,13 +887,37 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
                 "face_priority": prompt_plan.face_priority if prompt_plan else "identity preservation",
                 "anatomy_priority": prompt_plan.anatomy_priority if prompt_plan else "preserve",
                 "must_have_object": prompt_plan.must_have_object if prompt_plan else "original portrait subject",
+                "emotion": prompt_plan.emotion if prompt_plan else "preserve",
+                "composition": prompt_plan.composition if prompt_plan else "preserve",
+                "camera": prompt_plan.camera if prompt_plan else "preserve",
+                "lighting": prompt_plan.lighting if prompt_plan else "preserve",
+                "background": prompt_plan.background if prompt_plan else "preserve",
+                "subject_design": prompt_plan.subject_design if prompt_plan else "preserve",
+                "hair": prompt_plan.hair if prompt_plan else "preserve",
+                "wardrobe": prompt_plan.wardrobe if prompt_plan else "preserve",
+                "expression": prompt_plan.expression if prompt_plan else "preserve",
+                "color_palette": prompt_plan.color_palette if prompt_plan else "preserve",
+                "creative_brief": prompt_plan.creative_brief if prompt_plan else "preserve existing portrait",
+                "action_profile": prompt_plan.action_profile if prompt_plan else "portrait",
+                "style_profile": prompt_plan.style_profile if prompt_plan else "preserve",
             },
-            "retry_policy": "internal regenerate" if retry_count else "edit refinement" if mode in {"edit", "pose"} else "first pass",
+            "retry_policy": "candidate selection" if candidate_selection
+            else "internal regenerate" if retry_count else "edit refinement" if mode in {"edit", "pose"} else "first pass",
+            "feedback_labels": list(structured_feedback) if mode == "regenerate" else [],
+            "preferences_applied": bool(preference_context) if prompt_plan else False,
+            "reference_research": {
+                "used": bool(reference_sources) if prompt_plan else False,
+                "source_count": len(reference_sources) if prompt_plan else 0,
+            },
+            "candidates": candidate_reviews if prompt_plan else [],
             "quality_gate": {
                 "checked": quality.checked if quality else False,
                 "passed": quality.passed if quality else True,
                 "failures": list(quality.failures) if quality else [],
                 "summary": quality.summary if quality else "not applicable to pose correction",
+                "scores": dict(quality.scores) if quality else {},
+                "overall_score": quality.overall_score if quality else 0,
+                "decision": quality.decision if quality else "accept",
             },
         }
         response = image_chat_response(

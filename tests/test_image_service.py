@@ -161,23 +161,68 @@ class ImageServiceTests(unittest.TestCase):
         self.assertFalse(quality.passed)
         self.assertEqual(quality.failures, ("action", "face"))
 
+    def test_action_style_profiles_and_feedback_labels_are_generic(self) -> None:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"choices": [{"message": {"content": json.dumps({
+            "prompt": "readable cyclist",
+            "subject": "person",
+            "action": "cycling",
+            "style": "watercolor",
+            "face_priority": "normal",
+            "anatomy_priority": "high",
+            "must_have_object": "bicycle",
+        })}}]}
+
+        with patch("runtime.image_client.httpx.post", return_value=response) as post:
+            plan = image_client.build_image_prompt("수채화 스타일로 자전거를 타는 사람")
+
+        planner_input = post.call_args.kwargs["json"]["messages"][1]["content"]
+        self.assertEqual(plan.action_profile, "cycling")
+        self.assertEqual(plan.style_profile, "watercolor")
+        self.assertIn("feet aligned with pedals", planner_input)
+        self.assertIn("controlled translucent washes", planner_input)
+        self.assertEqual(
+            image_client.feedback_failure_labels("얼굴과 손이 이상하고 자전거가 없어"),
+            ("face_failure", "anatomy_failure", "object_failure"),
+        )
+        self.assertTrue(image_client.is_explicit_visual_preference("앞으로 그림은 항상 깔끔한 애니 스타일을 선호해"))
+        self.assertFalse(image_client.is_explicit_visual_preference("예쁜 애니 스타일로 그려줘"))
+        self.assertTrue(image_client.is_quality_sensitive_request("예쁜 여학생 캐릭터", "generic", "anime_illustration"))
+        self.assertFalse(image_client.is_quality_sensitive_request("파란 정육면체", "generic", "generic"))
+
+    def test_visual_reference_analysis_extracts_cues_without_identity_copying(self) -> None:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"choices": [{"message": {"content": "three-quarter pose, clean linework"}}]}
+
+        with patch("runtime.image_client.httpx.post", return_value=response) as post:
+            cues = image_client.analyze_visual_references(
+                "anime walking scene", (("reference", "image/png", png_bytes()),)
+            )
+
+        instruction = post.call_args.kwargs["json"]["messages"][0]["content"][0]["text"]
+        self.assertEqual(cues, "three-quarter pose, clean linework")
+        self.assertIn("Do not identify or reproduce", instruction)
+
     def test_image_quality_benchmark_covers_required_scene_types_and_metrics(self) -> None:
         benchmark = json.loads(
             (Path(__file__).parent / "fixtures" / "image_quality_benchmarks.json").read_text(encoding="utf-8")
         )
         fixtures = benchmark["cases"]
 
-        self.assertEqual(len(fixtures), 7)
+        self.assertEqual(len(fixtures), 8)
         self.assertEqual(set(benchmark["evaluation_metrics"]), {
-            "face_quality", "anatomy", "action_readability", "core_object_presence", "style_fidelity",
-            "retry_correctness", "edit_vs_regenerate_decision",
+            "face_attractiveness", "facial_coherence", "body_coherence", "pose_readability",
+            "object_correctness", "style_fidelity", "prompt_quality", "retry_decision_quality",
         })
         self.assertEqual({fixture["id"] for fixture in fixtures}, {
-            "person-riding-skateboard", "person-riding-bicycle", "girl-running", "man-dancing",
-            "woman-sitting-at-desk", "anime-portrait", "anime-full-body-action",
+            "attractive-student-riding-skateboard", "attractive-student-riding-bicycle",
+            "handsome-man-walking", "anime-full-body-person", "anime-face-closeup",
+            "photorealistic-portrait", "person-action-with-background", "aesthetic-character-without-reference",
         })
         for fixture in fixtures:
-            self.assertEqual(set(fixture["expected"]), {"action", "core_object", "composition"})
+            self.assertEqual(set(fixture["expected"]), {"action", "core_object", "composition", "quality_priority"})
 
     def test_edit_prompt_preserves_identity_and_treats_complaints_as_corrections(self) -> None:
         response = Mock()
