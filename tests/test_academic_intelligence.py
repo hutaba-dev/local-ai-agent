@@ -157,7 +157,10 @@ class AcademicIntelligenceTests(unittest.TestCase):
         response = Mock()
         response.raise_for_status.return_value = None
         response.json.return_value = {}
-        with patch.dict(os.environ, {"WOS_API_KEY": "key"}), patch(
+        with patch.dict(os.environ, {
+            "WOS_API_KEY": "starter-key",
+            "WOS_RESEARCHER_API_KEY": "researcher-key",
+        }), patch(
             "runtime.academic_intelligence.httpx.get", return_value=response
         ) as get:
             wos_search_researchers("Geoffrey Hinton")
@@ -170,7 +173,10 @@ class AcademicIntelligenceTests(unittest.TestCase):
         self.assertIn("https://api.clarivate.com/apis/wos-researcher/researchers/A-1234-2000", urls)
         self.assertIn("https://api.clarivate.com/apis/wos-starter/v1/documents", urls)
         self.assertIn("https://api.clarivate.com/apis/wos-starter/v1/documents/WOS:123", urls)
-        self.assertTrue(all(call.kwargs["headers"]["X-ApiKey"] == "key" for call in get.call_args_list))
+        self.assertEqual(
+            [call.kwargs["headers"]["X-ApiKey"] for call in get.call_args_list],
+            ["researcher-key", "researcher-key", "starter-key", "starter-key"],
+        )
 
     def test_provider_http_states_distinguish_entitlement_and_rate_limit(self) -> None:
         from runtime.academic_intelligence import _provider_failure

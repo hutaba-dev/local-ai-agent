@@ -202,10 +202,15 @@ def _wos_headers() -> dict[str, str] | None:
     return {"X-ApiKey": api_key} if api_key else None
 
 
+def _wos_researcher_headers() -> dict[str, str] | None:
+    api_key = os.getenv("WOS_RESEARCHER_API_KEY")
+    return {"X-ApiKey": api_key} if api_key else None
+
+
 def wos_search_researchers(query: str, limit: int = 10, page: int = 1) -> dict[str, object]:
-    headers = _wos_headers()
+    headers = _wos_researcher_headers()
     if headers is None:
-        raise RuntimeError("WOS_API_KEY is not configured")
+        raise RuntimeError("WOS_RESEARCHER_API_KEY is not configured")
     return _request_json(
         f"{WOS_RESEARCHER_API_BASE}/researchers",
         headers=headers,
@@ -214,9 +219,9 @@ def wos_search_researchers(query: str, limit: int = 10, page: int = 1) -> dict[s
 
 
 def wos_get_researcher(researcher_id: str) -> dict[str, object]:
-    headers = _wos_headers()
+    headers = _wos_researcher_headers()
     if headers is None:
-        raise RuntimeError("WOS_API_KEY is not configured")
+        raise RuntimeError("WOS_RESEARCHER_API_KEY is not configured")
     return _request_json(f"{WOS_RESEARCHER_API_BASE}/researchers/{researcher_id}", headers=headers)
 
 

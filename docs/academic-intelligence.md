@@ -23,6 +23,7 @@ The web service loads the ignored `.env` file from the repository root. It is `0
 SCOPUS_API_KEY=
 SCOPUS_INST_TOKEN=
 WOS_API_KEY=
+WOS_RESEARCHER_API_KEY=
 ```
 
 Scopus endpoints used:
@@ -40,7 +41,7 @@ Web of Science endpoints used:
 - Researcher API: `https://api.clarivate.com/apis/wos-researcher/researchers`
 - Starter documents: `https://api.clarivate.com/apis/wos-starter/v1/documents`
 
-WoS Researcher API requires a paid license in addition to a Web of Science subscription. Starter API has separate plans; the free trial omits times-cited and is limited to 50 requests per day, while institutional plans can include citation counts and higher quotas.
+Use `WOS_API_KEY` for Starter and `WOS_RESEARCHER_API_KEY` for Researcher. WoS Researcher API requires a paid license in addition to a Web of Science subscription. Starter API has separate plans; the free trial omits times-cited and is limited to 50 requests per day, while institutional plans can include citation counts and higher quotas.
 
 On this server, no Scopus or WoS credentials were configured during implementation. Unauthenticated probes returned HTTP 401. The runtime therefore reports these sources as unavailable and continues with public sources.
 
