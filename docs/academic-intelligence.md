@@ -2,6 +2,8 @@
 
 Researcher evaluation uses `runtime/academic_intelligence.py` to resolve identity and reconstruct publication evidence before final synthesis. No provider's author record is treated as the complete career record by itself.
 
+For Korean names, Deep Research first searches the exact native name. Qwen then derives plausible publication-name spellings from public profile evidence, while a standard Korean romanizer adds spacing variants. These aliases are candidates, not conclusions: Scopus affiliation, ORCID, and corpus size must confirm the selected Author ID. Institution or department text is never accepted as a person name.
+
 ## Source Roles
 
 Identity and curated bibliometrics prefer:
@@ -61,7 +63,7 @@ Independent provider calls run concurrently. Selection is dynamic:
 1. Configured Scopus and WoS sources run first with public Scholar profile discovery.
 2. If Scopus and WoS both resolve an author and their document counts agree within 25%, public API fallback can be skipped for quota and latency control.
 3. If a curated source is missing, limited, ambiguous, or conflicts with the other source, ORCID, OpenAlex, Semantic Scholar, and Crossref run concurrently as validation sources.
-4. The aggregate identity, publication, and metric snapshot is cached by normalized researcher name for six hours.
+4. The aggregate identity, publication, and metric snapshot is cached by normalized researcher name for six hours. A rate-limited snapshot expires after 60 seconds so a temporary provider throttle does not poison later research.
 
 The pipeline records:
 

@@ -9,6 +9,10 @@ from runtime.academic_intelligence import (
     SourceStatus,
     _aggregate_intelligence,
     _orcid_provider,
+    _scopus_author_entries,
+    _scopus_author_profile,
+    _scopus_author_query,
+    _scopus_provider,
     _semantic_scholar_provider,
     academic_intelligence,
     academic_source_status,
@@ -72,6 +76,82 @@ class AcademicIntelligenceTests(unittest.TestCase):
         headers = get.call_args.kwargs["headers"]
         self.assertEqual(headers["X-ELS-APIKey"], "real-ascii-key")
         self.assertNotIn("X-ELS-Insttoken", headers)
+
+    def test_scopus_normalizes_actual_author_response_shape(self) -> None:
+        search_payload = {"search-results": {"entry": [{
+            "dc:identifier": "AUTHOR_ID:26654087900",
+            "orcid": "[0000-0002-1036-3038]",
+            "preferred-name": {"given-name": "Ho Seon", "surname": "Ahn"},
+            "document-count": "136",
+            "affiliation-current": {"affiliation-name": "Incheon National University"},
+        }]}}
+        identity = _scopus_author_entries(search_payload)[0]
+        profile_payload = {"author-retrieval-response": [{
+            "coredata": {"document-count": "136", "citation-count": "5942", "orcid": "0000-0002-1036-3038"},
+            "h-index": "43",
+        }]}
+        profile, metrics = _scopus_author_profile(profile_payload, identity)
+
+        self.assertEqual(_scopus_author_query("Ho Seon Ahn"), 'AUTHLASTNAME(Ahn) AND AUTHFIRST("Ho Seon")')
+        self.assertEqual(profile["name"], "Ho Seon Ahn")
+        self.assertEqual(profile["orcid"], "0000-0002-1036-3038")
+        self.assertEqual(metrics, {"document_count": 136, "citation_count": 5942, "h_index": 43})
+
+    def test_scopus_stops_after_strong_alias_and_affiliation_match(self) -> None:
+        search_payload = {"search-results": {"entry": [{
+            "dc:identifier": "AUTHOR_ID:26654087900",
+            "preferred-name": {"given-name": "Ho Seon", "surname": "Ahn"},
+            "document-count": "136",
+            "affiliation-current": {"affiliation-name": "Incheon National University"},
+        }]}}
+        profile_payload = {"author-retrieval-response": [{
+            "coredata": {"document-count": "136", "citation-count": "5942"},
+            "h-index": "43",
+        }]}
+        query = (
+            "안호선 교수\nAcademic alias: Hoseon Ahn\nAcademic alias: Ho-Sun Ahn\n"
+            "Affiliation hint: Incheon National University"
+        )
+        with patch.dict(os.environ, {"SCOPUS_API_KEY": "key"}, clear=True), patch(
+            "runtime.academic_intelligence.scopus_search_authors", return_value=search_payload
+        ) as search, patch(
+            "runtime.academic_intelligence.scopus_get_author", return_value=profile_payload
+        ), patch(
+            "runtime.academic_intelligence.scopus_get_author_documents",
+            return_value={"search-results": {"entry": []}},
+        ):
+            result = _scopus_provider(query)
+
+        search.assert_called_once_with('AUTHLASTNAME(Ahn) AND AUTHFIRST("Hoseon")')
+        self.assertEqual(result.identities[0]["identifiers"]["scopus_author_id"], "26654087900")
+        self.assertEqual(result.metrics["h_index"], 43)
+
+    def test_verified_scopus_author_id_corpus_is_not_rejected_by_initialed_creator(self) -> None:
+        identity = {
+            "name": "Ho Seon Ahn",
+            "name_variants": ["Ahn H."],
+            "source": "scopus",
+            "identifiers": {"scopus_author_id": "26654087900"},
+            "orcid": "0000-0002-1036-3038",
+            "affiliations": ["Incheon National University"],
+        }
+        publication = {
+            "title": "Verified Scopus Work",
+            "doi": "10.1000/scopus",
+            "authors": ["Ahn, H."],
+            "sources": ["scopus"],
+        }
+        intelligence = _aggregate_intelligence(
+            "안호선 교수\nAcademic alias: Hoseon Ahn\nAcademic alias: Ho Seon Ahn",
+            [AcademicSourceResult(
+                "scopus", SourceStatus.AVAILABLE_FULL, (identity,), (publication,),
+                {"document_count": 136, "citation_count": 5943, "h_index": 43},
+            )],
+        )
+
+        self.assertEqual(intelligence["researcher"]["identity_confidence"], "MEDIUM")
+        self.assertEqual(intelligence["merged_publication_count"], 1)
+        self.assertEqual(intelligence["merged_verified_corpus"][0]["authorship_confidence"], "MEDIUM")
 
     def test_wos_adapters_use_starter_and_researcher_endpoints(self) -> None:
         response = Mock()

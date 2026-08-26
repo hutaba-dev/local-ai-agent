@@ -23,6 +23,7 @@ S2_API_BASE = "https://api.semanticscholar.org/graph/v1"
 ORCID_API_BASE = "https://pub.orcid.org/v3.0"
 USER_AGENT = "local-ai-agent-academic-intelligence/1.0"
 METRICS_TTL_SECONDS = 6 * 60 * 60
+TRANSIENT_FAILURE_TTL_SECONDS = 60
 
 
 class SourceStatus(str, Enum):
@@ -243,6 +244,9 @@ def wos_get_citation_metrics(query: str, limit: int = 50) -> dict[str, object]:
 
 
 def _name_from_query(query: str) -> str:
+    quoted_korean = re.search(r'["“”]([가-힣]{2,5})["“”]', query)
+    if quoted_korean:
+        return quoted_korean.group(1)
     korean = re.search(r"([가-힣]{2,5})\s*(?:교수|박사|연구자|학자)", query)
     if korean:
         return korean.group(1)
@@ -263,6 +267,24 @@ def _name_from_query(query: str) -> str:
     return cleaned[:160]
 
 
+def _academic_aliases(query: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(
+        alias.strip()
+        for alias in re.findall(r"^Academic alias:\s*([^\n]+)$", query, re.MULTILINE | re.IGNORECASE)
+        if alias.strip()
+    ))
+
+
+def _affiliation_hint(query: str) -> str | None:
+    match = re.search(r"^Affiliation hint:\s*([^\n]+)$", query, re.MULTILINE | re.IGNORECASE)
+    return match.group(1).strip() if match and match.group(1).strip() else None
+
+
+def _lookup_name(query: str) -> str:
+    aliases = _academic_aliases(query)
+    return aliases[0] if aliases else _name_from_query(query)
+
+
 def _scopus_author_entries(payload: dict[str, object]) -> list[dict[str, object]]:
     search_results = payload.get("search-results")
     entries = search_results.get("entry", []) if isinstance(search_results, dict) else []
@@ -271,14 +293,26 @@ def _scopus_author_entries(payload: dict[str, object]) -> list[dict[str, object]
         if not isinstance(entry, dict):
             continue
         preferred = entry.get("preferred-name")
-        normalized.append({
-            "name": preferred.get("ce:indexed-name") if isinstance(preferred, dict) else entry.get("dc:title"),
+        indexed_name = None
+        if isinstance(preferred, dict):
+            indexed_name = preferred.get("ce:indexed-name") or preferred.get("indexed-name")
+            if not indexed_name:
+                given_name = str(preferred.get("given-name", "")).strip()
+                surname = str(preferred.get("surname", "")).strip()
+                indexed_name = " ".join(value for value in (given_name, surname) if value)
+        orcid = entry.get("orcid")
+        if isinstance(orcid, str):
+            orcid = orcid.strip("[]")
+        identity = {
+            "name": indexed_name or entry.get("dc:title"),
             "source": "scopus",
             "identifiers": {"scopus_author_id": entry.get("dc:identifier", "").removeprefix("AUTHOR_ID:") if isinstance(entry.get("dc:identifier"), str) else None},
             "affiliations": [entry.get("affiliation-current", {}).get("affiliation-name")] if isinstance(entry.get("affiliation-current"), dict) else [],
             "document_count": _to_int(entry.get("document-count")),
-            "orcid": entry.get("orcid"),
-        })
+            "orcid": orcid,
+        }
+        if identity["name"] and identity["identifiers"]["scopus_author_id"]:
+            normalized.append(identity)
     return normalized
 
 
@@ -300,13 +334,29 @@ def _scopus_documents(payload: dict[str, object]) -> list[dict[str, object]]:
 def _scopus_provider(query: str) -> AcademicSourceResult:
     if _scopus_headers() is None:
         return AcademicSourceResult("scopus", SourceStatus.UNAVAILABLE, error="SCOPUS_API_KEY is not configured")
-    name = _name_from_query(query)
+    names = _academic_aliases(query) or (_name_from_query(query),)
     try:
-        search_payload = scopus_search_authors(_scopus_author_query(name))
-        identities = _scopus_author_entries(search_payload)
+        identities: list[dict[str, object]] = []
+        searched_names: list[str] = []
+        affiliation_hint = _affiliation_hint(query)
+        for name in names:
+            searched_names.append(name)
+            identities.extend(_scopus_author_entries(scopus_search_authors(_scopus_author_query(name))))
+            if any(
+                _scopus_affiliation_matches(identity, affiliation_hint)
+                and (_to_int(identity.get("document_count")) or 0) >= 5
+                for identity in identities
+            ):
+                break
+        identities = list({
+            str(identity.get("identifiers", {}).get("scopus_author_id")): identity
+            for identity in identities
+            if isinstance(identity.get("identifiers"), dict)
+        }.values())
+        identities = _select_scopus_identities(identities, affiliation_hint)
         publications: list[dict[str, object]] = []
         metrics: dict[str, object] = {}
-        details: dict[str, object] = {}
+        details: dict[str, object] = {"searched_names": searched_names}
         status = SourceStatus.AVAILABLE_LIMITED
         if len(identities) == 1:
             author_id = identities[0].get("identifiers", {}).get("scopus_author_id")
@@ -325,10 +375,41 @@ def _scopus_provider(query: str) -> AcademicSourceResult:
         return _provider_failure("scopus", error)
 
 
+def _select_scopus_identities(
+    identities: list[dict[str, object]], affiliation_hint: str | None
+) -> list[dict[str, object]]:
+    candidates = identities
+    if affiliation_hint:
+        affiliation_matches = [
+            identity for identity in candidates
+            if _scopus_affiliation_matches(identity, affiliation_hint)
+        ]
+        if affiliation_matches:
+            candidates = affiliation_matches
+    candidates.sort(key=lambda identity: _to_int(identity.get("document_count")) or 0, reverse=True)
+    if len(candidates) <= 1:
+        return candidates
+    leading = _to_int(candidates[0].get("document_count")) or 0
+    runner_up = _to_int(candidates[1].get("document_count")) or 0
+    return candidates[:1] if leading >= 5 and leading >= max(1, runner_up) * 2 else candidates
+
+
+def _scopus_affiliation_matches(identity: dict[str, object], affiliation_hint: str | None) -> bool:
+    if not affiliation_hint:
+        return False
+    hint_terms = set(_normalize_name(affiliation_hint).split())
+    return any(
+        hint_terms <= set(_normalize_name(affiliation).split())
+        or set(_normalize_name(affiliation).split()) <= hint_terms
+        for affiliation in identity.get("affiliations", [])
+        if isinstance(affiliation, str)
+    )
+
+
 def _wos_provider(query: str) -> AcademicSourceResult:
     if _wos_headers() is None:
         return AcademicSourceResult("web_of_science", SourceStatus.UNAVAILABLE, error="WOS_API_KEY is not configured")
-    name = _name_from_query(query)
+    name = _lookup_name(query)
     researcher_error: str | None = None
     identities: list[dict[str, object]] = []
     try:
@@ -355,7 +436,7 @@ def _wos_provider(query: str) -> AcademicSourceResult:
 
 
 def _openalex_provider(query: str) -> AcademicSourceResult:
-    name = _name_from_query(query)
+    name = _lookup_name(query)
     try:
         author_payload = _request_json(
             f"{OPENALEX_API_BASE}/authors",
@@ -385,7 +466,7 @@ def _openalex_provider(query: str) -> AcademicSourceResult:
 
 
 def _semantic_scholar_provider(query: str) -> AcademicSourceResult:
-    name = _name_from_query(query)
+    name = _lookup_name(query)
     headers = {"x-api-key": os.getenv("S2_API_KEY", "")} if os.getenv("S2_API_KEY") else {}
     try:
         payload = _request_json(
@@ -462,7 +543,7 @@ def _semantic_scholar_work(item: dict[str, object]) -> dict[str, object]:
 
 
 def _orcid_provider(query: str) -> AcademicSourceResult:
-    name = _name_from_query(query)
+    name = _lookup_name(query)
     try:
         payload = _request_json(
             f"{ORCID_API_BASE}/expanded-search/",
@@ -493,7 +574,7 @@ def _orcid_provider(query: str) -> AcademicSourceResult:
 
 
 def _crossref_provider(query: str) -> AcademicSourceResult:
-    name = _name_from_query(query)
+    name = _lookup_name(query)
     try:
         payload = _request_json(
             f"{CROSSREF_API_BASE}/works",
@@ -516,7 +597,7 @@ def _crossref_provider(query: str) -> AcademicSourceResult:
 
 
 def _google_scholar_provider(query: str) -> AcademicSourceResult:
-    name = _name_from_query(query)
+    name = _lookup_name(query)
     try:
         from runtime.web_search import search_many
 
@@ -549,7 +630,8 @@ def academic_source_status() -> dict[str, str]:
 
 
 def academic_intelligence(query: str) -> dict[str, object]:
-    cache_key = f"academic-intelligence:{_normalize_name(_name_from_query(query))}"
+    identity_names = (_name_from_query(query), *_academic_aliases(query))
+    cache_key = f"academic-intelligence:{'|'.join(_normalize_name(name) for name in identity_names)}"
     cached = _CACHE.get(cache_key)
     if isinstance(cached, dict):
         return cached | {"cache_hit": True}
@@ -585,7 +667,12 @@ def academic_intelligence(query: str) -> dict[str, object]:
         "public_fallback_triggered": public_fallback_triggered,
         "providers_called": [*curated, *(fallback if public_fallback_triggered else {})],
     }
-    _CACHE.set(cache_key, intelligence, METRICS_TTL_SECONDS)
+    cache_ttl = (
+        TRANSIENT_FAILURE_TTL_SECONDS
+        if SourceStatus.RATE_LIMITED.value in intelligence.get("source_status", {}).values()
+        else METRICS_TTL_SECONDS
+    )
+    _CACHE.set(cache_key, intelligence, cache_ttl)
     return intelligence | {"cache_hit": False}
 
 
@@ -620,8 +707,9 @@ def _curated_sources_agree(results: list[AcademicSourceResult]) -> bool:
 
 def _aggregate_intelligence(query: str, results: list[AcademicSourceResult]) -> dict[str, object]:
     target_name = _name_from_query(query)
-    identity = _resolve_identity(target_name, results)
-    candidate_corpus = _merge_publications(results, identity["confidence"], target_name)
+    aliases = _academic_aliases(query)
+    identity = _resolve_identity(target_name, aliases, results)
+    candidate_corpus = _merge_publications(results, identity["confidence"], (target_name, *aliases))
     verified_corpus = [
         publication for publication in candidate_corpus
         if publication.get("authorship_confidence") in {"HIGH", "MEDIUM"}
@@ -667,12 +755,24 @@ def _aggregate_intelligence(query: str, results: list[AcademicSourceResult]) -> 
     }
 
 
-def _resolve_identity(target_name: str, results: list[AcademicSourceResult]) -> dict[str, object]:
+def _resolve_identity(
+    target_name: str, aliases: tuple[str, ...], results: list[AcademicSourceResult]
+) -> dict[str, object]:
     matching: list[dict[str, object]] = []
     for result in results:
         for identity in result.identities:
             name = identity.get("name")
-            if isinstance(name, str) and _name_similarity(name, target_name) >= 0.8:
+            name_variants = identity.get("name_variants")
+            candidate_identity_names = [name] if isinstance(name, str) else []
+            if isinstance(name_variants, list):
+                candidate_identity_names.extend(
+                    variant for variant in name_variants if isinstance(variant, str)
+                )
+            if any(
+                _name_similarity(identity_name, candidate_name) >= 0.8
+                for identity_name in candidate_identity_names
+                for candidate_name in (target_name, *aliases)
+            ):
                 matching.append(identity)
     sources = sorted({str(identity.get("source")) for identity in matching})
     identifiers: dict[str, object] = {
@@ -699,11 +799,21 @@ def _resolve_identity(target_name: str, results: list[AcademicSourceResult]) -> 
     elif len(sources) >= 2 and len(exact_names) <= 2:
         confidence = "MEDIUM"
     elif len(matching) == 1:
-        confidence = "LOW"
+        only_identity = matching[0]
+        only_identifiers = only_identity.get("identifiers")
+        confidence = "MEDIUM" if (
+            only_identity.get("source") in {"scopus", "web_of_science"}
+            and affiliations
+            and (
+                only_identity.get("orcid")
+                or isinstance(only_identifiers, dict) and any(only_identifiers.values())
+            )
+        ) else "LOW"
     else:
         confidence = "AMBIGUOUS" if matching else "UNRESOLVED"
     return {
         "canonical_name": target_name,
+        "aliases": list(aliases),
         "native_name": target_name if re.search(r"[가-힣]", target_name) else None,
         "affiliations": affiliations[:8],
         "identifiers": identifiers,
@@ -715,7 +825,7 @@ def _resolve_identity(target_name: str, results: list[AcademicSourceResult]) -> 
 
 
 def _merge_publications(
-    results: list[AcademicSourceResult], identity_confidence: object, target_name: str
+    results: list[AcademicSourceResult], identity_confidence: object, target_names: tuple[str, ...]
 ) -> list[dict[str, object]]:
     merged: dict[str, dict[str, object]] = {}
     for result in results:
@@ -729,10 +839,17 @@ def _merge_publications(
                 existing = dict(publication)
                 existing["sources"] = sorted(set(publication.get("sources", [])) | {result.source})
                 existing["source_ids"] = dict(publication.get("source_ids", {}))
+                existing["verified_author_profile_source"] = (
+                    result.source in {"scopus", "web_of_science"} and len(result.identities) == 1
+                )
                 merged[key] = existing
             else:
                 existing["sources"] = sorted(set(existing.get("sources", [])) | set(publication.get("sources", [])) | {result.source})
                 existing.setdefault("source_ids", {}).update(publication.get("source_ids", {}))
+                existing["verified_author_profile_source"] = bool(
+                    existing.get("verified_author_profile_source")
+                    or result.source in {"scopus", "web_of_science"} and len(result.identities) == 1
+                )
                 for field_name in ("doi", "year", "journal", "authors", "abstract", "citation_count"):
                     if not existing.get(field_name) and publication.get(field_name):
                         existing[field_name] = publication[field_name]
@@ -740,7 +857,9 @@ def _merge_publications(
         source_count = len(publication.get("sources", []))
         authors = publication.get("authors")
         target_author_match = isinstance(authors, list) and any(
-            isinstance(author, str) and _name_similarity(author, target_name) >= 0.8
+            isinstance(author, str) and any(
+                _name_similarity(author, target_name) >= 0.8 for target_name in target_names
+            )
             for author in authors
         )
         publication["authorship_confidence"] = (
@@ -748,8 +867,10 @@ def _merge_publications(
             else "MEDIUM" if source_count >= 2
             or (
                 identity_confidence in {"HIGH", "MEDIUM"}
-                and target_author_match
-                and bool(publication.get("doi"))
+                and (
+                    bool(publication.get("verified_author_profile_source"))
+                    or target_author_match and bool(publication.get("doi"))
+                )
             )
             else "LOW"
         )
@@ -841,7 +962,8 @@ def _representative_papers(corpus: list[dict[str, object]]) -> list[dict[str, ob
 def _scopus_author_query(name: str) -> str:
     parts = name.replace(",", " ").split()
     if len(parts) >= 2:
-        return f"AUTHLASTNAME({parts[-1]}) AND AUTHFIRST({parts[0]})"
+        given_names = " ".join(parts[:-1])
+        return f'AUTHLASTNAME({parts[-1]}) AND AUTHFIRST("{given_names}")'
     return f"AUTHLASTNAME({name})"
 
 
@@ -853,6 +975,14 @@ def _scopus_author_profile(
     core = record.get("coredata") if isinstance(record.get("coredata"), dict) else {}
     profile = record.get("author-profile") if isinstance(record.get("author-profile"), dict) else {}
     preferred = profile.get("preferred-name") if isinstance(profile.get("preferred-name"), dict) else {}
+    profile_name = preferred.get("indexed-name") or preferred.get("ce:indexed-name")
+    fallback_name = fallback.get("name")
+    selected_name = (
+        profile_name
+        if isinstance(profile_name, str)
+        and _name_detail_score(profile_name) >= _name_detail_score(str(fallback_name or ""))
+        else fallback_name
+    )
     current = profile.get("affiliation-current")
     current_items = current.get("affiliation") if isinstance(current, dict) else []
     if isinstance(current_items, dict):
@@ -863,18 +993,25 @@ def _scopus_author_profile(
     ] if isinstance(current_items, list) else []
     identity = dict(fallback)
     identity.update({
-        "name": preferred.get("indexed-name") or preferred.get("ce:indexed-name") or fallback.get("name"),
-        "name_variants": _scopus_name_variants(profile),
+        "name": selected_name,
+        "name_variants": list(dict.fromkeys(
+            value for value in (fallback_name, profile_name, *_scopus_name_variants(profile))
+            if isinstance(value, str) and value
+        )),
         "affiliations": [value for value in affiliations if isinstance(value, str) and value] or fallback.get("affiliations", []),
-        "orcid": profile.get("orcid") or fallback.get("orcid"),
-        "subject_areas": profile.get("subject-areas", {}).get("subject-area", []) if isinstance(profile.get("subject-areas"), dict) else [],
+        "orcid": core.get("orcid") or profile.get("orcid") or fallback.get("orcid"),
+        "subject_areas": record.get("subject-areas", {}).get("subject-area", []) if isinstance(record.get("subject-areas"), dict) else [],
     })
     metrics = {
         "document_count": _to_int(core.get("document-count") or fallback.get("document_count")),
         "citation_count": _to_int(core.get("citation-count")),
-        "h_index": _to_int(core.get("h-index")),
+        "h_index": _to_int(record.get("h-index") or core.get("h-index")),
     }
     return identity, metrics
+
+
+def _name_detail_score(value: str) -> int:
+    return sum(len(term) for term in re.findall(r"[A-Za-z가-힣]+", value) if len(term) > 1)
 
 
 def _scopus_name_variants(profile: dict[str, object]) -> list[str]:

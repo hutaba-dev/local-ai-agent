@@ -8,6 +8,7 @@ import subprocess
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
+from typing import Callable
 
 import httpx
 
@@ -43,10 +44,11 @@ def run_agent_tools(
     search_mode: str = "NO_SEARCH",
     allow_local_tools: bool = True,
     project_scope: ProjectToolScope | None = None,
+    researcher_identity_resolver: Callable[[tuple[str, ...], str], str] | None = None,
 ) -> list[dict[str, object]]:
     results: list[ToolResult] = []
     if agent == "research":
-        results.extend(_research_tools(message, search_mode, allow_local_tools))
+        results.extend(_research_tools(message, search_mode, allow_local_tools, researcher_identity_resolver))
     elif allow_local_tools:
         tools = {
             "coding": _coding_tools,
@@ -91,7 +93,12 @@ def _coding_tools(message: str, search_mode: str) -> list[ToolResult]:
     ]
 
 
-def _research_tools(message: str, search_mode: str, allow_local_tools: bool = True) -> list[ToolResult]:
+def _research_tools(
+    message: str,
+    search_mode: str,
+    allow_local_tools: bool = True,
+    researcher_identity_resolver: Callable[[tuple[str, ...], str], str] | None = None,
+) -> list[ToolResult]:
     results = []
     if allow_local_tools:
         results = [
@@ -104,7 +111,12 @@ def _research_tools(message: str, search_mode: str, allow_local_tools: bool = Tr
         if search_mode == "DEEP_RESEARCH" and web_result.success:
             results.append(_web_sources(web_result.output))
             if _is_researcher_query(_queries(message)):
-                results.append(_academic_intelligence(_researcher_query(_queries(message))))
+                researcher_query = (
+                    researcher_identity_resolver(_queries(message), web_result.output)
+                    if researcher_identity_resolver is not None
+                    else _researcher_query(_queries(message), web_result.output)
+                )
+                results.append(_academic_intelligence(researcher_query))
             else:
                 academic_result = _academic_papers(_queries(message))
                 results.append(academic_result)
@@ -289,11 +301,50 @@ def _needs_s2_cross_check(papers: list[object], queries: tuple[str, ...]) -> boo
     ) < 3
 
 
-def _researcher_query(queries: tuple[str, ...]) -> str:
-    for query in queries[1:]:
-        if any(character.isascii() and character.isalpha() for character in query):
-            return query[:500]
-    return queries[0][:500]
+def _researcher_query(queries: tuple[str, ...], web_output: str = "") -> str:
+    original = queries[0][:500]
+    if not re.search(r"[가-힣]", original):
+        return original
+    alias = next(
+        (candidate for query in queries[1:] if (candidate := _latin_person_name(query))),
+        None,
+    )
+    if alias is None:
+        try:
+            web_results = json.loads(web_output)
+        except json.JSONDecodeError:
+            web_results = []
+        if isinstance(web_results, list):
+            for item in web_results:
+                if not isinstance(item, dict):
+                    continue
+                text = f"{item.get('title', '')} {item.get('description', '')}"
+                alias = _latin_person_name(text)
+                if alias:
+                    break
+    return f"{original}\nAcademic alias: {alias}" if alias else original
+
+
+def _latin_person_name(text: str) -> str | None:
+    boundary_terms = {
+        "college", "department", "engineering", "incheon", "institute", "korea", "korean",
+        "laboratory", "mechanical", "national", "professor", "research", "school", "seoul", "university",
+    }
+    tokens = re.findall(r"\b[A-Z][A-Za-z'-]*\b", text)
+    candidate: list[str] = []
+    for token in tokens:
+        if token.isupper() and len(token) > 1:
+            candidate = []
+            continue
+        if token.casefold() in boundary_terms:
+            if len(candidate) >= 2:
+                break
+            candidate = []
+            continue
+        candidate.append(token)
+        if len(candidate) == 3:
+            break
+    return " ".join(candidate) if 2 <= len(candidate) <= 3 else None
 
 
 def _search_title_hints(results: list[ToolResult]) -> tuple[str, ...]:

@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from runtime.agent_runtime import AgentRuntime
+from runtime.agent_runtime import AgentRuntime, LatencyRecorder
 from runtime.image_client import GeneratedImage
 from runtime.projects import ProjectStore
 from runtime.tool_registry import ToolResult, _academic_evidence_gaps, _research_tools, _researcher_query, run_agent_tools
@@ -1202,10 +1202,50 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertIsNotNone(evidence)
         self.assertEqual(evidence["author"]["name"], "Researcher")
 
-    def test_researcher_query_prefers_ascii_planner_alias(self) -> None:
+    def test_researcher_query_preserves_native_name_and_extracts_person_alias(self) -> None:
         query = _researcher_query(("안호선 교수 연구 실적", "Ho Seon Ahn Incheon National University"))
 
-        self.assertEqual(query, "Ho Seon Ahn Incheon National University")
+        self.assertEqual(query, "안호선 교수 연구 실적\nAcademic alias: Ho Seon Ahn")
+
+    def test_researcher_query_rejects_institution_as_person_alias(self) -> None:
+        query = _researcher_query(("안호선 교수 연구 실적", "Incheon National University mechanical engineering"))
+
+        self.assertEqual(query, "안호선 교수 연구 실적")
+
+    def test_llm_resolves_publication_name_from_public_web_evidence(self) -> None:
+        class IdentityClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                response = FakeResponse()
+                response.json = lambda: {  # type: ignore[method-assign]
+                    "choices": [{"message": {"content": json_module.dumps({
+                        "canonical_name": "안호선",
+                        "publication_name": "Ho Seon Ahn",
+                        "affiliation": "Incheon National University",
+                        "confidence": "HIGH",
+                    })}}],
+                    "usage": {},
+                }
+                return response
+
+        json_module = json
+        runtime = AgentRuntime(client=IdentityClient())
+        resolved = runtime._resolve_researcher_identity_query(
+            "안호선 교수의 연구역량을 조사해봐",
+            ('"안호선"', "Incheon National University mechanical engineering"),
+            json.dumps([{"title": "안호선 교수 연구실", "description": "Ho Seon Ahn, Incheon National University"}]),
+            "system",
+            LatencyRecorder(),
+        )
+
+        self.assertIn("안호선 교수", resolved)
+        self.assertIn("Academic alias: Ho Seon Ahn", resolved)
+        self.assertIn("Affiliation hint: Incheon National University", resolved)
+
+    def test_korean_romanization_adds_compact_and_syllable_publication_names(self) -> None:
+        aliases = AgentRuntime._romanization_aliases("안호선", ["Ho-Sun Ahn"])
+
+        self.assertEqual(aliases, ("Hoseon Ahn", "Ho Seon Ahn"))
 
     def test_s2_author_queries_extracts_and_reorders_hyphenated_professor_name(self) -> None:
         queries = _s2_author_queries("Incheon University Ho-Sun Ahn professor research papers")

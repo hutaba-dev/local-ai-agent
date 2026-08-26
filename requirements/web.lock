@@ -2,6 +2,7 @@
 fastapi==0.136.3
 uvicorn==0.52.3
 httpx==0.28.1
+hangul-romanize==0.1.0
 python-multipart==0.0.32
 pypdf==6.6.2
 python-docx==1.2.0

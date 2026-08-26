@@ -13,6 +13,8 @@ from time import perf_counter
 from typing import Callable, TypeVar
 
 import httpx
+from hangul_romanize import Transliter
+from hangul_romanize.rule import academic as academic_romanization
 
 from runtime.router import Route, route_request
 from runtime.sessions import SessionStore
@@ -39,6 +41,8 @@ PERSON_RESEARCH_PATTERN = re.compile(r"(?:교수|박사|연구자|\bprofessor\b|
 RESEARCH_PROGRESS_PATTERN = re.compile(
     r"(?i)^\s*(?:i(?:'ll| will| need\b)|let me|the (?:initial|first) search|먼저 찾아|더 찾아|조사해 ?보겠|확인해 ?보겠)"
 )
+HANGUL_TRANSLITER = Transliter(academic_romanization)
+COMPOUND_KOREAN_SURNAMES = {"남궁", "독고", "사공", "서문", "선우", "제갈", "황보"}
 
 
 @dataclass(frozen=True)
@@ -254,9 +258,21 @@ class AgentRuntime:
         search_mode: str,
         allow_local_tools: bool,
         project_scope: ProjectToolScope | None,
+        researcher_identity_resolver: Callable[[tuple[str, ...], str], str] | None = None,
     ) -> list[dict[str, object]]:
         if project_scope is not None:
-            return run_agent_tools(agent, queries, search_mode, allow_local_tools, project_scope)
+            return run_agent_tools(
+                agent, queries, search_mode, allow_local_tools, project_scope,
+                researcher_identity_resolver,
+            )
+        if researcher_identity_resolver is not None:
+            return run_agent_tools(
+                agent,
+                queries,
+                search_mode,
+                allow_local_tools,
+                researcher_identity_resolver=researcher_identity_resolver,
+            )
         return run_agent_tools(agent, queries, search_mode, allow_local_tools)
 
     def _run_deep_research(
@@ -277,6 +293,14 @@ class AgentRuntime:
         entity_confidence = "UNKNOWN"
         gap_status = "NOT_EVALUATED"
         termination_reason = "research_budget_exhausted"
+        identity_query_cache: dict[str, str] = {}
+
+        def resolve_researcher_query(tool_queries: tuple[str, ...], web_output: str) -> str:
+            if "query" not in identity_query_cache:
+                identity_query_cache["query"] = self._resolve_researcher_identity_query(
+                    question, tool_queries, web_output, system_prompt, latency
+                )
+            return identity_query_cache["query"]
 
         for round_number in range(1, MAX_RESEARCH_ROUNDS + 1):
             state_history.append(ResearchState.SEARCHING.value)
@@ -285,7 +309,8 @@ class AgentRuntime:
             round_tools = latency.stage(
                 f"research_round_{round_number}_tools",
                 lambda queries=queries: self._run_tools(
-                    "research", queries, "DEEP_RESEARCH", allow_local_tools, project_scope
+                    "research", queries, "DEEP_RESEARCH", allow_local_tools, project_scope,
+                    resolve_researcher_query if person_query else None,
                 ),
             )
             all_tools.extend(round_tools)
@@ -340,6 +365,108 @@ class AgentRuntime:
             "final_synthesis_executed": True,
             "termination_reason": termination_reason,
         }
+
+    def _resolve_researcher_identity_query(
+        self,
+        question: str,
+        queries: tuple[str, ...],
+        web_output: str,
+        system_prompt: str,
+        latency: LatencyRecorder,
+    ) -> str:
+        fallback = self._fallback_researcher_query(queries, web_output)
+        native_match = KOREAN_PERSON_PATTERN.search(question)
+        canonical_name = native_match.group("name") if native_match else question[:160].strip()
+        prompt = (
+            "Resolve a researcher's publication identity before academic database lookup. "
+            "Use the exact original name as canonical_name. Infer publication_name only from the supplied public search evidence. "
+            "Return up to four plausible Latin-script publication spellings in publication_names, ordered by explicit evidence. "
+            "Include spacing and hyphenation variants when Korean romanization is uncertain. Each value must be a person's name, "
+            "never an institution, department, discipline, or keyword. "
+            "Use affiliation and research topics to disambiguate. Do not invent an alias. Return exactly one JSON object: "
+            '{"canonical_name":"...","publication_names":["..."],"affiliation":"... or empty",'
+            '"confidence":"HIGH|MEDIUM|LOW|UNRESOLVED"}.\n\n'
+            f"Original question:\n{question[:500]}\n\n"
+            f"Search queries:\n{json.dumps(queries, ensure_ascii=False)[:2000]}\n\n"
+            f"Public search evidence:\n{web_output[:8000]}"
+        )
+        try:
+            content, _ = self._complete(
+                [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
+                350,
+                latency,
+                "researcher_identity_resolution",
+                temperature=0,
+            )
+            decision = self._parse_json_object(content)
+            publication_names = decision.get("publication_names")
+            if not isinstance(publication_names, list):
+                publication_name = decision.get("publication_name")
+                publication_names = [publication_name] if isinstance(publication_name, str) else []
+            confidence = decision.get("confidence")
+            valid_names = [
+                publication_name.strip() for publication_name in publication_names
+                if isinstance(publication_name, str)
+                and re.fullmatch(r"[A-Za-z][A-Za-z' -]{2,80}", publication_name.strip())
+                and not re.search(
+                    r"\b(?:college|department|engineering|institute|laboratory|school|university)\b",
+                    publication_name,
+                    re.IGNORECASE,
+                )
+            ][:4]
+            if valid_names and confidence in {"HIGH", "MEDIUM"}:
+                valid_names = list(dict.fromkeys((
+                    *self._romanization_aliases(canonical_name, valid_names),
+                    *valid_names,
+                )))[:6]
+                affiliation = decision.get("affiliation")
+                resolved = f"{canonical_name} 교수" + "".join(
+                    f"\nAcademic alias: {publication_name}" for publication_name in dict.fromkeys(valid_names)
+                )
+                if isinstance(affiliation, str) and affiliation.strip():
+                    resolved += f"\nAffiliation hint: {affiliation.strip()[:200]}"
+                return resolved
+        except (httpx.HTTPError, ValueError):
+            pass
+        return fallback
+
+    @staticmethod
+    def _romanization_aliases(canonical_name: str, inferred_names: list[str]) -> tuple[str, ...]:
+        if not re.fullmatch(r"[가-힣]{2,5}", canonical_name):
+            return ()
+        surname_length = 2 if canonical_name[:2] in COMPOUND_KOREAN_SURNAMES else 1
+        given_name = canonical_name[surname_length:]
+        if not given_name:
+            return ()
+        inferred_surnames = [name.split()[-1] for name in inferred_names if len(name.split()) >= 2]
+        surnames = list(dict.fromkeys(inferred_surnames))
+        compact_given = HANGUL_TRANSLITER.translit(given_name).replace("-", " ").replace(" ", "").title()
+        split_given = " ".join(HANGUL_TRANSLITER.translit(character).title() for character in given_name)
+        return tuple(dict.fromkeys(
+            candidate
+            for surname in surnames
+            for candidate in (f"{compact_given} {surname}", f"{split_given} {surname}")
+        ))
+
+    @staticmethod
+    def _fallback_researcher_query(queries: tuple[str, ...], web_output: str) -> str:
+        from runtime.tool_registry import _researcher_query
+
+        return _researcher_query(queries, web_output)
+
+    @staticmethod
+    def _parse_json_object(content: str) -> dict[str, object]:
+        decoder = json.JSONDecoder()
+        for index, character in enumerate(content):
+            if character != "{":
+                continue
+            try:
+                value, _ = decoder.raw_decode(content[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                return value
+        raise ValueError("model did not return a JSON object")
 
     @staticmethod
     def _initial_research_queries(question: str, planned_queries: tuple[str, ...]) -> tuple[str, ...]:
@@ -704,7 +831,7 @@ class AgentRuntime:
                     package["identity"] = {
                         key: researcher.get(key)
                         for key in (
-                            "canonical_name", "native_name", "affiliations", "identifiers",
+                            "canonical_name", "native_name", "aliases", "affiliations", "identifiers",
                             "identity_confidence", "identity_sources", "candidate_count",
                         )
                     }
