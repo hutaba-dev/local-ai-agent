@@ -111,7 +111,8 @@ def _image_prompt(prompt: str, editing: bool = False) -> str:
             " This is an edit of an existing photo. Preserve the same person's identity, age, ethnicity, "
             "facial proportions, hair, clothing, and framing unless the user explicitly requests a change. "
             "Explicitly state what to keep, what to change, and which quality issue to fix. "
-            "Interpret complaints such as 'became X', 'too X', or 'not X' as traits to remove, never as desired traits."
+            "Interpret complaints such as 'became X', 'too X', or 'not X' as traits to remove, never as desired traits. "
+            "Keep the final prompt under 45 English words so no requested edit or identity constraint is truncated."
         )
     try:
         response = httpx.post(
@@ -123,7 +124,7 @@ def _image_prompt(prompt: str, editing: bool = False) -> str:
                     {"role": "user", "content": prompt},
                 ],
                 "temperature": 0.1,
-                "max_tokens": 180,
+                "max_tokens": 80 if editing else 180,
                 "chat_template_kwargs": {"enable_thinking": False},
             },
             timeout=60,

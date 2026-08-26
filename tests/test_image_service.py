@@ -142,6 +142,17 @@ class ImageServiceTests(unittest.TestCase):
         with patch("image_service.app.httpx.post", side_effect=OSError("offline")):
             self.assertEqual(image_app._image_prompt("원문 프롬프트"), "원문 프롬프트")
 
+    def test_edit_prompt_optimizer_uses_clip_safe_output_budget(self) -> None:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"choices": [{"message": {"content": "concise edit prompt"}}]}
+        with patch("image_service.app.httpx.post", return_value=response) as post:
+            prompt = image_app._image_prompt("apply two edits", editing=True)
+
+        self.assertEqual(prompt, "concise edit prompt")
+        self.assertEqual(post.call_args.kwargs["json"]["max_tokens"], 80)
+        self.assertIn("under 45 English words", post.call_args.kwargs["json"]["messages"][0]["content"])
+
     def test_structured_prompt_builder_prioritizes_action_anatomy_and_face(self) -> None:
         response = Mock()
         response.raise_for_status.return_value = None
