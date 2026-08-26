@@ -78,6 +78,24 @@ class ImageWorkerTests(unittest.TestCase):
         self.assertEqual(valid.status_code, 502)
         self.assertEqual(execute.call_count, 1)
 
+    def test_edit_accepts_identity_preserving_strength(self) -> None:
+        result = worker_app.BackendResult(
+            b"png", "image/png", {"X-Image-Seed": "8", "X-Image-Mode": "edit"}
+        )
+        with patch.object(worker_app, "WORKER_TOKEN", TOKEN), patch.object(
+            worker_app.backend_manager, "execute", return_value=result
+        ) as execute:
+            response = self.client.post(
+                "/v1/tasks/image.edit",
+                headers=self.authorization,
+                json={"prompt": "subtle face edit", "source_image_base64": png_base64(), "strength": 0.25},
+            )
+        self.assertEqual(response.status_code, 200)
+        execute.assert_called_once_with(
+            "image.edit",
+            {"prompt": "subtle face edit", "source_image_base64": png_base64(), "strength": 0.25},
+        )
+
     def test_rejects_unknown_capability_without_backend_call(self) -> None:
         with patch.object(worker_app, "WORKER_TOKEN", TOKEN), patch.object(
             worker_app.backend_manager, "execute"

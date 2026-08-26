@@ -11,7 +11,14 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from runtime.agent_runtime import AgentRuntime, LatencyRecorder
-from runtime.image_client import GeneratedImage, ImagePromptPlan, ImageQualityAssessment
+from runtime.image_client import (
+    GeneratedImage,
+    ImageEditCompletion,
+    ImageEditOperation,
+    ImageEditPlan,
+    ImagePromptPlan,
+    ImageQualityAssessment,
+)
 from runtime.projects import ProjectStore
 from runtime.tool_registry import ToolResult, _academic_evidence_gaps, _research_tools, _researcher_query, run_agent_tools
 from runtime.web_search import fetch_sources, search, visual_search
@@ -583,10 +590,16 @@ class WebRuntimeTests(unittest.TestCase):
             upload = client.post("/api/upload", files={"file": ("source.png", b"source", "image/png")})
         attachment_id = upload.json()["attachment_id"]
         generated = GeneratedImage(b"edited", 7, "edit", "edit-7.png")
+        plan = ImageEditPlan((ImageEditOperation(
+            "generic_edit", "image", "Apply the requested nighttime change.", "generative_edit"
+        ),))
+        completed = ImageEditCompletion(True, True, (("generic_edit", True),), True, "complete")
 
         with patch("runtime.image_client.infer_image_intent", return_value="edit"), patch(
+            "web.app.build_image_edit_plan", return_value=plan
+        ), patch(
             "web.app.build_image_prompt", side_effect=planned_prompt
-        ), patch("web.app.assess_image_quality", return_value=PASSED_IMAGE_QUALITY), patch(
+        ), patch("web.app.assess_image_edit_completion", return_value=completed), patch(
             "web.app.create_image", return_value=generated
         ) as create:
             response = client.post("/api/chat", json={
@@ -595,7 +608,7 @@ class WebRuntimeTests(unittest.TestCase):
             })
 
         self.assertEqual(response.status_code, 200)
-        create.assert_called_once_with("make it nighttime", b"normalized-source")
+        create.assert_called_once_with(unittest.mock.ANY, b"normalized-source")
         self.assertEqual(response.json()["activity"]["route_summary"], "Remote image edit")
         self.assertEqual(upload.json()["thumbnail_data_url"], "data:image/jpeg;base64,dGh1bWI=")
 
@@ -611,9 +624,18 @@ class WebRuntimeTests(unittest.TestCase):
         attachment_id = upload.json()["attachment_id"]
         prompt = "배경을 자연스럽게 바꿔주고 조명을 보정해줘."
         generated = GeneratedImage(b"edited", 8, "edit", "edit-8.png")
+        plan = ImageEditPlan((
+            ImageEditOperation("background_edit", "background", "Change the background.", "generative_edit"),
+            ImageEditOperation("lighting_edit", "lighting", "Correct the lighting.", "generative_edit"),
+        ))
+        completed = ImageEditCompletion(
+            True, True, (("background_edit", True), ("lighting_edit", True)), True, "complete"
+        )
 
-        with patch("web.app.build_image_prompt", side_effect=planned_prompt), patch(
-            "web.app.assess_image_quality", return_value=PASSED_IMAGE_QUALITY
+        with patch("web.app.build_image_edit_plan", return_value=plan), patch(
+            "web.app.build_image_prompt", side_effect=planned_prompt
+        ), patch(
+            "web.app.assess_image_edit_completion", return_value=completed
         ), patch("web.app.create_image", return_value=generated) as create:
             response = client.post("/api/chat", json={
                 "message": prompt,
@@ -622,7 +644,7 @@ class WebRuntimeTests(unittest.TestCase):
             })
 
         self.assertEqual(response.status_code, 200)
-        create.assert_called_once_with(prompt, b"normalized-source")
+        create.assert_called_once_with(unittest.mock.ANY, b"normalized-source")
         self.assertEqual(response.json()["activity"]["routed_agent"], "image")
         continuation_image_id = response.json()["continuation_image_id"]
 
@@ -639,7 +661,17 @@ class WebRuntimeTests(unittest.TestCase):
 
         correction = "고개를 똑바로 보게 수정해달라니까. 과도하게 바뀐 외모도 원래대로 되돌려줘."
         revised = GeneratedImage(b"revised", 0, "pose", "pose-corrected.png")
+        pose_plan = ImageEditPlan((ImageEditOperation(
+            "face_orientation", "face_orientation", "Turn the face toward the camera.", "pose_correction"
+        ),))
+        pose_completed = ImageEditCompletion(True, True, (("face_orientation", True),), True, "frontal")
         with patch("runtime.image_client.infer_image_intent", return_value="pose"), patch(
+            "web.app.build_image_edit_plan", return_value=pose_plan
+        ), patch(
+            "web.app.build_image_prompt", side_effect=planned_prompt
+        ), patch(
+            "web.app.assess_image_edit_completion", return_value=pose_completed
+        ), patch(
             "web.app.correct_portrait_pose", return_value=revised
         ) as correct, patch(
             "web.app.create_image"
@@ -799,7 +831,17 @@ class WebRuntimeTests(unittest.TestCase):
             upload = client.post("/api/upload", files={"file": ("portrait.png", b"source", "image/png")})
 
         corrected = GeneratedImage(b"frontal", 0, "pose", "pose-corrected.png")
+        plan = ImageEditPlan((ImageEditOperation(
+            "face_orientation", "face_orientation", "Turn the face toward the camera.", "pose_correction"
+        ),))
+        completed = ImageEditCompletion(True, True, (("face_orientation", True),), True, "frontal")
         with patch("runtime.image_client.infer_image_intent", return_value="pose"), patch(
+            "web.app.build_image_edit_plan", return_value=plan
+        ), patch(
+            "web.app.build_image_prompt", side_effect=planned_prompt
+        ), patch(
+            "web.app.assess_image_edit_completion", return_value=completed
+        ), patch(
             "web.app.correct_portrait_pose", return_value=corrected
         ) as correct, patch(
             "web.app.create_image"
@@ -814,7 +856,92 @@ class WebRuntimeTests(unittest.TestCase):
         correct.assert_called_once_with(b"original-face")
         diffuse.assert_not_called()
         self.assertEqual(response.json()["activity"]["route_summary"], "Remote portrait pose correction")
-        self.assertEqual(response.json()["content"], "얼굴 방향을 정면으로 보정했습니다.")
+        self.assertEqual(response.json()["content"], "요청한 이미지 수정 사항을 모두 적용했습니다.")
+
+    def test_multi_intent_edit_executes_pose_then_appearance_and_checks_both(self) -> None:
+        client = self.authenticated_client()
+        extracted = ExtractedUpload(
+            "OCR text", False, (("Uploaded image", "image/jpeg", b"original-face"),)
+        )
+        with patch("web.app.extract_text", return_value=extracted), patch(
+            "web.app.image_thumbnail_data_url", return_value="data:image/jpeg;base64,dGh1bWI="
+        ):
+            upload = client.post("/api/upload", files={"file": ("portrait.png", b"source", "image/png")})
+        plan = ImageEditPlan((
+            ImageEditOperation(
+                "face_orientation", "face_orientation", "Turn the face toward the camera.", "pose_correction"
+            ),
+            ImageEditOperation(
+                "appearance_refinement", "face", "Naturally refine facial attractiveness.", "generative_edit"
+            ),
+        ))
+        frontal = GeneratedImage(b"frontal-intermediate", 0, "pose", "pose-corrected.png")
+        final = GeneratedImage(b"handsome-frontal", 81, "edit", "edit-81.png")
+        completed = ImageEditCompletion(
+            True, True, (("face_orientation", True), ("appearance_refinement", True)), True, "all complete"
+        )
+        with patch("runtime.image_client.infer_image_intent", return_value="edit"), patch(
+            "web.app.build_image_edit_plan", return_value=plan
+        ), patch("web.app.build_image_prompt", side_effect=planned_prompt), patch(
+            "web.app.correct_portrait_pose", return_value=frontal
+        ) as pose, patch("web.app.create_image", return_value=final) as edit, patch(
+            "web.app.assess_image_edit_completion", return_value=completed
+        ) as completion:
+            response = client.post("/api/chat", json={
+                "message": "이 남자의 얼굴을 좀 더 잘생기게 하고 얼굴을 정면으로 바라보게 해줘.",
+                "attachment_ids": [upload.json()["attachment_id"]],
+            })
+
+        self.assertEqual(response.status_code, 200)
+        pose.assert_called_once_with(b"original-face")
+        edit.assert_called_once_with(unittest.mock.ANY, b"frontal-intermediate", 0.25)
+        completion.assert_called_once_with(plan, b"original-face", b"handsome-frontal")
+        activity = response.json()["activity"]["image"]["edit_plan"]
+        self.assertEqual(activity["tools"], ["portrait.frontalize", "image.edit"])
+        self.assertEqual(activity["status"], {"face_orientation": True, "appearance_refinement": True})
+        self.assertTrue(activity["identity_preserved"])
+
+    def test_multi_intent_edit_retries_incomplete_modifications_once(self) -> None:
+        client = self.authenticated_client()
+        extracted = ExtractedUpload(
+            "OCR text", False, (("Uploaded image", "image/jpeg", b"original-face"),)
+        )
+        with patch("web.app.extract_text", return_value=extracted), patch(
+            "web.app.image_thumbnail_data_url", return_value="data:image/jpeg;base64,dGh1bWI="
+        ):
+            upload = client.post("/api/upload", files={"file": ("portrait.png", b"source", "image/png")})
+        plan = ImageEditPlan((
+            ImageEditOperation("hair_edit", "hair", "Make the hair longer.", "generative_edit"),
+            ImageEditOperation("clothing_edit", "clothing", "Make the clothing black.", "generative_edit"),
+        ))
+        first = GeneratedImage(b"hair-only", 91, "edit", "edit-91.png")
+        retry = GeneratedImage(b"hair-and-clothing", 92, "edit", "edit-92.png")
+        incomplete = ImageEditCompletion(
+            True, False, (("hair_edit", True), ("clothing_edit", False)), True, "clothing unchanged"
+        )
+        complete = ImageEditCompletion(
+            True, True, (("hair_edit", True), ("clothing_edit", True)), True, "all complete"
+        )
+        with patch("runtime.image_client.infer_image_intent", return_value="edit"), patch(
+            "web.app.build_image_edit_plan", return_value=plan
+        ), patch("web.app.build_image_prompt", side_effect=planned_prompt) as planner, patch(
+            "web.app.create_image", side_effect=[first, retry]
+        ) as edit, patch(
+            "web.app.assess_image_edit_completion", side_effect=[incomplete, complete]
+        ) as completion:
+            response = client.post("/api/chat", json={
+                "message": "머리를 길게 만들고 옷을 검정색으로 바꿔줘",
+                "attachment_ids": [upload.json()["attachment_id"]],
+            })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(edit.call_count, 2)
+        self.assertEqual(edit.call_args_list[1].args[1], b"hair-only")
+        self.assertIn("clothing_edit", planner.call_args_list[1].args[0])
+        self.assertEqual(completion.call_count, 2)
+        activity = response.json()["activity"]["image"]["edit_plan"]
+        self.assertEqual(activity["tools"], ["image.edit", "image.edit.retry"])
+        self.assertTrue(activity["passed"])
 
     def test_upload_rejects_unsupported_and_oversized_files(self) -> None:
         client = self.authenticated_client()

@@ -28,7 +28,7 @@ class ImageRequest(BaseModel):
     prompt: str = Field(min_length=1, max_length=2_000)
     source_image_base64: str | None = None
     seed: int | None = Field(default=None, ge=0, le=2**63 - 1)
-    strength: float = Field(default=0.5, ge=0.5, le=0.95)
+    strength: float = Field(default=0.5, ge=0.25, le=0.95)
 
 
 class ImageEngine:

@@ -10,7 +10,7 @@ from PIL import Image
 
 from image_service import app as image_app
 from runtime import image_client
-from runtime.image_client import parse_image_command, prefers_original_source
+from runtime.image_client import build_image_edit_plan, parse_image_command, prefers_original_source
 
 
 def png_bytes() -> bytes:
@@ -20,6 +20,29 @@ def png_bytes() -> bytes:
 
 
 class ImageServiceTests(unittest.TestCase):
+    def test_multi_intent_edit_plan_preserves_every_requested_modification(self) -> None:
+        cases = {
+            "얼굴을 좀 더 잘생기게 하고 정면을 바라보게 해줘": (
+                "face_orientation", "appearance_refinement",
+            ),
+            "머리를 길게 만들고 옷을 검정색으로 바꿔줘": ("hair_edit", "clothing_edit"),
+            "웃게 하고 얼굴을 왼쪽으로 돌려줘": ("expression_edit", "face_orientation"),
+            "배경을 바다로 바꾸고 옷은 흰색으로 하고 얼굴은 그대로 둬": (
+                "clothing_edit", "background_edit",
+            ),
+            "얼굴만 정면으로 돌려줘": ("face_orientation",),
+        }
+        with patch("runtime.image_client.httpx.post", side_effect=OSError("offline")):
+            for request, expected in cases.items():
+                with self.subTest(request=request):
+                    plan = build_image_edit_plan(request)
+                    self.assertEqual(tuple(edit.type for edit in plan.edits), expected)
+                    self.assertTrue(plan.preserve_identity)
+
+            handsome_plan = build_image_edit_plan(next(iter(cases)))
+        self.assertIn("balanced proportions", handsome_plan.edits[1].instruction)
+        self.assertEqual(handsome_plan.edits[0].capability, "pose_correction")
+
     def test_remote_worker_uses_capability_and_bearer_token_without_local_fallback(self) -> None:
         response = Mock()
         response.content = png_bytes()

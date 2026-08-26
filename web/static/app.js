@@ -263,6 +263,9 @@ function activityElement(activity) {
     ["Whole LLM output", wholeUsage.output_tokens ?? 0], ["Stages", stages], ["LLM timing", llmCalls], ["Tools", tools],
   ];
   if (image.mode) {
+    const editPlan = image.edit_plan || {};
+    const plannedEdits = (editPlan.edits || []).map((edit) => `${edit.type}: ${edit.instruction}`).join("; ");
+    const editStatus = Object.entries(editPlan.status || {}).map(([type, complete]) => `${complete ? "✓" : "!"} ${type}`).join("; ");
     rows.splice(3, 0,
       ["Image mode", escapeHtml(image.mode)],
       ["Image reason", escapeHtml(image.reason || "N/A")],
@@ -293,6 +296,11 @@ function activityElement(activity) {
       ["Overall appeal", imageQuality.overall_score ? `${escapeHtml(String(imageQuality.overall_score))}/10` : "N/A"],
       ["Decision", escapeHtml(imageQuality.decision || "N/A")],
       ["Quality findings", escapeHtml((imageQuality.failures || []).join(", ") || imageQuality.summary || "none")],
+      ["Image Edit Plan", escapeHtml(plannedEdits || "N/A")],
+      ["Edit tools", escapeHtml((editPlan.tools || []).join(" → ") || "N/A")],
+      ["Edit status", escapeHtml(editStatus || "N/A")],
+      ["Identity preservation", editPlan.checked ? (editPlan.identity_preserved ? "✓ preserved" : "! failed") : "N/A"],
+      ["Identity similarity", editPlan.checked ? `${escapeHtml(String(editPlan.identity_score ?? 0))}/10` : "N/A"],
     );
   }
   details.innerHTML = `<summary>Agent Activity</summary><div class="activity-grid">${rows.map(([key, value]) => `<strong>${escapeHtml(key)}</strong><span>${value}</span>`).join("")}</div>`;

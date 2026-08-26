@@ -111,6 +111,32 @@ AESTHETIC_INTENT_PATTERN = re.compile(
     r"예쁜|아름다운|미소녀|잘생긴|고급|매력|미감|attractive|beautiful|pretty|handsome|elegant|appealing",
     re.IGNORECASE,
 )
+IDENTITY_REPLACEMENT_PATTERN = re.compile(
+    r"완전히\s*다른\s*사람|다른\s*사람처럼|replace\s+(?:the\s+)?(?:person|identity)|different\s+person",
+    re.IGNORECASE,
+)
+EDIT_PATTERNS = {
+    "appearance_refinement": re.compile(r"잘생기|예쁘게|아름답게|매력적|handsome|prettier|beautiful|attractive", re.IGNORECASE),
+    "hair_edit": re.compile(r"머리|헤어|hair", re.IGNORECASE),
+    "clothing_edit": re.compile(r"옷|의상|복장|clothing|clothes|outfit|wardrobe", re.IGNORECASE),
+    "background_edit": re.compile(r"배경|background", re.IGNORECASE),
+    "style_edit": re.compile(r"스타일|화풍|style|rendering", re.IGNORECASE),
+    "lighting_edit": re.compile(r"조명|밝기|어둡|밝게|lighting|brighter|darker", re.IGNORECASE),
+    "object_edit": re.compile(r"물체|소품|추가|제거|지워|object|add|remove", re.IGNORECASE),
+    "expression_edit": re.compile(r"웃|미소|표정|smil|expression|frown", re.IGNORECASE),
+    "face_orientation": re.compile(
+        r"정면|바라보|쳐다보|고개|얼굴.*(?:왼쪽|오른쪽|돌)|(?:왼쪽|오른쪽).*얼굴|"
+        r"front.?facing|face.*(?:left|right|camera)|head.*(?:left|right|turn)|gaze",
+        re.IGNORECASE,
+    ),
+}
+IDENTITY_CONSTRAINTS = (
+    "preserve recognizable identity",
+    "preserve ethnicity and approximate age",
+    "preserve hairstyle unless requested",
+    "use natural skin texture",
+    "do not replace the face with a generic attractive face",
+)
 
 
 @dataclass(frozen=True)
@@ -158,6 +184,166 @@ class ImageQualityAssessment:
     scores: tuple[tuple[str, int], ...] = ()
     overall_score: float = 0.0
     decision: str = "accept"
+
+
+@dataclass(frozen=True)
+class ImageEditOperation:
+    type: str
+    target: str
+    instruction: str
+    capability: str
+
+
+@dataclass(frozen=True)
+class ImageEditPlan:
+    edits: tuple[ImageEditOperation, ...]
+    preserve_identity: bool = True
+    constraints: tuple[str, ...] = IDENTITY_CONSTRAINTS
+
+
+@dataclass(frozen=True)
+class ImageEditCompletion:
+    checked: bool
+    passed: bool
+    edit_status: tuple[tuple[str, bool], ...] = ()
+    identity_preserved: bool = True
+    summary: str = ""
+    identity_score: int = 10
+
+
+def _edit_instruction(edit_type: str, request: str) -> tuple[str, str, str]:
+    if edit_type == "appearance_refinement":
+        return (
+            "face",
+            "Naturally refine facial attractiveness with cleaner symmetry, balanced proportions, a clearer jawline, "
+            "natural skin texture, and a flattering realistic structure while preserving recognizable identity.",
+            "generative_edit",
+        )
+    if edit_type == "hair_edit":
+        return "hair", f"Apply the requested hair change: {request}", "generative_edit"
+    if edit_type == "clothing_edit":
+        return "clothing", f"Apply the requested clothing change: {request}", "generative_edit"
+    if edit_type == "background_edit":
+        return "background", f"Apply the requested background change: {request}", "generative_edit"
+    if edit_type == "style_edit":
+        return "style", f"Apply the requested visual style change: {request}", "generative_edit"
+    if edit_type == "lighting_edit":
+        return "lighting", f"Apply the requested lighting change: {request}", "generative_edit"
+    if edit_type == "object_edit":
+        return "object", f"Apply the requested object change: {request}", "generative_edit"
+    if edit_type == "expression_edit":
+        return "facial_expression", f"Apply the requested expression change: {request}", "generative_edit"
+    if edit_type == "generic_edit":
+        return "image", f"Apply this requested image change exactly: {request}", "generative_edit"
+    frontal = bool(re.search(r"정면|바라보|쳐다보|front.?facing|camera", request, re.IGNORECASE))
+    return (
+        "face_orientation",
+        "Turn the face toward the camera while preserving identity." if frontal else f"Apply the requested face direction: {request}",
+        "pose_correction" if frontal else "generative_edit",
+    )
+
+
+def build_image_edit_plan(request: str) -> ImageEditPlan:
+    detected = [edit_type for edit_type, pattern in EDIT_PATTERNS.items() if pattern.search(request)]
+    preserve_identity = not IDENTITY_REPLACEMENT_PATTERN.search(request)
+    model_edits: list[dict[str, object]] = []
+    instruction = """Extract every requested modification from an existing-image edit request.
+Return one JSON object with an edits array. Each edit has type, target, instruction, and evidence, where evidence is an exact short quote from the user request. Allowed types: appearance_refinement, hair_edit, clothing_edit, background_edit, style_edit, lighting_edit, object_edit, expression_edit, face_orientation. Never collapse multiple modifications into one and never invent an unrequested change. Also return preserve_identity as a boolean. Do not include reasoning."""
+    try:
+        response = httpx.post(
+            f"{OPENAI_BASE_URL}/chat/completions",
+            json={
+                "model": OPENAI_MODEL,
+                "messages": [
+                    {"role": "system", "content": instruction},
+                    {"role": "user", "content": request},
+                ],
+                "temperature": 0,
+                "max_tokens": 600,
+                "response_format": {"type": "json_object"},
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            timeout=45,
+        )
+        response.raise_for_status()
+        payload = json.loads(response.json()["choices"][0]["message"]["content"])
+        model_edits = payload.get("edits", []) if isinstance(payload.get("edits"), list) else []
+        preserve_identity = preserve_identity and bool(payload.get("preserve_identity", True))
+    except (OSError, httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    ordered_types: list[str] = []
+    allowed_types = set(EDIT_PATTERNS)
+    for item in model_edits:
+        edit_type = str(item.get("type", "")) if isinstance(item, dict) else ""
+        evidence = str(item.get("evidence", "")).strip() if isinstance(item, dict) else ""
+        if (
+            edit_type in allowed_types
+            and (EDIT_PATTERNS[edit_type].search(request) or evidence and evidence in request)
+            and edit_type not in ordered_types
+        ):
+            ordered_types.append(edit_type)
+    for edit_type in detected:
+        if edit_type not in ordered_types:
+            ordered_types.append(edit_type)
+    if not ordered_types:
+        ordered_types.append("generic_edit")
+    operations = []
+    for edit_type in ordered_types:
+        target, edit_instruction, capability = _edit_instruction(edit_type, request)
+        operations.append(ImageEditOperation(edit_type, target, edit_instruction, capability))
+    if len(operations) > 1:
+        operations.sort(key=lambda operation: operation.capability != "pose_correction")
+    constraints = IDENTITY_CONSTRAINTS if preserve_identity else ("follow the requested identity replacement",)
+    return ImageEditPlan(tuple(operations), preserve_identity, constraints)
+
+
+def edit_plan_prompt(plan: ImageEditPlan) -> str:
+    changes = " ".join(f"{index}. {edit.instruction}" for index, edit in enumerate(plan.edits, 1))
+    constraints = "; ".join(plan.constraints)
+    return f"Apply all requested edits cumulatively. {changes} Constraints: {constraints}. Preserve all completed prior edits."
+
+
+def assess_image_edit_completion(
+    plan: ImageEditPlan,
+    original_image: bytes,
+    final_image: bytes,
+) -> ImageEditCompletion:
+    requested = [{"type": edit.type, "target": edit.target, "instruction": edit.instruction} for edit in plan.edits]
+    instruction = """Compare the original and final images and verify every requested edit independently.
+Return JSON with edit_status as an object mapping each requested edit type to a boolean, identity_preserved as a boolean, identity_similarity as an integer from 0 to 10, and a short summary. Identity preservation requires the same recognizable person, ethnicity, approximate age, and core facial geometry; ordinary attractiveness improvement is not permission to replace or substantially rejuvenate the person. Do not provide reasoning."""
+    try:
+        response = httpx.post(
+            f"{OPENAI_BASE_URL}/chat/completions",
+            json={
+                "model": OPENAI_MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"{instruction}\nRequested edits: {json.dumps(requested)}"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64.b64encode(original_image).decode()}"}},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64.b64encode(final_image).decode()}"}},
+                    ],
+                }],
+                "temperature": 0,
+                "max_tokens": 300,
+                "response_format": {"type": "json_object"},
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            timeout=90,
+        )
+        response.raise_for_status()
+        payload = json.loads(response.json()["choices"][0]["message"]["content"])
+        raw_status = payload.get("edit_status", {})
+        status = tuple((edit.type, bool(raw_status.get(edit.type, False))) for edit in plan.edits)
+        identity_preserved = bool(payload.get("identity_preserved", False))
+        identity_score = max(0, min(10, int(payload.get("identity_similarity", 0))))
+        identity_passed = identity_preserved and identity_score >= 7
+        passed = all(completed for _edit_type, completed in status) and (identity_passed or not plan.preserve_identity)
+        return ImageEditCompletion(
+            True, passed, status, identity_passed, str(payload.get("summary", ""))[:300], identity_score
+        )
+    except (OSError, httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        return ImageEditCompletion(False, True, tuple((edit.type, True) for edit in plan.edits), True, "completion check unavailable")
 
 
 def feedback_failure_labels(feedback: str) -> tuple[str, ...]:
@@ -449,7 +635,7 @@ Return exactly one lowercase label:
 - image: a present request to create or draw a new image from a description.
 - edit: a small, localized change where the existing subject, identity, composition, pose, or background should be preserved.
 - regenerate: a request to try again from scratch because the result has a severe quality failure, such as a distorted face, broken anatomy, unreadable action, wrong composition, missing core object, major style mismatch, or increasing edit drift.
-- pose: a present request involving the subject's head direction, gaze, or front-facing pose. This takes priority when combined with other image changes.
+- pose: a present request whose only modification is the subject's head direction, gaze, or front-facing pose. If orientation is combined with appearance, hair, clothing, expression, background, or style changes, choose edit.
 - resend: a present request to display or send the existing image again without changing it.
 - chat: all ordinary conversation, including commentary, feedback, future preferences, explanations, questions, and acknowledgements.
 Treat direct complaints such as "the face is broken", "this looks wrong", "what did you draw", or "the person is not riding it" as requests to fix a severe failure now and choose regenerate when a source image is available. Do not use regenerate for a clearly localized correction that should preserve a successful image. Editing, regeneration, pose correction, and resending require an available source image; otherwise choose chat. If the intent is ambiguous, choose chat."""

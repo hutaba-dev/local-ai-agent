@@ -26,6 +26,8 @@ KIM scores subject correctness, action readability, face quality, anatomy, core-
 
 Explicit visual-reference requests use up to three strict-safe-search thumbnails. KIM analyzes only reusable pose, composition, camera, palette, linework, facial-rendering, wardrobe-category, and background-density cues; it does not copy identities, characters, logos, artists, or designs. Explicit non-sensitive visual preferences can be stored as Project `preference` memory and reused by later Project image requests. AHN7 remains stateless and image-only throughout this process.
 
+For existing-image edits, KIM extracts every requested modification into a multi-intent edit plan. Frontal pose correction is routed to `portrait.frontalize`; appearance, hair, clothing, background, expression, lighting, style, and object changes are routed to `image.edit`. Mixed frontal-pose requests run pose correction first and pass that intermediate image into the generative editor. A final vision check verifies every requested edit and identity preservation independently, with at most one cumulative retry for incomplete items. Agent Activity exposes the plan, tools, and item statuses without private reasoning.
+
 Requests require a bearer token stored only in root-owned environment files:
 
 - Main: `/etc/local-ai-agent/image-worker.env`

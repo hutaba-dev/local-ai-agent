@@ -21,11 +21,15 @@ from starlette.concurrency import run_in_threadpool
 
 from runtime.agent_runtime import BASE_URL, MODEL, AgentRuntime
 from runtime.image_client import (
+    GeneratedImage,
     analyze_visual_references,
+    assess_image_edit_completion,
     assess_image_quality,
+    build_image_edit_plan,
     build_image_prompt,
     correct_portrait_pose,
     create_image,
+    edit_plan_prompt,
     feedback_failure_labels,
     is_explicit_visual_preference,
     parse_image_command,
@@ -692,12 +696,63 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
                 user.username, request.project_id, request.conversation_id, "user", request.message
             )
         try:
-            if mode == "pose":
-                generated = await run_in_threadpool(correct_portrait_pose, source_image)
-                prompt_plan = None
+            edit_plan = None
+            edit_completion = None
+            executed_edit_tools: list[str] = []
+            if mode in {"edit", "pose"}:
+                original_edit_source = source_image
+                edit_plan = await run_in_threadpool(build_image_edit_plan, prompt)
+                planned_prompt = edit_plan_prompt(edit_plan)
+                prompt_plan = await run_in_threadpool(
+                    build_image_prompt,
+                    planned_prompt,
+                    editing=True,
+                    original_request=prompt,
+                )
+                generated = GeneratedImage(source_image, 0, "edit", "edit-intermediate.png")
+                if any(edit.capability == "pose_correction" for edit in edit_plan.edits):
+                    generated = await run_in_threadpool(correct_portrait_pose, generated.content)
+                    executed_edit_tools.append("portrait.frontalize")
+                generative_source = generated.content
+                if any(edit.capability == "generative_edit" for edit in edit_plan.edits):
+                    appearance_sensitive = any(edit.type == "appearance_refinement" for edit in edit_plan.edits)
+                    if appearance_sensitive:
+                        generated = await run_in_threadpool(create_image, prompt_plan.prompt, generated.content, 0.25)
+                    else:
+                        generated = await run_in_threadpool(create_image, prompt_plan.prompt, generated.content)
+                    executed_edit_tools.append("image.edit")
+                edit_completion = await run_in_threadpool(
+                    assess_image_edit_completion, edit_plan, original_edit_source, generated.content
+                )
                 quality = None
                 retry_count = 0
-                decision_reason = "small correction requiring identity-preserving pose adjustment"
+                if edit_completion.checked and not edit_completion.passed:
+                    pending = [edit_type for edit_type, complete in edit_completion.edit_status if not complete]
+                    if edit_plan.preserve_identity and not edit_completion.identity_preserved:
+                        pending.append("identity_preservation")
+                    retry_prompt = f"{planned_prompt} Retry incomplete edits: {', '.join(pending)}."
+                    retry_plan = await run_in_threadpool(
+                        build_image_prompt, retry_prompt, editing=True, original_request=prompt
+                    )
+                    if any(edit.capability == "generative_edit" for edit in edit_plan.edits):
+                        retry_source = generative_source if "identity_preservation" in pending else generated.content
+                        if appearance_sensitive:
+                            generated = await run_in_threadpool(create_image, retry_plan.prompt, retry_source, 0.25)
+                        else:
+                            generated = await run_in_threadpool(create_image, retry_plan.prompt, retry_source)
+                        executed_edit_tools.append("image.edit.retry")
+                    else:
+                        generated = await run_in_threadpool(correct_portrait_pose, original_edit_source)
+                        executed_edit_tools.append("portrait.frontalize.retry")
+                    edit_completion = await run_in_threadpool(
+                        assess_image_edit_completion, edit_plan, original_edit_source, generated.content
+                    )
+                    retry_count = 1
+                structured_feedback = ()
+                candidate_reviews = []
+                preference_context = ""
+                reference_sources = []
+                decision_reason = "executed every requested edit with identity-preserving sequential orchestration"
             else:
                 decision_reason = {
                     "image": "initial request",
@@ -845,8 +900,10 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             ),
         )
         assistant_content = (
-            "얼굴 방향을 정면으로 보정했습니다."
-            if generated.mode == "pose"
+            "요청한 이미지 수정 사항을 모두 적용했습니다."
+            if edit_plan and (not edit_completion or edit_completion.passed)
+            else "이미지를 수정했지만 일부 요청의 반영 여부를 확인하지 못했습니다."
+            if edit_plan
             else f"이미지를 {'편집' if generated.mode == 'edit' else '생성'}했습니다. Seed: {generated.seed}"
         )
         project_artifact = None
@@ -910,6 +967,24 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
                 "source_count": len(reference_sources) if prompt_plan else 0,
             },
             "candidates": candidate_reviews if prompt_plan else [],
+            "edit_plan": {
+                "preserve_identity": edit_plan.preserve_identity,
+                "edits": [
+                    {
+                        "type": edit.type,
+                        "target": edit.target,
+                        "instruction": edit.instruction,
+                        "capability": edit.capability,
+                    }
+                    for edit in edit_plan.edits
+                ],
+                "tools": executed_edit_tools,
+                "status": dict(edit_completion.edit_status) if edit_completion else {},
+                "identity_preserved": edit_completion.identity_preserved if edit_completion else True,
+                    "identity_score": edit_completion.identity_score if edit_completion else 10,
+                "checked": edit_completion.checked if edit_completion else False,
+                "passed": edit_completion.passed if edit_completion else True,
+            } if edit_plan else {},
             "quality_gate": {
                 "checked": quality.checked if quality else False,
                 "passed": quality.passed if quality else True,
