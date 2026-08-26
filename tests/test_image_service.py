@@ -1,6 +1,8 @@
 import base64
+import json
 import unittest
 from io import BytesIO
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from fastapi.testclient import TestClient
@@ -62,6 +64,8 @@ class ImageServiceTests(unittest.TestCase):
     def test_continuation_intent_distinguishes_actions_from_conversation(self) -> None:
         cases = {
             "더 예쁘고 사실적으로... 고화질로": "edit",
+            "얼굴이 망가졌네. 그림을 제대로 다시 그려줘.": "regenerate",
+            "스케이트보드를 안 타잖아. 이상한 그림이야.": "regenerate",
             "정면을 보게 해줘": "pose",
             "고개가 기울어져 있으니 똑바로 바라보게 수정해줘": "pose",
             "결과 다시 보여줘": "resend",
@@ -87,6 +91,8 @@ class ImageServiceTests(unittest.TestCase):
         self.assertEqual(intent, "chat")
         instruction = post.call_args.kwargs["json"]["messages"][0]["content"]
         self.assertIn("speech act rather than matching keywords", instruction)
+        self.assertIn("distorted face", instruction)
+        self.assertIn("clearly localized correction", instruction)
         self.assertIn("If the intent is ambiguous, choose chat", instruction)
 
         with patch("runtime.image_client.httpx.post", side_effect=OSError("offline")):
@@ -112,6 +118,66 @@ class ImageServiceTests(unittest.TestCase):
     def test_prompt_optimizer_falls_back_when_qwen_is_unavailable(self) -> None:
         with patch("image_service.app.httpx.post", side_effect=OSError("offline")):
             self.assertEqual(image_app._image_prompt("원문 프롬프트"), "원문 프롬프트")
+
+    def test_structured_prompt_builder_prioritizes_action_anatomy_and_face(self) -> None:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"choices": [{"message": {"content": json.dumps({
+            "prompt": "full-body anime skateboard action",
+            "subject": "student",
+            "action": "riding a skateboard",
+            "style": "anime",
+            "face_priority": "high",
+            "anatomy_priority": "high",
+            "must_have_object": "skateboard",
+        })}}]}
+
+        with patch("runtime.image_client.httpx.post", return_value=response) as post:
+            plan = image_client.build_image_prompt("예쁜 여학생이 스케이트보드를 타는 애니메이션 그림")
+
+        instruction = post.call_args.kwargs["json"]["messages"][0]["content"]
+        self.assertEqual(plan.must_have_object, "skateboard")
+        self.assertIn("subject/action correctness, anatomy, face quality", instruction)
+        self.assertIn("full body", instruction)
+        self.assertIn("distorted faces", instruction)
+
+    def test_quality_gate_requires_multiple_major_failures_before_retry(self) -> None:
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"choices": [{"message": {"content": json.dumps({
+            "subject": True,
+            "action": False,
+            "face": False,
+            "anatomy": True,
+            "main_object": True,
+            "style": True,
+            "summary": "action and face failed",
+        })}}]}
+
+        with patch("runtime.image_client.httpx.post", return_value=response):
+            quality = image_client.assess_image_quality("a skateboard rider", png_bytes())
+
+        self.assertTrue(quality.checked)
+        self.assertFalse(quality.passed)
+        self.assertEqual(quality.failures, ("action", "face"))
+
+    def test_image_quality_benchmark_covers_required_scene_types_and_metrics(self) -> None:
+        benchmark = json.loads(
+            (Path(__file__).parent / "fixtures" / "image_quality_benchmarks.json").read_text(encoding="utf-8")
+        )
+        fixtures = benchmark["cases"]
+
+        self.assertEqual(len(fixtures), 7)
+        self.assertEqual(set(benchmark["evaluation_metrics"]), {
+            "face_quality", "anatomy", "action_readability", "core_object_presence", "style_fidelity",
+            "retry_correctness", "edit_vs_regenerate_decision",
+        })
+        self.assertEqual({fixture["id"] for fixture in fixtures}, {
+            "person-riding-skateboard", "person-riding-bicycle", "girl-running", "man-dancing",
+            "woman-sitting-at-desk", "anime-portrait", "anime-full-body-action",
+        })
+        for fixture in fixtures:
+            self.assertEqual(set(fixture["expected"]), {"action", "core_object", "composition"})
 
     def test_edit_prompt_preserves_identity_and_treats_complaints_as_corrections(self) -> None:
         response = Mock()

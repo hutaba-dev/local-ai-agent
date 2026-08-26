@@ -16,6 +16,12 @@ through `local-ai-worker-tunnel.service` at `127.0.0.1:18010`. The same SSH
 connection reverse-forwards Main vLLM to AHN7 loopback `127.0.0.1:18000`, so
 SD-Turbo prompt optimization is preserved without exposing either API.
 
+## Image Quality Control
+
+KIM owns image intent, structured prompt planning, and the post-generation quality gate. Small localized changes use `image.edit` and preserve the source image. Severe face, anatomy, action, composition, core-object, or style failures abandon the failed anchor and call `image.generate` from scratch using the retained original request.
+
+Generated images are checked once for subject, action, face, anatomy, core object, and style. When multiple major checks fail, KIM allows one source-free regenerate with a simpler composition and then returns the result without further looping. AHN7 remains stateless and image-only throughout this process.
+
 Requests require a bearer token stored only in root-owned environment files:
 
 - Main: `/etc/local-ai-agent/image-worker.env`

@@ -20,7 +20,14 @@ from pydantic import BaseModel, Field
 from starlette.concurrency import run_in_threadpool
 
 from runtime.agent_runtime import BASE_URL, MODEL, AgentRuntime
-from runtime.image_client import correct_portrait_pose, create_image, parse_image_command, prefers_original_source
+from runtime.image_client import (
+    assess_image_quality,
+    build_image_prompt,
+    correct_portrait_pose,
+    create_image,
+    parse_image_command,
+    prefers_original_source,
+)
 from runtime.projects import ProjectNotFoundError, ProjectPathError, ProjectStorageOfflineError, ProjectStore
 from runtime.project_tools import ProjectTools
 from runtime.router import AGENT_CHOICES
@@ -135,6 +142,7 @@ class UploadedAttachment:
     truncated: bool
     images: tuple[tuple[str, str, bytes], ...]
     created_at: float
+    image_context: dict[str, object] | None = None
 
 
 def current_user(request: Request) -> User:
@@ -196,6 +204,7 @@ def save_attachment(attachment_id: str, attachment: UploadedAttachment) -> None:
             for label, media_type, content in attachment.images
         ],
         "created_at": attachment.created_at,
+        "image_context": attachment.image_context,
     }
     temporary_path = path.with_suffix(".tmp")
     temporary_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -223,6 +232,7 @@ def load_attachment(attachment_id: str) -> UploadedAttachment | None:
                 for label, media_type, content in payload["images"]
             ),
             created_at=float(payload["created_at"]),
+            image_context=payload.get("image_context") if isinstance(payload.get("image_context"), dict) else None,
         )
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
         path.unlink(missing_ok=True)
@@ -289,6 +299,7 @@ def image_chat_response(
     filename: str,
     image_content: bytes,
     route_summary: str,
+    image_activity: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "session_id": session_id,
@@ -311,6 +322,7 @@ def image_chat_response(
             "research_rounds": 0,
             "whole_request_usage": {"input_tokens": 0, "output_tokens": 0, "llm_call_count": 0},
             "final_call": None,
+            "image": image_activity or {},
         },
     }
 
@@ -631,7 +643,10 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         raise HTTPException(status_code=422, detail=str(error)) from error
     if image_command is not None:
         mode, prompt = image_command
-        if mode in {"edit", "pose", "resend"}:
+        source_context = source_attachment.image_context if source_attachment and source_attachment.image_context else {}
+        original_request = str(source_context.get("original_request", "")).strip()
+        previous_attempt = int(source_context.get("attempt", 0)) if source_context else 0
+        if mode in {"edit", "regenerate", "pose", "resend"}:
             if source_attachment is None or source_attachment.owner != owner:
                 raise HTTPException(status_code=404, detail="attachment expired or not found")
             if not source_attachment.images:
@@ -659,7 +674,9 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
                 )
                 response.update({"project_id": request.project_id, "conversation_id": request.conversation_id})
                 return response
-            if prefers_original_source(prompt):
+            if mode == "regenerate":
+                source_image = None
+            elif prefers_original_source(prompt):
                 source_image = source_attachment.images[-1][2]
         else:
             source_image = None
@@ -672,8 +689,42 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         try:
             if mode == "pose":
                 generated = await run_in_threadpool(correct_portrait_pose, source_image)
+                prompt_plan = None
+                quality = None
+                retry_count = 0
+                decision_reason = "small correction requiring identity-preserving pose adjustment"
             else:
-                generated = await run_in_threadpool(create_image, prompt, source_image)
+                decision_reason = {
+                    "image": "initial request",
+                    "edit": "small correction preserving the existing image",
+                    "regenerate": "severe quality failure; abandoned the previous image",
+                }[mode]
+                prompt_plan = await run_in_threadpool(
+                    build_image_prompt,
+                    prompt,
+                    editing=mode == "edit",
+                    original_request=original_request,
+                    quality_feedback=prompt if mode == "regenerate" else "",
+                )
+                generated = await run_in_threadpool(create_image, prompt_plan.prompt, source_image)
+                quality_request = original_request or prompt
+                quality = await run_in_threadpool(assess_image_quality, quality_request, generated.content)
+                retry_count = 0
+                if quality.checked and not quality.passed:
+                    failure_summary = ", ".join(quality.failures)
+                    if quality.summary:
+                        failure_summary = f"{failure_summary}. {quality.summary}"
+                    prompt_plan = await run_in_threadpool(
+                        build_image_prompt,
+                        quality_request,
+                        original_request=quality_request,
+                        quality_feedback=failure_summary,
+                        simplify_composition=True,
+                    )
+                    generated = await run_in_threadpool(create_image, prompt_plan.prompt, None)
+                    quality = await run_in_threadpool(assess_image_quality, quality_request, generated.content)
+                    retry_count = 1
+                    decision_reason = "quality gate found multiple major failures; regenerated from scratch"
         except httpx.HTTPError as error:
             raise HTTPException(status_code=503, detail="image worker is unavailable") from error
         consumed_ids = set(request.attachment_ids)
@@ -686,6 +737,13 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         chat_session_roles[session_id] = user.role
         continuation_image_id = secrets.token_urlsafe(24)
         original_image = source_attachment.images[-1][2] if source_attachment and mode in {"edit", "pose"} else generated.content
+        retained_request = original_request or prompt
+        image_context = {
+            "original_request": retained_request,
+            "attempt": previous_attempt + 1 + retry_count,
+            "last_mode": "regenerate" if mode == "regenerate" or retry_count else generated.mode,
+            "quality_failures": list(quality.failures) if quality else [],
+        }
         save_attachment(
             continuation_image_id,
             UploadedAttachment(
@@ -698,6 +756,7 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
                     ("Original image", "image/png", original_image),
                 ),
                 time(),
+                image_context,
             ),
         )
         assistant_content = (
@@ -723,6 +782,26 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             project_store.add_message(
                 user.username, request.project_id, request.conversation_id, "assistant", assistant_content
             )
+        effective_mode = "regenerate" if mode == "regenerate" or retry_count else generated.mode
+        image_activity = {
+            "mode": effective_mode,
+            "reason": decision_reason,
+            "prompt_intent": {
+                "subject": prompt_plan.subject if prompt_plan else "existing portrait",
+                "action": prompt_plan.action if prompt_plan else "front-facing pose correction",
+                "style": prompt_plan.style if prompt_plan else "preserve existing style",
+                "face_priority": prompt_plan.face_priority if prompt_plan else "identity preservation",
+                "anatomy_priority": prompt_plan.anatomy_priority if prompt_plan else "preserve",
+                "must_have_object": prompt_plan.must_have_object if prompt_plan else "original portrait subject",
+            },
+            "retry_policy": "internal regenerate" if retry_count else "edit refinement" if mode in {"edit", "pose"} else "first pass",
+            "quality_gate": {
+                "checked": quality.checked if quality else False,
+                "passed": quality.passed if quality else True,
+                "failures": list(quality.failures) if quality else [],
+                "summary": quality.summary if quality else "not applicable to pose correction",
+            },
+        }
         response = image_chat_response(
             request,
             session_id,
@@ -732,7 +811,9 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             generated.content,
             "Remote portrait pose correction"
             if generated.mode == "pose"
+            else "Remote image regenerate" if effective_mode == "regenerate"
             else "Remote image edit" if generated.mode == "edit" else "Remote image generation",
+            image_activity,
         )
         response.update({
             "project_id": request.project_id,

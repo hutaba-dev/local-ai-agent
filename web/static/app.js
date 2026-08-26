@@ -213,6 +213,9 @@ function activityElement(activity) {
   const wholeUsage = activity.whole_request_usage || {};
   const finalCall = activity.final_call || {};
   const research = activity.research || {};
+  const image = activity.image || {};
+  const imageIntent = image.prompt_intent || {};
+  const imageQuality = image.quality_gate || {};
   const researchRounds = (research.rounds || []).map((round) => {
     const academic = round.academic_intelligence || {};
     const sourceStatus = Object.entries(academic.source_status || {})
@@ -255,6 +258,21 @@ function activityElement(activity) {
     ["LLM calls", wholeUsage.llm_call_count ?? 0], ["Whole LLM input", wholeUsage.input_tokens ?? 0],
     ["Whole LLM output", wholeUsage.output_tokens ?? 0], ["Stages", stages], ["LLM timing", llmCalls], ["Tools", tools],
   ];
+  if (image.mode) {
+    rows.splice(3, 0,
+      ["Image mode", escapeHtml(image.mode)],
+      ["Image reason", escapeHtml(image.reason || "N/A")],
+      ["Image subject", escapeHtml(imageIntent.subject || "N/A")],
+      ["Image action", escapeHtml(imageIntent.action || "N/A")],
+      ["Image style", escapeHtml(imageIntent.style || "N/A")],
+      ["Face priority", escapeHtml(imageIntent.face_priority || "N/A")],
+      ["Anatomy priority", escapeHtml(imageIntent.anatomy_priority || "N/A")],
+      ["Must-have object", escapeHtml(imageIntent.must_have_object || "N/A")],
+      ["Retry policy", escapeHtml(image.retry_policy || "N/A")],
+      ["Quality gate", escapeHtml(imageQuality.checked ? (imageQuality.passed ? "passed" : "failed after retry") : "unavailable")],
+      ["Quality findings", escapeHtml((imageQuality.failures || []).join(", ") || imageQuality.summary || "none")],
+    );
+  }
   details.innerHTML = `<summary>Agent Activity</summary><div class="activity-grid">${rows.map(([key, value]) => `<strong>${escapeHtml(key)}</strong><span>${value}</span>`).join("")}</div>`;
   return details;
 }

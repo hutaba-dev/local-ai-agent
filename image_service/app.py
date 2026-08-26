@@ -65,7 +65,7 @@ class ImageEngine:
                     prompt=prompt,
                     image=source,
                     generator=generator,
-                    num_inference_steps=2,
+                    num_inference_steps=4,
                     strength=request.strength,
                     guidance_scale=0.0,
                 ).images[0]
@@ -74,7 +74,7 @@ class ImageEngine:
                 output = pipeline(
                     prompt=prompt,
                     generator=generator,
-                    num_inference_steps=2,
+                    num_inference_steps=4,
                     guidance_scale=0.0,
                     height=IMAGE_SIZE,
                     width=IMAGE_SIZE,
@@ -97,12 +97,20 @@ def _source_image(encoded: str) -> Image.Image:
 def _image_prompt(prompt: str, editing: bool = False) -> str:
     instruction = (
         "Rewrite the user's image request as one concise English diffusion-model prompt. "
-        "Preserve every requested subject, composition, color, style, and edit. Return only the prompt."
+        "Preserve every requested subject, action, composition, camera/view, color, style, background, and must-have object. "
+        "Prioritize subject and action correctness, anatomy, and face quality before style fidelity. "
+        "For people performing an action, use a readable full-body composition when needed, show the complete core object, "
+        "make limb placement and balance physically coherent, keep the face unobscured unless requested, and use a clear silhouette. "
+        "When an attractive or prominent face is requested, require clear facial structure, symmetrical aligned eyes, a natural "
+        "defined nose and mouth, and clean facial line work. Pair requested styles with polished rendering and coherent anatomy. "
+        "Include constraints against distorted faces, broken anatomy, extra limbs, melted hands, disfigured feet, unclear poses, "
+        "missing core objects, and floating bodies. Return only the prompt."
     )
     if editing:
         instruction += (
             " This is an edit of an existing photo. Preserve the same person's identity, age, ethnicity, "
             "facial proportions, hair, clothing, and framing unless the user explicitly requests a change. "
+            "Explicitly state what to keep, what to change, and which quality issue to fix. "
             "Interpret complaints such as 'became X', 'too X', or 'not X' as traits to remove, never as desired traits."
         )
     try:

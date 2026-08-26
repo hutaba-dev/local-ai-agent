@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import os
 import re
 from dataclasses import dataclass
@@ -29,6 +30,132 @@ class GeneratedImage:
     seed: int
     mode: str
     filename: str
+
+
+@dataclass(frozen=True)
+class ImagePromptPlan:
+    prompt: str
+    subject: str
+    action: str
+    style: str
+    face_priority: str
+    anatomy_priority: str
+    must_have_object: str
+
+
+@dataclass(frozen=True)
+class ImageQualityAssessment:
+    checked: bool
+    passed: bool
+    failures: tuple[str, ...] = ()
+    summary: str = ""
+
+
+def build_image_prompt(
+    request: str,
+    *,
+    editing: bool = False,
+    original_request: str = "",
+    quality_feedback: str = "",
+    simplify_composition: bool = False,
+) -> ImagePromptPlan:
+    instruction = """Build a high-quality diffusion prompt from the user's image request.
+Return one JSON object with string fields: prompt, subject, action, style, face_priority, anatomy_priority, must_have_object.
+The prompt must be concise English and prioritize, in order: subject/action correctness, anatomy, face quality, then style fidelity.
+Include an appropriate composition and camera/view, background, all must-have elements, and explicit failure constraints.
+For a person performing an action, show the full body when needed, keep the core object fully visible, make limb placement and balance physically readable, keep the face unobscured unless requested, and use a clear silhouette.
+For requested attractive or prominent people, require clear facial structure, symmetrical aligned eyes, a defined natural nose and mouth, and clean facial line work.
+Combine a requested style with polished rendering, coherent anatomy, and character-art quality. Avoid distorted faces, broken anatomy, extra limbs, melted hands, disfigured feet, unclear poses, missing core objects, and floating bodies.
+Do not imitate a living artist. Generic named media styles such as Japanese anime are allowed."""
+    if editing:
+        instruction += """
+This is a localized edit. The prompt must explicitly say what to keep, what to change, and which quality issue to fix. Preserve successful identity, pose, composition, core objects, background, and style unless the user explicitly changes them."""
+    else:
+        instruction += """
+This is generation from scratch. Do not refer to or depend on a previous image."""
+    if simplify_composition:
+        instruction += """
+This is a retry after a failed result. Simplify the composition and camera angle while preserving the requested subject, action, core object, and style. Prefer a readable side or three-quarter view over a busy action shot."""
+    user_content = (
+        f"Original request: {original_request or request}\n"
+        f"Current request or feedback: {request}\n"
+        f"Known quality failures: {quality_feedback or 'none'}"
+    )
+    try:
+        response = httpx.post(
+            f"{OPENAI_BASE_URL}/chat/completions",
+            json={
+                "model": OPENAI_MODEL,
+                "messages": [
+                    {"role": "system", "content": instruction},
+                    {"role": "user", "content": user_content},
+                ],
+                "temperature": 0.1,
+                "max_tokens": 500,
+                "response_format": {"type": "json_object"},
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+        payload = json.loads(response.json()["choices"][0]["message"]["content"])
+        prompt = str(payload.get("prompt", "")).strip()
+        if prompt:
+            return ImagePromptPlan(
+                prompt=prompt[:2_000],
+                subject=str(payload.get("subject", "unspecified"))[:160],
+                action=str(payload.get("action", "none"))[:160],
+                style=str(payload.get("style", "unspecified"))[:160],
+                face_priority=str(payload.get("face_priority", "normal"))[:80],
+                anatomy_priority=str(payload.get("anatomy_priority", "normal"))[:80],
+                must_have_object=str(payload.get("must_have_object", "none"))[:160],
+            )
+    except (OSError, httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    fallback = original_request or request
+    if quality_feedback and quality_feedback != request:
+        fallback = f"{fallback}. Correct these failures: {quality_feedback}"
+    fallback += (
+        ". Clear readable composition and camera view. Show the complete subject and every core object. "
+        "For people in action, show a readable full-body pose with coherent balance and limb placement. "
+        "Clear symmetrical face, natural aligned eyes, defined nose and mouth, coherent anatomy, polished rendering. "
+        "Avoid distorted faces, broken anatomy, extra limbs, melted hands, disfigured feet, unclear action, "
+        "missing objects, or floating bodies."
+    )
+    return ImagePromptPlan(fallback[:2_000], "unspecified", "unspecified", "unspecified", "high", "high", "unspecified")
+
+
+def assess_image_quality(request: str, image_content: bytes) -> ImageQualityAssessment:
+    instruction = """Evaluate whether the generated image satisfies the request. Inspect exactly these criteria:
+subject present, requested action clearly readable, face coherent when visible, anatomy acceptable, main object present and readable, and requested style roughly correct.
+Return one JSON object with booleans subject, action, face, anatomy, main_object, style and a short summary string.
+Use true for a criterion that is not applicable. Be strict about severe visible failures, but do not reject harmless artistic variation."""
+    try:
+        response = httpx.post(
+            f"{OPENAI_BASE_URL}/chat/completions",
+            json={
+                "model": OPENAI_MODEL,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": f"{instruction}\nUser request: {request}"},
+                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64.b64encode(image_content).decode()}"}},
+                    ],
+                }],
+                "temperature": 0,
+                "max_tokens": 220,
+                "response_format": {"type": "json_object"},
+                "chat_template_kwargs": {"enable_thinking": False},
+            },
+            timeout=90,
+        )
+        response.raise_for_status()
+        payload = json.loads(response.json()["choices"][0]["message"]["content"])
+        criteria = ("subject", "action", "face", "anatomy", "main_object", "style")
+        failures = tuple(criterion for criterion in criteria if payload.get(criterion) is False)
+        return ImageQualityAssessment(True, len(failures) < 2, failures, str(payload.get("summary", ""))[:300])
+    except (OSError, httpx.HTTPError, KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        return ImageQualityAssessment(False, True, (), "quality gate unavailable")
 
 
 def create_image(prompt: str, source_image: bytes | None = None, strength: float = 0.5) -> GeneratedImage:
@@ -87,11 +214,12 @@ def infer_image_intent(message: str, source_image_available: bool = False) -> st
 Decide from the meaning, discourse context, and speech act rather than matching keywords.
 Return exactly one lowercase label:
 - image: a present request to create or draw a new image from a description.
-- edit: a present request to alter, improve, restyle, add, remove, or regenerate the image.
+- edit: a small, localized change where the existing subject, identity, composition, pose, or background should be preserved.
+- regenerate: a request to try again from scratch because the result has a severe quality failure, such as a distorted face, broken anatomy, unreadable action, wrong composition, missing core object, major style mismatch, or increasing edit drift.
 - pose: a present request involving the subject's head direction, gaze, or front-facing pose. This takes priority when combined with other image changes.
 - resend: a present request to display or send the existing image again without changing it.
 - chat: all ordinary conversation, including commentary, feedback, future preferences, explanations, questions, and acknowledgements.
-Only choose an image action when the user is asking for that action to be performed now. Editing, pose correction, and resending require an available source image; otherwise choose chat. If the intent is ambiguous, choose chat."""
+Treat direct complaints such as "the face is broken", "this looks wrong", "what did you draw", or "the person is not riding it" as requests to fix a severe failure now and choose regenerate when a source image is available. Do not use regenerate for a clearly localized correction that should preserve a successful image. Editing, regeneration, pose correction, and resending require an available source image; otherwise choose chat. If the intent is ambiguous, choose chat."""
     try:
         response = httpx.post(
             f"{OPENAI_BASE_URL}/chat/completions",
@@ -115,7 +243,7 @@ Only choose an image action when the user is asking for that action to be perfor
         label = str(content).strip().lower().rstrip(".")
         allowed = {"image", "chat"}
         if source_image_available:
-            allowed.update({"edit", "pose", "resend"})
+            allowed.update({"edit", "regenerate", "pose", "resend"})
         return label if label in allowed else "chat"
     except (OSError, httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
         return "chat"

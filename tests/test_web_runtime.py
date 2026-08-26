@@ -11,13 +11,20 @@ from unittest.mock import patch
 from fastapi.testclient import TestClient
 
 from runtime.agent_runtime import AgentRuntime, LatencyRecorder
-from runtime.image_client import GeneratedImage
+from runtime.image_client import GeneratedImage, ImagePromptPlan, ImageQualityAssessment
 from runtime.projects import ProjectStore
 from runtime.tool_registry import ToolResult, _academic_evidence_gaps, _research_tools, _researcher_query, run_agent_tools
 from runtime.web_search import fetch_sources, search
 from web import app as web_app
 from web.auth import UserStore
 from web.uploads import ExtractedUpload
+
+
+def planned_prompt(request: str, **_kwargs: object) -> ImagePromptPlan:
+    return ImagePromptPlan(request, "person", "action", "anime", "high", "high", "core object")
+
+
+PASSED_IMAGE_QUALITY = ImageQualityAssessment(True, True, (), "all requested elements are readable")
 
 
 class FakeResponse:
@@ -462,7 +469,9 @@ class WebRuntimeTests(unittest.TestCase):
             files={"file": ("notes.txt", b"critical pressure is 12 bar", "text/plain")},
         )
         generated = GeneratedImage(b"png-data", 42, "generate", "generate-42.png")
-        with patch("web.app.create_image", return_value=generated):
+        with patch("web.app.build_image_prompt", side_effect=planned_prompt), patch(
+            "web.app.assess_image_quality", return_value=PASSED_IMAGE_QUALITY
+        ), patch("web.app.create_image", return_value=generated):
             image = client.post("/api/chat", json={
                 "message": "/image test diagram",
                 "project_id": project_id,
@@ -540,7 +549,9 @@ class WebRuntimeTests(unittest.TestCase):
         client = self.authenticated_client()
         generated = GeneratedImage(b"png", 42, "generate", "generate-42.png")
 
-        with patch("web.app.create_image", return_value=generated) as create:
+        with patch("web.app.build_image_prompt", side_effect=planned_prompt), patch(
+            "web.app.assess_image_quality", return_value=PASSED_IMAGE_QUALITY
+        ), patch("web.app.create_image", return_value=generated) as create:
             response = client.post("/api/chat", json={"message": "/image glass tower"})
 
         self.assertEqual(response.status_code, 200)
@@ -562,6 +573,8 @@ class WebRuntimeTests(unittest.TestCase):
         generated = GeneratedImage(b"edited", 7, "edit", "edit-7.png")
 
         with patch("runtime.image_client.infer_image_intent", return_value="edit"), patch(
+            "web.app.build_image_prompt", side_effect=planned_prompt
+        ), patch("web.app.assess_image_quality", return_value=PASSED_IMAGE_QUALITY), patch(
             "web.app.create_image", return_value=generated
         ) as create:
             response = client.post("/api/chat", json={
@@ -587,7 +600,9 @@ class WebRuntimeTests(unittest.TestCase):
         prompt = "배경을 자연스럽게 바꿔주고 조명을 보정해줘."
         generated = GeneratedImage(b"edited", 8, "edit", "edit-8.png")
 
-        with patch("web.app.create_image", return_value=generated) as create:
+        with patch("web.app.build_image_prompt", side_effect=planned_prompt), patch(
+            "web.app.assess_image_quality", return_value=PASSED_IMAGE_QUALITY
+        ), patch("web.app.create_image", return_value=generated) as create:
             response = client.post("/api/chat", json={
                 "message": prompt,
                 "selected_agent": "research",
@@ -629,6 +644,49 @@ class WebRuntimeTests(unittest.TestCase):
         diffuse.assert_not_called()
         self.assertNotEqual(follow_up.json()["continuation_image_id"], continuation_image_id)
         self.assertEqual(follow_up.json()["activity"]["route_summary"], "Remote portrait pose correction")
+
+    def test_severe_generation_feedback_regenerates_without_failed_image_anchor(self) -> None:
+        client = self.authenticated_client()
+        initial = GeneratedImage(b"failed-image", 11, "generate", "generate-11.png")
+        regenerated = GeneratedImage(b"better-image", 12, "generate", "generate-12.png")
+        request = "예쁜 여학생이 스케이트보드를 타는 그림을 그려줘. 일본 애니메이션 스타일로."
+
+        with patch("web.app.build_image_prompt", side_effect=planned_prompt), patch(
+            "web.app.assess_image_quality", return_value=PASSED_IMAGE_QUALITY
+        ), patch("web.app.create_image", side_effect=[initial, regenerated]) as create:
+            first = client.post("/api/chat", json={"message": f"/image {request}"})
+            with patch("runtime.image_client.infer_image_intent", return_value="regenerate"):
+                second = client.post("/api/chat", json={
+                    "message": "얼굴이 망가졌네. 그림을 제대로 다시 그려줘.",
+                    "session_id": first.json()["session_id"],
+                    "continuation_image_id": first.json()["continuation_image_id"],
+                })
+
+        self.assertEqual(second.status_code, 200)
+        self.assertIsNone(create.call_args_list[1].args[1])
+        self.assertEqual(second.json()["activity"]["image"]["mode"], "regenerate")
+        self.assertIn("severe quality failure", second.json()["activity"]["image"]["reason"])
+
+    def test_quality_gate_allows_only_one_source_free_regenerate(self) -> None:
+        client = self.authenticated_client()
+        failed = ImageQualityAssessment(True, False, ("face", "anatomy"), "warped face and limbs")
+        generated = [
+            GeneratedImage(b"first", 21, "generate", "generate-21.png"),
+            GeneratedImage(b"retry", 22, "generate", "generate-22.png"),
+        ]
+
+        with patch("web.app.build_image_prompt", side_effect=planned_prompt) as planner, patch(
+            "web.app.assess_image_quality", side_effect=[failed, PASSED_IMAGE_QUALITY]
+        ), patch("web.app.create_image", side_effect=generated) as create:
+            response = client.post("/api/chat", json={"message": "/image anime full-body action"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(create.call_count, 2)
+        self.assertIsNone(create.call_args_list[1].args[1])
+        self.assertTrue(planner.call_args_list[1].kwargs["simplify_composition"])
+        image_activity = response.json()["activity"]["image"]
+        self.assertEqual(image_activity["mode"], "regenerate")
+        self.assertEqual(image_activity["retry_policy"], "internal regenerate")
 
     def test_front_facing_feedback_uses_identity_preserving_pose_service(self) -> None:
         client = self.authenticated_client()

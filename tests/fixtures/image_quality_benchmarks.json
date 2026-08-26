@@ -1,0 +1,48 @@
+{
+  "evaluation_metrics": [
+    "face_quality",
+    "anatomy",
+    "action_readability",
+    "core_object_presence",
+    "style_fidelity",
+    "retry_correctness",
+    "edit_vs_regenerate_decision"
+  ],
+  "cases": [
+  {
+    "id": "person-riding-skateboard",
+    "prompt": "A student riding a skateboard outdoors",
+    "expected": {"action": "riding a skateboard", "core_object": "skateboard", "composition": "full body"}
+  },
+  {
+    "id": "person-riding-bicycle",
+    "prompt": "A person riding a bicycle on a city path",
+    "expected": {"action": "riding a bicycle", "core_object": "bicycle", "composition": "full body"}
+  },
+  {
+    "id": "girl-running",
+    "prompt": "A girl running through a park",
+    "expected": {"action": "running", "core_object": "none", "composition": "full body"}
+  },
+  {
+    "id": "man-dancing",
+    "prompt": "A man dancing on a clean stage",
+    "expected": {"action": "dancing", "core_object": "none", "composition": "full body"}
+  },
+  {
+    "id": "woman-sitting-at-desk",
+    "prompt": "A woman sitting naturally at a desk and writing",
+    "expected": {"action": "sitting and writing", "core_object": "desk", "composition": "readable seated pose"}
+  },
+  {
+    "id": "anime-portrait",
+    "prompt": "A polished Japanese anime-style portrait with an attractive face",
+    "expected": {"action": "portrait", "core_object": "none", "composition": "face clearly visible"}
+  },
+  {
+    "id": "anime-full-body-action",
+    "prompt": "A polished Japanese anime-style full-body character jumping",
+    "expected": {"action": "jumping", "core_object": "none", "composition": "full body"}
+  }
+  ]
+}
