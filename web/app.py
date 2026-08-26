@@ -412,6 +412,13 @@ def get_project(project_id: str, request: Request) -> dict[str, object]:
     return project_store.get_project(user.username, project_id)
 
 
+@app.delete("/api/projects/{project_id}")
+def delete_project(project_id: str, request: Request) -> dict[str, str]:
+    user = require_project_access(request)
+    project_store.delete_project(user.username, project_id)
+    return {"status": "deleted"}
+
+
 @app.post("/api/projects/{project_id}/conversations")
 def create_project_conversation(
     project_id: str, conversation: ConversationCreateRequest, request: Request

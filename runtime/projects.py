@@ -277,6 +277,31 @@ class ProjectStore:
         project["storage_online"] = self.storage_status().online
         return project
 
+    def delete_project(self, owner_id: str, project_id: str) -> None:
+        self.require_storage()
+        root = self._project_root(project_id)
+        tombstone = root.parent / f".deleting-{project_id}"
+        with self._connect() as connection:
+            self._project_row(connection, owner_id, project_id)
+        if tombstone.exists():
+            raise RuntimeError("project deletion is already in progress")
+        if root.is_symlink():
+            raise ProjectPathError("project root symlinks are not allowed")
+        if root.exists():
+            root.rename(tombstone)
+        try:
+            with self._connect() as connection:
+                self._project_row(connection, owner_id, project_id)
+                for table in ("message_fts", "memory_fts", "file_chunk_fts"):
+                    connection.execute(f"DELETE FROM {table} WHERE project_id = ?", (project_id,))
+                connection.execute("DELETE FROM projects WHERE id = ? AND owner_id = ?", (project_id, owner_id))
+        except Exception:
+            if tombstone.exists() and not root.exists():
+                tombstone.rename(root)
+            raise
+        if tombstone.exists():
+            shutil.rmtree(tombstone, ignore_errors=True)
+
     def create_conversation(self, owner_id: str, project_id: str, title: str = "New conversation") -> dict[str, object]:
         self.require_storage()
         conversation_id = self._id("cnv")

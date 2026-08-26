@@ -28,6 +28,17 @@ const projectHeader = document.querySelector("#project-header");
 const projectNameElement = document.querySelector("#project-name");
 const projectDescriptionElement = document.querySelector("#project-description");
 const projectNewChatButton = document.querySelector("#project-new-chat");
+const projectHeaderActions = document.createElement("div");
+projectHeaderActions.style.display = "flex";
+projectHeaderActions.style.alignItems = "center";
+projectHeaderActions.style.gap = "8px";
+const deleteProjectButton = document.createElement("button");
+deleteProjectButton.id = "delete-project";
+deleteProjectButton.className = "secondary";
+deleteProjectButton.type = "button";
+deleteProjectButton.textContent = "Delete Project";
+projectNewChatButton.replaceWith(projectHeaderActions);
+projectHeaderActions.append(projectNewChatButton, deleteProjectButton);
 const workspaceTabs = document.querySelector("#workspace-tabs");
 const conversationContext = document.querySelector("#conversation-context");
 const projectFileInput = document.querySelector("#project-file-input");
@@ -364,6 +375,27 @@ async function createProjectConversation() {
   setView("chat");
 }
 
+async function deleteCurrentProject() {
+  if (!currentProject) return;
+  const projectId = currentProject.id;
+  const projectName = currentProject.name;
+  const confirmation = window.prompt(
+    `Delete "${projectName}" permanently? Type the project name to confirm.`,
+  );
+  if (confirmation !== projectName) return;
+  deleteProjectButton.disabled = true;
+  try {
+    await request(`/api/projects/${encodeURIComponent(projectId)}`, { method: "DELETE" });
+    projects = projects.filter((project) => project.id !== projectId);
+    await openGeneralChat();
+    await loadProjects();
+  } catch (error) {
+    window.alert(`Could not delete project: ${error.message}`);
+  } finally {
+    deleteProjectButton.disabled = false;
+  }
+}
+
 async function openGeneralChat() {
   currentProject = null;
   currentConversation = null;
@@ -620,6 +652,7 @@ newChatButton.addEventListener("click", newSession);
 generalNewChatButton.addEventListener("click", openGeneralChat);
 generalChatButton.addEventListener("click", openGeneralChat);
 projectNewChatButton.addEventListener("click", createProjectConversation);
+deleteProjectButton.addEventListener("click", deleteCurrentProject);
 workspaceTabs.querySelectorAll("button").forEach((button) => button.addEventListener("click", () => setView(button.dataset.view)));
 sidebarToggle.addEventListener("click", () => { sidebar.classList.add("open"); sidebarScrim.hidden = false; });
 sidebarScrim.addEventListener("click", closeSidebar);

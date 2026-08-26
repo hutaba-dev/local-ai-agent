@@ -436,6 +436,20 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(memory.status_code, 200)
         self.assertEqual(forbidden.status_code, 404)
 
+    def test_project_api_allows_only_owner_to_delete_project(self) -> None:
+        owner = self.authenticated_client()
+        project_id = owner.post("/api/projects", json={"name": "Disposable API Project"}).json()["id"]
+        other = self.authenticated_client("test-manager")
+
+        forbidden = other.delete(f"/api/projects/{project_id}")
+        deleted = owner.delete(f"/api/projects/{project_id}")
+        missing = owner.get(f"/api/projects/{project_id}")
+
+        self.assertEqual(forbidden.status_code, 404)
+        self.assertEqual(deleted.status_code, 200)
+        self.assertEqual(deleted.json(), {"status": "deleted"})
+        self.assertEqual(missing.status_code, 404)
+
     def test_project_upload_and_image_artifact_persist_to_project_files(self) -> None:
         client = self.authenticated_client()
         project_id = client.post("/api/projects", json={"name": "Artifacts"}).json()["id"]

@@ -38,6 +38,37 @@ class ProjectStoreTests(unittest.TestCase):
 
         self.assertTrue((empty_root / "projects" / project["id"] / "files").is_dir())
 
+    def test_project_delete_removes_owned_database_and_storage_records(self) -> None:
+        project = self.store.create_project("owner", "Disposable")
+        conversation = self.store.create_conversation("owner", project["id"], "Delete me")
+        message = self.store.add_message("owner", project["id"], conversation["id"], "user", "indexed message")
+        memory = self.store.add_memory("owner", project["id"], "fact", "indexed memory")
+        self.store.save_file(
+            "owner", project["id"], "notes.txt", b"indexed file", "text/plain", "indexed file",
+            conversation["id"],
+        )
+        project_root = self.data_root / "projects" / project["id"]
+
+        with self.assertRaises(ProjectNotFoundError):
+            self.store.delete_project("other-owner", project["id"])
+        self.assertTrue(project_root.exists())
+
+        self.store.delete_project("owner", project["id"])
+
+        self.assertFalse(project_root.exists())
+        self.assertEqual(self.store.list_projects("owner"), [])
+        with self.assertRaises(ProjectNotFoundError):
+            self.store.get_project("owner", project["id"])
+        with self.store._connect() as connection:
+            for table in ("conversations", "files", "memories", "artifacts", "project_events"):
+                count = connection.execute(f"SELECT COUNT(*) FROM {table} WHERE project_id = ?", (project["id"],)).fetchone()[0]
+                self.assertEqual(count, 0, table)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM messages WHERE id = ?", (message,)).fetchone()[0], 0)
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM memory_sources WHERE memory_id = ?", (memory["id"],)).fetchone()[0], 0)
+            for table in ("message_fts", "memory_fts", "file_chunk_fts"):
+                count = connection.execute(f"SELECT COUNT(*) FROM {table} WHERE project_id = ?", (project["id"],)).fetchone()[0]
+                self.assertEqual(count, 0, table)
+
     def test_conversation_messages_survive_store_restart(self) -> None:
         project = self.store.create_project("owner", "Persistence")
         conversation = self.store.create_conversation("owner", project["id"], "Experiment")
