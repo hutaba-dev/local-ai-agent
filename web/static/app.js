@@ -213,6 +213,7 @@ function activityElement(activity) {
   const wholeUsage = activity.whole_request_usage || {};
   const finalCall = activity.final_call || {};
   const research = activity.research || {};
+  const sourcePlan = research.source_plan || {};
   const image = activity.image || {};
   const imageIntent = image.prompt_intent || {};
   const imageQuality = image.quality_gate || {};
@@ -254,6 +255,11 @@ function activityElement(activity) {
     ["Final synthesis TTFT", formatMs(finalCall.ttft_ms)], ["Final synthesis decode", formatMs(finalCall.generation_time_ms)],
     ["Final synthesis decode speed", finalCall.decode_tokens_per_second ? `${finalCall.decode_tokens_per_second} tok/s` : "N/A"],
     ["Research mode", research.mode || "N/A"], ["Research state", research.state || "N/A"],
+    ["Research Intent", (sourcePlan.intents || []).join(" + ") || "N/A"],
+    ["Freshness", sourcePlan.freshness_priority || "N/A"],
+    ["Selected Sources", (sourcePlan.selected_sources || []).join("; ") || "N/A"],
+    ["Skipped Sources", (sourcePlan.skipped_sources || []).join("; ") || "none"],
+    ["Required Evidence", (sourcePlan.required_evidence || []).join("; ") || "N/A"],
     ["State history", (research.state_history || []).join(" → ") || "N/A"],
     ["Research rounds", activity.research_rounds || "N/A"], ["Round detail", researchRounds],
     ["Entity confidence", research.entity_confidence || "N/A"], ["Gap status", research.gap_status || "N/A"],

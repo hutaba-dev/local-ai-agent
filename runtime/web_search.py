@@ -25,6 +25,8 @@ KOREAN_PATTERN = re.compile(r"[\uac00-\ud7a3]")
 USER_AGENT = "local-ai-agent-research/0.1"
 MAX_SOURCE_COUNT = 5
 MAX_SOURCE_CHARS = 6_000
+MAX_SOURCE_HTML_CHARS = 1_000_000
+MIN_SOURCE_CHARS = 200
 S2_MAX_ATTEMPTS = 3
 
 
@@ -526,13 +528,14 @@ def fetch_sources(
                 measurement["failure_reason"] = "non_html_content"
                 continue
             extractor = _TextExtractor()
-            extractor.feed(response.text[:MAX_SOURCE_CHARS * 3])
+            extractor.feed(response.text[:MAX_SOURCE_HTML_CHARS])
             text = extractor.text()[:MAX_SOURCE_CHARS]
-            if text:
+            if len(text) >= MIN_SOURCE_CHARS:
                 sources.append({
                     "title": result.get("title", "Untitled source"),
                     "url": final_url,
                     "text": text,
+                    "relevance_score": result.get("relevance_score", 0.4),
                 })
                 measurement.update({
                     "url": final_url,
@@ -541,7 +544,7 @@ def fetch_sources(
                     "text_length": len(text),
                 })
             else:
-                measurement["failure_reason"] = "empty_extracted_text"
+                measurement["failure_reason"] = "insufficient_extracted_text"
         except (OSError, ValueError, httpx.HTTPError) as error:
             measurement["failure_reason"] = _fetch_failure_reason(error)
         finally:

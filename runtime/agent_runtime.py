@@ -7,10 +7,12 @@ import os
 import re
 import base64
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from time import perf_counter
 from typing import Callable, TypeVar
+from zoneinfo import ZoneInfo
 
 import httpx
 from hangul_romanize import Transliter
@@ -18,7 +20,7 @@ from hangul_romanize.rule import academic as academic_romanization
 
 from runtime.router import Route, route_request
 from runtime.sessions import SessionStore
-from runtime.tool_registry import ProjectToolScope, run_agent_tools
+from runtime.tool_registry import ProjectToolScope, research_source_plan, run_agent_tools
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -294,6 +296,7 @@ class AgentRuntime:
         gap_status = "NOT_EVALUATED"
         termination_reason = "research_budget_exhausted"
         identity_query_cache: dict[str, str] = {}
+        source_plan = research_source_plan(question)
 
         def resolve_researcher_query(tool_queries: tuple[str, ...], web_output: str) -> str:
             if "query" not in identity_query_cache:
@@ -306,10 +309,11 @@ class AgentRuntime:
             state_history.append(ResearchState.SEARCHING.value)
             if person_query:
                 state_history.append(ResearchState.IDENTIFYING.value)
+            tool_queries = tuple(dict.fromkeys((question, *queries)))
             round_tools = latency.stage(
                 f"research_round_{round_number}_tools",
-                lambda queries=queries: self._run_tools(
-                    "research", queries, "DEEP_RESEARCH", allow_local_tools, project_scope,
+                lambda tool_queries=tool_queries: self._run_tools(
+                    "research", tool_queries, "DEEP_RESEARCH", allow_local_tools, project_scope,
                     resolve_researcher_query if person_query else None,
                 ),
             )
@@ -318,7 +322,7 @@ class AgentRuntime:
             state_history.append(ResearchState.GAP_ANALYSIS.value)
             gap = latency.stage(
                 f"research_round_{round_number}_gap_analysis",
-                lambda: self._research_gap(question, queries, all_tools, system_prompt, latency),
+                lambda: self._research_gap(question, queries, all_tools, source_plan, system_prompt, latency),
             )
             entity_confidence = gap.entity_confidence
             gap_status = "READY" if gap.ready_to_answer else "FOLLOWUP_REQUIRED"
@@ -352,7 +356,9 @@ class AgentRuntime:
         state_history.append(ResearchState.SYNTHESIZING.value)
         answer, payload = latency.stage(
             "final_synthesis",
-            lambda: self._synthesize_research(question, all_tools, system_prompt, latency, persistent_context),
+            lambda: self._synthesize_research(
+                question, all_tools, system_prompt, latency, persistent_context, source_plan
+            ),
         )
         state_history.append(ResearchState.COMPLETE.value)
         return all_tools, answer, payload, {
@@ -364,6 +370,14 @@ class AgentRuntime:
             "gap_status": gap_status,
             "final_synthesis_executed": True,
             "termination_reason": termination_reason,
+            "source_plan": {
+                "intents": list(source_plan.intents),
+                "freshness_priority": source_plan.freshness_priority,
+                "required_evidence": list(source_plan.required_evidence),
+                "selected_sources": list(source_plan.selected_sources),
+                "skipped_sources": list(source_plan.skipped_sources),
+                "academic_enabled": source_plan.academic_enabled,
+            },
         }
 
     def _resolve_researcher_identity_query(
@@ -494,10 +508,17 @@ class AgentRuntime:
         question: str,
         round_queries: tuple[str, ...],
         tools: list[dict[str, object]],
+        source_plan: object,
         system_prompt: str,
         latency: LatencyRecorder,
     ) -> ResearchGap:
         evidence_package = self._evidence_package(tools)
+        plan_json = json.dumps({
+            "intents": list(source_plan.intents),
+            "freshness_priority": source_plan.freshness_priority,
+            "academic_enabled": source_plan.academic_enabled,
+            "required_evidence": list(source_plan.required_evidence),
+        }, ensure_ascii=False)
         prompt = (
             "Evaluate research evidence coverage without answering the user. Return exactly one JSON object: "
             '{"missing":[],"uncertain":[],"next_queries":[],"next_tools":[],"ready_to_answer":false,'
@@ -507,8 +528,12 @@ class AgentRuntime:
             "Never treat one database author record as the complete publication corpus. Compare source coverage and identifiers; "
             "a large publication, citation, affiliation, timeline, or subject conflict requires follow-up verification. "
             "Preserve the original Korean name exactly in follow-up queries; romanizations are additional aliases only. "
+            "Judge completeness against the Research Source Plan and required_evidence, not source count. "
+            "For current market questions, retry official sources, financial sources, current web queries, and page fetches; "
+            "never substitute academic papers for missing market evidence. Mark unavailable material NOT VERIFIED. "
             "Set ready_to_answer=false whenever identity or a material evidence gap remains. Do not include prose.\n\n"
-            f"Question:\n{question}\n\nQueries executed:\n{json.dumps(round_queries, ensure_ascii=False)}\n\n"
+            f"Question:\n{question}\n\nResearch Source Plan:\n{plan_json}\n\n"
+            f"Queries executed:\n{json.dumps(round_queries, ensure_ascii=False)}\n\n"
             f"External Evidence Package:\n{json.dumps(evidence_package, ensure_ascii=False)}"
         )
         try:
@@ -614,9 +639,34 @@ class AgentRuntime:
         system_prompt: str,
         latency: LatencyRecorder,
         persistent_context: str = "",
+        source_plan: object | None = None,
     ) -> tuple[str, dict[str, object]]:
         evidence_package = self._evidence_package(tools, persistent_context)
+        source_plan = source_plan or research_source_plan(question)
+        if "MARKET_FINANCE" in source_plan.intents:
+            now = datetime.now(timezone.utc)
+            evidence_package["research_as_of"] = {
+                "utc": now.isoformat(timespec="minutes"),
+                "kst": now.astimezone(ZoneInfo("Asia/Seoul")).isoformat(timespec="minutes"),
+            }
         package_json = self._bounded_evidence_json(evidence_package)
+        plan_json = json.dumps({
+            "intents": list(source_plan.intents),
+            "freshness_priority": source_plan.freshness_priority,
+            "academic_enabled": source_plan.academic_enabled,
+            "required_evidence": list(source_plan.required_evidence),
+        }, ensure_ascii=False)
+        market_instruction = (
+            "For current market questions, organize the answer around schedule, consensus, watch points, current market reaction, "
+            "bull/base/bear scenarios, and post-release checks where evidence permits. Show US Eastern and Korea Standard times for events. "
+            "Prefer current primary sources and fetched page text. Never add academic-paper or bibliometric sections. "
+            "If figures differ across sources, state the discrepancy. Mark missing facts NOT VERIFIED. "
+            if "MARKET_FINANCE" in source_plan.intents else ""
+        )
+        mixed_instruction = (
+            "For MIXED requests, separate Current Market Evidence from Academic Context and never treat academic work as direct evidence "
+            "of the current earnings event. " if "MIXED" in source_plan.intents else ""
+        )
         analyst_prompt = (
             "You are the Analyst / Synthesizer. Use only the supplied Evidence Package. "
             "Project context is user workspace context, not independently verified evidence; never use it to prove an external claim. "
@@ -625,7 +675,9 @@ class AgentRuntime:
             "Do not merely summarize facts. Explain what each evidence item means for the requested evaluation. "
             "Do not judge from publication or citation counts alone: assess topic consistency, development, originality, "
             "representative-work significance, recent activity, collaboration, and leadership where evidence exists. "
-            "Separate Evidence from Interpretation, state uncertainty, and cite supplied URLs beside factual claims.\n\n"
+            "Separate Evidence from Interpretation, state uncertainty, and cite supplied URLs beside factual claims. "
+            "More sources is not better. Use only evidence that materially answers the user's question. "
+            f"{market_instruction}{mixed_instruction}\n\nResearch Source Plan:\n{plan_json}\n\n"
             f"Question:\n{question}\n\nEvidence Package:\n{package_json}"
         )
         draft, _ = self._complete(
@@ -656,6 +708,7 @@ class AgentRuntime:
             "Do not assume praise in the question is true; state when the evidence is insufficient for that characterization. "
             "Report database-specific publication/citation metrics separately and explain material coverage conflicts. "
             "Connect facts to meaning, comparative judgment, limitations, and a clear overall assessment. Preserve URL citations.\n\n"
+            f"{market_instruction}{mixed_instruction}\n\nResearch Source Plan:\n{plan_json}\n\n"
             f"Question:\n{question}\n\nEvidence Package:\n{package_json}\n\nAnalyst Draft:\n{bounded_draft}\n\nCritic Feedback:\n{bounded_critique}"
         )
         answer, payload = self._complete(
@@ -671,7 +724,7 @@ class AgentRuntime:
             "Using only the Evidence Package, write the completed terminal research answer now in the user's language. "
             "Include identity confidence, evidence-based findings, limitations, overall assessment, and source URLs. "
             "Do not describe future work or the research process.\n\n"
-            f"Question:\n{question}\n\nEvidence Package:\n{package_json}"
+            f"{market_instruction}{mixed_instruction}\n\nQuestion:\n{question}\n\nEvidence Package:\n{package_json}"
         )
         repaired_answer, repaired_payload = self._complete(
             [{"role": "system", "content": system_prompt}, {"role": "user", "content": repair_prompt}],
@@ -704,7 +757,7 @@ class AgentRuntime:
                         work[key] = work[key][:500]
         for source in bounded.get("sources", []):
             if isinstance(source, dict) and isinstance(source.get("text"), str):
-                source["text"] = source["text"][:600]
+                source["text"] = source["text"][:1200]
         bounded["evidence_truncated_for_context"] = False
         serialized = json.dumps(bounded, ensure_ascii=False)
         if len(serialized) <= MAX_EVIDENCE_JSON_CHARS:
@@ -875,6 +928,8 @@ class AgentRuntime:
                         "title": str(item.get("title", ""))[:300],
                         "url": str(item.get("url", ""))[:1000],
                         "text": str(item.get("text", ""))[:1200],
+                        "relevance_score": float(item.get("relevance_score", 0.4)),
+                        "evidence_group": "current_web",
                     }
                     for item in output if isinstance(item, dict)
                 )
@@ -952,7 +1007,11 @@ class AgentRuntime:
             "A direct Research agent selection is a strong signal for DEEP_RESEARCH when the request asks to find, verify, evaluate, or analyze evidence. "
             "For QUICK_SEARCH provide exactly one concise query. "
             "For DEEP_RESEARCH provide 2 to 4 complementary queries covering the question's major evidence needs; include a query for "
-            "primary or official sources and, when relevant, a query for academic papers. Preserve a Korean person's original name exactly "
+            "primary or official sources and include academic papers only when the user explicitly asks for scholarly evidence. "
+            "More sources is not better. Use only sources that can materially answer the user's question. Academic sources are specialized "
+            "tools, not general research tools. For current news and market questions, prioritize freshness, primary sources, financial data, "
+            "and current reporting. Do not request scholarly search merely because the subject is AI, technology, a company, or adjacent to research. "
+            "Preserve a Korean person's original name exactly "
             "in at least one query; romanizations may only be additional queries. Treat praise in the request as a hypothesis to test. "
             "Do not answer the request yet."
         )

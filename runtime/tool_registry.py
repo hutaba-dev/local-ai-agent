@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import re
 import subprocess
+from datetime import datetime, timezone
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from time import perf_counter
 from typing import Callable
+from urllib.parse import urlparse
 
 import httpx
 
@@ -36,6 +38,104 @@ class ProjectToolScope:
     tools: ProjectTools
     owner_id: str
     project_id: str
+
+
+@dataclass(frozen=True)
+class ResearchSourcePlan:
+    intents: tuple[str, ...]
+    freshness_priority: str
+    academic_enabled: bool
+    required_evidence: tuple[str, ...]
+    selected_sources: tuple[str, ...]
+    skipped_sources: tuple[str, ...]
+
+
+ACADEMIC_PATTERN = re.compile(
+    r"논문|학술|학계\s*연구|저널|인용|피인용|연구자|교수|연구\s*역량|대표\s*논문|"
+    r"\b(?:papers?|publications?|citations?|h[- ]?index|journal|doi|bibliometric|research output|scholarly|academic)\b",
+    re.IGNORECASE,
+)
+CURRENT_PATTERN = re.compile(
+    r"오늘|현재|지금|이번\s*주|방금|최신|발표|"
+    r"\b(?:latest|today|current|this evening|before market|after market|tonight|breaking)\b",
+    re.IGNORECASE,
+)
+MARKET_PATTERN = re.compile(
+    r"실적|매출|주가|목표주가|시장\s*(?:전망|예상|뉴스)|월가|컨센서스|프리마켓|애프터마켓|옵션|"
+    r"\b(?:earnings|revenue|eps|guidance|consensus|stock|share price|analyst forecast|"
+    r"conference call|earnings call|implied move|premarket|aftermarket|wall street)\b",
+    re.IGNORECASE,
+)
+COMPANY_PATTERN = re.compile(
+    r"기업|회사|경쟁사|생태계|수요\s*전망|"
+    r"\b(?:company|competitive|competitor|ecosystem|investor relations|sec filing|demand outlook|nvidia|tsmc)\b",
+    re.IGNORECASE,
+)
+TECHNICAL_PATTERN = re.compile(
+    r"기술|아키텍처|성능|플랫폼|반도체|cuda|"
+    r"\b(?:technical|architecture|performance|platform|semiconductor|api|gpu)\b",
+    re.IGNORECASE,
+)
+ACADEMIC_DOMAINS = (
+    "scopus.com", "webofscience.com", "openalex.org", "semanticscholar.org",
+    "crossref.org", "scholar.google", "doi.org", "arxiv.org", "springer.com",
+    "sciencedirect.com", "wiley.com", "tandfonline.com",
+)
+CURRENT_NEWS_DOMAINS = (
+    "reuters.com", "bloomberg.com", "cnbc.com", "wsj.com", "ft.com", "apnews.com",
+)
+MARKET_DATA_DOMAINS = (
+    "nasdaq.com", "marketwatch.com", "finance.yahoo.com", "investing.com", "morningstar.com",
+)
+COMPANY_SOURCE_DOMAINS = {
+    "NVIDIA": ("investor.nvidia.com", "nvidianews.nvidia.com"),
+    "TSMC": ("investor.tsmc.com",),
+}
+
+
+def research_source_plan(query: str | tuple[str, ...]) -> ResearchSourcePlan:
+    queries = _queries(query)
+    text = queries[0] if queries else ""
+    intents: list[str] = []
+    if CURRENT_PATTERN.search(text):
+        intents.append("CURRENT_NEWS")
+    if MARKET_PATTERN.search(text):
+        intents.append("MARKET_FINANCE")
+    if ACADEMIC_PATTERN.search(text):
+        intents.append("ACADEMIC_RESEARCH")
+    if COMPANY_PATTERN.search(text):
+        intents.append("COMPANY_RESEARCH")
+    if TECHNICAL_PATTERN.search(text):
+        intents.append("TECHNICAL_RESEARCH")
+    if not intents:
+        intents.append("GENERAL_WEB")
+    academic_enabled = "ACADEMIC_RESEARCH" in intents
+    if academic_enabled and any(intent in intents for intent in ("CURRENT_NEWS", "MARKET_FINANCE", "COMPANY_RESEARCH")):
+        intents.append("MIXED")
+    required: list[str] = []
+    selected = ["General Web Search", "Fetched Source Pages"]
+    skipped: list[str] = []
+    if "MARKET_FINANCE" in intents:
+        required.extend((
+            "official earnings date", "official release timing", "conference call time",
+            "revenue consensus", "EPS consensus", "guidance expectation",
+            "stock reaction or recent price movement", "analyst commentary", "optional implied move",
+        ))
+        selected.extend(("Company Investor Relations / SEC", "Current Financial News", "Market / Analyst Data"))
+    if "CURRENT_NEWS" in intents and "Current Financial News" not in selected:
+        selected.append("Current News")
+    if academic_enabled:
+        selected.append("Academic Intelligence")
+    else:
+        skipped.append("Academic Intelligence — not relevant")
+    return ResearchSourcePlan(
+        tuple(dict.fromkeys(intents)),
+        "VERY_HIGH" if "CURRENT_NEWS" in intents else "NORMAL",
+        academic_enabled,
+        tuple(required),
+        tuple(selected),
+        tuple(skipped),
+    )
 
 
 def run_agent_tools(
@@ -99,25 +199,31 @@ def _research_tools(
     allow_local_tools: bool = True,
     researcher_identity_resolver: Callable[[tuple[str, ...], str], str] | None = None,
 ) -> list[ToolResult]:
-    results = []
+    plan = research_source_plan(message)
+    results: list[ToolResult] = []
     if allow_local_tools:
-        results = [
+        results.extend([
             _command("search_project_docs", ["find", "docs", "-type", "f", "-name", "*.md", "-print"], cwd=REPO_ROOT),
             _command("read_file", ["sed", "-n", "1,220p", "docs/model-serving.md"], cwd=REPO_ROOT),
-        ]
+        ])
     if search_mode != "NO_SEARCH":
-        web_result = _web_search(message, search_mode)
+        results.append(ToolResult(
+            "research_source_plan", True, json.dumps(asdict(plan), ensure_ascii=False), None, 0,
+            {"cost_gate": "Only sources with a realistic chance of answering the query are enabled."},
+        ))
+        routed_queries = _source_queries(message, plan)
+        web_result = _web_search(routed_queries, search_mode, plan)
         results.append(web_result)
         if search_mode == "DEEP_RESEARCH" and web_result.success:
             results.append(_web_sources(web_result.output))
-            if _is_researcher_query(_queries(message)):
+            if plan.academic_enabled and _is_researcher_query(_queries(message)):
                 researcher_query = (
                     researcher_identity_resolver(_queries(message), web_result.output)
                     if researcher_identity_resolver is not None
                     else _researcher_query(_queries(message), web_result.output)
                 )
                 results.append(_academic_intelligence(researcher_query))
-            else:
+            elif plan.academic_enabled:
                 academic_result = _academic_papers(_queries(message))
                 results.append(academic_result)
                 results.extend(_academic_evidence_gaps(
@@ -126,6 +232,37 @@ def _research_tools(
                     results,
                 ))
     return results
+
+
+def _source_queries(message: str | tuple[str, ...], plan: ResearchSourcePlan) -> tuple[str, ...]:
+    requested_queries = list(_queries(message))
+    anchor = requested_queries[0]
+    queries = requested_queries[1:] if len(requested_queries) > 1 else [anchor]
+    if "MARKET_FINANCE" in plan.intents and len(requested_queries) == 1:
+        entity = _market_entity(anchor)
+        now = datetime.now(timezone.utc)
+        current_period = now.strftime("%B %Y")
+        official_domains = COMPANY_SOURCE_DOMAINS.get(entity, ())
+        official_queries = (
+            tuple(f"site:{domain} {entity} earnings {current_period} conference call" for domain in official_domains)
+            if official_domains else (f"{entity} official investor relations earnings {current_period} conference call",)
+        )
+        queries.extend((*official_queries,
+            f"site:sec.gov {entity} 8-K earnings {current_period}",
+            f"site:reuters.com {entity} earnings {current_period} consensus",
+            f"{entity} earnings {current_period} EPS revenue consensus guidance implied move",
+        ))
+    elif "CURRENT_NEWS" in plan.intents and len(requested_queries) == 1:
+        queries.append(f"{anchor} latest official source Reuters AP")
+    return tuple(dict.fromkeys(query[:500] for query in queries))
+
+
+def _market_entity(query: str) -> str:
+    for entity in COMPANY_SOURCE_DOMAINS:
+        if re.search(rf"\b{re.escape(entity)}\b", query, re.IGNORECASE):
+            return entity
+    ticker = re.search(r"\b[A-Z]{2,6}\b", query)
+    return ticker.group(0) if ticker else query[:120]
 
 
 def _server_tools(message: str, search_mode: str) -> list[ToolResult]:
@@ -159,12 +296,59 @@ def _queries(message: str | tuple[str, ...]) -> tuple[str, ...]:
     return (message,) if isinstance(message, str) else message
 
 
-def _web_search(message: str | tuple[str, ...], search_mode: str) -> ToolResult:
+def _web_search(
+    message: str | tuple[str, ...],
+    search_mode: str,
+    plan: ResearchSourcePlan | None = None,
+) -> ToolResult:
     started = perf_counter()
     try:
-        return ToolResult("web_search", True, json.dumps(search_many(_queries(message), search_mode), ensure_ascii=False), None, round((perf_counter() - started) * 1000))
+        results = search_many(_queries(message), search_mode)
+        if plan is not None:
+            results = _rank_relevant_web_results(results, plan)
+        return ToolResult("web_search", True, json.dumps(results, ensure_ascii=False), None, round((perf_counter() - started) * 1000))
     except (RuntimeError, httpx.HTTPError) as error:
         return ToolResult("web_search", False, "", str(error), round((perf_counter() - started) * 1000))
+
+
+def _rank_relevant_web_results(
+    results: list[dict[str, str]], plan: ResearchSourcePlan
+) -> list[dict[str, object]]:
+    ranked: list[dict[str, object]] = []
+    for result in results:
+        url = str(result.get("url", "")).lower()
+        text = f"{result.get('title', '')} {result.get('description', '')}".lower()
+        if not plan.academic_enabled and any(domain in url for domain in ACADEMIC_DOMAINS):
+            score = 0.05
+        elif any(marker in url for marker in ("investor.", "/investor", "sec.gov", "nvidianews.nvidia.com")):
+            score = 1.0
+        elif any(domain in url for domain in CURRENT_NEWS_DOMAINS):
+            score = 0.95
+        elif any(domain in url for domain in MARKET_DATA_DOMAINS):
+            score = 0.85
+        elif plan.academic_enabled and any(domain in url for domain in ACADEMIC_DOMAINS):
+            score = 0.9
+        elif "MARKET_FINANCE" in plan.intents and any(
+            term in text for term in ("earnings", "revenue", "eps", "guidance", "consensus", "실적", "매출")
+        ):
+            score = 0.7
+        else:
+            score = 0.4
+        if score < 0.25:
+            continue
+        ranked.append({**result, "relevance_score": score})
+    ranked.sort(key=lambda result: float(result["relevance_score"]), reverse=True)
+    diversified: list[dict[str, object]] = []
+    host_counts: dict[str, int] = {}
+    for result in ranked:
+        host = urlparse(str(result.get("url", ""))).netloc.lower().removeprefix("www.")
+        if host_counts.get(host, 0) >= 2:
+            continue
+        host_counts[host] = host_counts.get(host, 0) + 1
+        diversified.append(result)
+        if len(diversified) == 24:
+            break
+    return diversified
 
 
 def _web_sources(search_output: str) -> ToolResult:

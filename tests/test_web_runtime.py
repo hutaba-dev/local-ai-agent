@@ -20,7 +20,16 @@ from runtime.image_client import (
     ImageQualityAssessment,
 )
 from runtime.projects import ProjectStore
-from runtime.tool_registry import ToolResult, _academic_evidence_gaps, _research_tools, _researcher_query, run_agent_tools
+from runtime.tool_registry import (
+    ToolResult,
+    _rank_relevant_web_results,
+    _source_queries,
+    _academic_evidence_gaps,
+    _research_tools,
+    _researcher_query,
+    research_source_plan,
+    run_agent_tools,
+)
 from runtime.web_search import fetch_sources, search, visual_search
 from web import app as web_app
 from web.auth import UserStore
@@ -108,7 +117,11 @@ class RedditResponse:
 class SourceResponse:
     headers = {"content-type": "text/html; charset=utf-8"}
     is_redirect = False
-    text = "<html><head><title>Ignored</title><script>secret()</script></head><body><h1>Evidence</h1><p>Verified source text.</p></body></html>"
+    text = (
+        "<html><head><title>Ignored</title><script>secret()</script></head><body><h1>Evidence</h1><p>"
+        + "Verified source text with substantive details for evidence review. " * 5
+        + "</p></body></html>"
+    )
 
     def raise_for_status(self) -> None:
         return None
@@ -170,6 +183,142 @@ class UnpaywallResponse:
 
 
 class WebRuntimeTests(unittest.TestCase):
+    def test_research_source_router_covers_market_academic_and_mixed_intents(self) -> None:
+        cases = {
+            "NVIDIA 오늘 실적 발표 몇 시고 시장 예상은 어때?": (
+                {"CURRENT_NEWS", "MARKET_FINANCE", "COMPANY_RESEARCH"}, False,
+            ),
+            "안호선 교수 연구자로서의 역량을 논문 기반으로 평가해줘": (
+                {"ACADEMIC_RESEARCH"}, True,
+            ),
+            "오늘 비트코인 시장 뉴스 정리해줘": (
+                {"CURRENT_NEWS", "MARKET_FINANCE"}, False,
+            ),
+            "AI가 주식시장에 미치는 영향에 대한 학술 논문을 조사해줘": (
+                {"ACADEMIC_RESEARCH"}, True,
+            ),
+            "TSMC 최신 실적과 향후 반도체 수요 전망": (
+                {"CURRENT_NEWS", "MARKET_FINANCE", "COMPANY_RESEARCH"}, False,
+            ),
+            "NVIDIA 실적과 AI bubble에 대한 학계 연구를 함께 비교해줘": (
+                {"MARKET_FINANCE", "COMPANY_RESEARCH", "ACADEMIC_RESEARCH", "MIXED"}, True,
+            ),
+        }
+        for query, (expected, academic_enabled) in cases.items():
+            with self.subTest(query=query):
+                plan = research_source_plan(query)
+                self.assertTrue(expected <= set(plan.intents))
+                self.assertEqual(plan.academic_enabled, academic_enabled)
+                if "CURRENT_NEWS" in expected:
+                    self.assertEqual(plan.freshness_priority, "VERY_HIGH")
+                if not academic_enabled:
+                    self.assertIn("Academic Intelligence — not relevant", plan.skipped_sources)
+
+    def test_current_market_research_forbids_academic_tools_and_fetches_pages(self) -> None:
+        queries = (
+            "NVIDIA 오늘 실적 발표 일정과 시장 전망, 컨센서스, 주가에 어떤 영향을 줄 것으로 보는지 조사해줘.",
+        )
+        search_result = ToolResult("web_search", True, json.dumps([{
+            "title": "NVIDIA Investor Relations",
+            "url": "https://investor.nvidia.com/events-and-presentations/",
+            "description": "Earnings and conference call",
+            "relevance_score": 1.0,
+        }]), None, 1)
+        fetched = ToolResult("web_sources", True, json.dumps([{
+            "title": "NVIDIA Investor Relations",
+            "url": "https://investor.nvidia.com/events-and-presentations/",
+            "text": "Conference call information",
+            "relevance_score": 1.0,
+        }]), None, 1)
+        with patch("runtime.tool_registry._web_search", return_value=search_result) as web, patch(
+            "runtime.tool_registry._web_sources", return_value=fetched
+        ) as fetch, patch("runtime.tool_registry._academic_papers") as papers, patch(
+            "runtime.tool_registry._academic_intelligence"
+        ) as intelligence, patch("runtime.tool_registry._semantic_scholar") as semantic:
+            results = _research_tools(queries, "DEEP_RESEARCH", False)
+
+        self.assertEqual([result.name for result in results], [
+            "research_source_plan", "web_search", "web_sources",
+        ])
+        web.assert_called_once()
+        fetch.assert_called_once_with(search_result.output)
+        papers.assert_not_called()
+        intelligence.assert_not_called()
+        semantic.assert_not_called()
+        routed_queries = web.call_args.args[0]
+        self.assertTrue(any("site:investor.nvidia.com" in query for query in routed_queries))
+        self.assertTrue(any("site:nvidianews.nvidia.com" in query for query in routed_queries))
+        self.assertTrue(any("site:sec.gov NVIDIA 8-K" in query for query in routed_queries))
+        self.assertTrue(any("site:reuters.com NVIDIA earnings" in query for query in routed_queries))
+        self.assertTrue(any("EPS revenue consensus guidance implied move" in query for query in routed_queries))
+
+    def test_market_followup_searches_only_gap_queries_under_original_intent_gate(self) -> None:
+        original = "NVIDIA 오늘 실적 발표와 시장 전망을 조사해줘"
+        plan = research_source_plan(original)
+
+        routed = _source_queries((original, "NVIDIA revenue consensus August 2026"), plan)
+
+        self.assertEqual(routed, ("NVIDIA revenue consensus August 2026",))
+        self.assertFalse(plan.academic_enabled)
+
+    def test_academic_and_mixed_research_enable_academic_tools_only_when_requested(self) -> None:
+        web = ToolResult("web_search", True, "[]", None, 1)
+        sources = ToolResult("web_sources", True, "[]", None, 1)
+        academic = ToolResult("academic_papers", True, "[]", None, 1)
+        with patch("runtime.tool_registry._web_search", return_value=web), patch(
+            "runtime.tool_registry._web_sources", return_value=sources
+        ), patch("runtime.tool_registry._academic_papers", return_value=academic) as papers, patch(
+            "runtime.tool_registry._academic_evidence_gaps", return_value=[]
+        ):
+            academic_results = _research_tools(
+                ("AI가 주식시장에 미치는 영향에 대한 학술 논문을 조사해줘",), "DEEP_RESEARCH", False
+            )
+            mixed_results = _research_tools(
+                ("NVIDIA 실적과 AI bubble에 대한 학계 연구를 함께 비교해줘",), "DEEP_RESEARCH", False
+            )
+
+        self.assertEqual(papers.call_count, 2)
+        self.assertIn("academic_papers", [result.name for result in academic_results])
+        self.assertIn("academic_papers", [result.name for result in mixed_results])
+        mixed_plan = json.loads(mixed_results[0].output)
+        self.assertIn("MIXED", mixed_plan["intents"])
+
+    def test_current_market_relevance_excludes_academic_results_and_prioritizes_primary_sources(self) -> None:
+        plan = research_source_plan("NVIDIA 오늘 실적 발표와 시장 전망을 조사해줘")
+        ranked = _rank_relevant_web_results([
+            {
+                "provider": "brave", "title": "AI stock indices using 10-K filings",
+                "url": "https://www.sciencedirect.com/science/article/example", "description": "NVIDIA AI paper",
+            },
+            {
+                "provider": "brave", "title": "NVIDIA earnings call",
+                "url": "https://investor.nvidia.com/events-and-presentations/", "description": "official event",
+            },
+            {
+                "provider": "brave", "title": "NVIDIA earnings preview",
+                "url": "https://www.reuters.com/technology/nvidia-preview", "description": "current consensus",
+            },
+        ], plan)
+
+        self.assertEqual([item["relevance_score"] for item in ranked], [1.0, 0.95])
+        self.assertFalse(any("sciencedirect" in str(item["url"]) for item in ranked))
+
+    def test_current_market_relevance_limits_one_domain_from_crowding_out_other_tiers(self) -> None:
+        plan = research_source_plan("NVIDIA 오늘 실적 발표와 시장 전망을 조사해줘")
+        results = [
+            {
+                "provider": "brave", "title": f"SEC filing {index}",
+                "url": f"https://www.sec.gov/Archives/filing-{index}.htm", "description": "earnings",
+            }
+            for index in range(5)
+        ] + [{
+            "provider": "brave", "title": "Reuters preview",
+            "url": "https://www.reuters.com/business/nvidia-preview", "description": "consensus",
+        }]
+        ranked = _rank_relevant_web_results(results, plan)
+
+        self.assertEqual(sum("sec.gov" in str(item["url"]) for item in ranked), 2)
+        self.assertTrue(any("reuters.com" in str(item["url"]) for item in ranked))
     def setUp(self) -> None:
         self.fake_client = FakeClient()
         self.runtime = AgentRuntime(client=self.fake_client)
@@ -1219,6 +1368,34 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertIn("truncated for context budget", critic_input)
         self.assertEqual(result.content, "bounded final revision")
 
+    def test_bounded_evidence_keeps_official_details_after_navigation_text(self) -> None:
+        package = {
+            "sources": [{
+                "title": "NVIDIA conference call",
+                "url": "https://nvidianews.nvidia.com/news/example",
+                "text": "Navigation " * 65 + "Official call: August 26 at 5 p.m. ET.",
+            }]
+        }
+
+        bounded = AgentRuntime._bounded_evidence_json(package)
+
+        self.assertIn("Official call: August 26 at 5 p.m. ET.", bounded)
+
+    def test_market_synthesis_includes_utc_and_kst_research_timestamp(self) -> None:
+        client = FakeClient()
+        runtime = AgentRuntime(client=client)
+        question = "NVIDIA 오늘 실적 발표와 시장 전망을 조사해줘"
+
+        runtime._synthesize_research(
+            question, [], "system", LatencyRecorder(), source_plan=research_source_plan(question)
+        )
+
+        analyst_input = client.requests[0]["json"]["messages"][1]["content"]
+        self.assertIn('"research_as_of"', analyst_input)
+        self.assertIn('"utc"', analyst_input)
+        self.assertIn('"kst"', analyst_input)
+        self.assertIn("+09:00", analyst_input)
+
     def test_direct_research_selection_still_classifies_deep_research(self) -> None:
         class DirectResearchClient(FakeClient):
             def post(self, url: str, json: dict[str, object]) -> FakeResponse:
@@ -1285,7 +1462,10 @@ class WebRuntimeTests(unittest.TestCase):
             result = runtime.chat("안호선 교수의 연구 역량을 평가해줘", "auto")
 
         self.assertEqual(run_tools.call_count, 2)
-        self.assertEqual(run_tools.call_args_list[1].args[1], ("second query",))
+        self.assertEqual(
+            run_tools.call_args_list[1].args[1],
+            ("안호선 교수의 연구 역량을 평가해줘", "second query"),
+        )
         self.assertEqual(len(result.research["rounds"]), 2)
         self.assertFalse(result.research["rounds"][0]["ready_to_answer"])
         self.assertTrue(result.research["final_synthesis_executed"])
@@ -1463,8 +1643,36 @@ class WebRuntimeTests(unittest.TestCase):
             sources = fetch_sources(results)
 
         self.assertEqual(sources[0]["url"], "https://example.com/paper")
-        self.assertIn("Verified source text.", sources[0]["text"])
+        self.assertIn("Verified source text with substantive details", sources[0]["text"])
         self.assertNotIn("secret", sources[0]["text"])
+
+    def test_deep_research_rejects_insufficient_page_text(self) -> None:
+        results = [{"title": "Thin page", "url": "https://example.com/thin", "description": "Snippet"}]
+        response = SourceResponse()
+        response.text = "<html><body>Brief navigation shell.</body></html>"
+        with patch("runtime.web_search.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), patch(
+            "runtime.web_search.httpx.get", return_value=response
+        ):
+            sources, metrics = fetch_sources(results, include_metrics=True)
+
+        self.assertEqual(sources, [])
+        self.assertEqual(metrics[0]["failure_reason"], "insufficient_extracted_text")
+
+    def test_deep_research_reads_body_after_large_page_head(self) -> None:
+        results = [{"title": "Official newsroom", "url": "https://example.com/news", "description": "Snippet"}]
+        response = SourceResponse()
+        response.text = (
+            "<html><head><script>" + "ignored metadata " * 2_000 + "</script></head><body><article>"
+            + "Official earnings date, conference call time, revenue, and guidance details. " * 5
+            + "</article></body></html>"
+        )
+        with patch("runtime.web_search.socket.getaddrinfo", return_value=[(2, 1, 6, "", ("93.184.216.34", 0))]), patch(
+            "runtime.web_search.httpx.get", return_value=response
+        ):
+            sources = fetch_sources(results)
+
+        self.assertIn("Official earnings date", sources[0]["text"])
+        self.assertNotIn("ignored metadata", sources[0]["text"])
 
     def test_source_fetch_rejects_private_network_urls(self) -> None:
         results = [{"title": "Private", "url": "https://127.0.0.1/private", "description": ""}]
