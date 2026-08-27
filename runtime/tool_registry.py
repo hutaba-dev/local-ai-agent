@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from datetime import datetime, timezone
@@ -16,6 +17,7 @@ import httpx
 
 from runtime.project_tools import ProjectTools
 from runtime.academic_intelligence import academic_intelligence, academic_source_status
+from runtime.mcp_host import call_mcp_tool, mcp_tool_catalog, mcp_tool_enabled
 from runtime.search_providers import SearchRequest, SearchRouter
 from runtime.web_search import academic_papers, search_many, semantic_scholar_evidence, unpaywall_oa_locations
 
@@ -162,6 +164,10 @@ def research_tool_catalog() -> list[dict[str, object]]:
     academic_status = academic_source_status()
     catalog: list[dict[str, object]] = []
     for name, description in RESEARCH_TOOL_DESCRIPTIONS.items():
+        if name in {"searxng", "serper", "brave"} and mcp_tool_enabled("search_web"):
+            continue
+        if name == "secure_page_fetch" and mcp_tool_enabled("fetch_page"):
+            continue
         available = True
         if name in router.providers:
             available = router.providers[name].configured()
@@ -169,6 +175,21 @@ def research_tool_catalog() -> list[dict[str, object]]:
         if status is not None:
             available = status != "UNAVAILABLE"
         catalog.append({"name": name, "available": available, "status": status or ("AVAILABLE" if available else "UNAVAILABLE"), **description})
+    if mcp_tool_enabled("search_web") or mcp_tool_enabled("fetch_page"):
+        for tool in mcp_tool_catalog():
+            if not mcp_tool_enabled(str(tool["name"])):
+                continue
+            catalog.append({
+                "name": tool["name"],
+                "description": tool["description"],
+                "server": tool["server"],
+                "cost": tool["cost"],
+                "permission": tool["permission"],
+                "available": tool["available"],
+                "status": tool["health"],
+                "action": "FETCH_PAGE" if tool["name"] == "fetch_page" else "SEARCH_WEB",
+                "freshness": "current public page" if tool["name"] == "fetch_page" else "current web/news discovery",
+            })
     return catalog
 
 
@@ -179,10 +200,20 @@ def execute_research_action(
     prior_tools: tuple[dict[str, object], ...] = (),
     search_category: str = "web",
     freshness: str = "normal",
+    urls: tuple[str, ...] = (),
 ) -> list[dict[str, object]]:
     if action == "SEARCH_WEB":
-        return [asdict(_web_search_provider(queries, provider, search_category, freshness))]
+        if mcp_tool_enabled("search_web"):
+            return [_mcp_web_search(queries, provider, search_category, freshness)]
+        return [asdict(_direct_web_search(queries, provider, search_category, freshness))]
     if action == "FETCH_PAGE":
+        if mcp_tool_enabled("fetch_page"):
+            return [_mcp_fetch_pages(urls)]
+        if urls:
+            return [asdict(_web_sources(json.dumps([
+                {"title": urlparse(url).hostname or "Selected source", "url": url}
+                for url in urls[:3]
+            ])))]
         search_tool = next(
             (tool for tool in reversed(prior_tools) if tool.get("name") == "web_search" and tool.get("success")),
             None,
@@ -195,6 +226,122 @@ def execute_research_action(
     if action == "LOOKUP_AUTHOR":
         return [asdict(_academic_intelligence("\n".join(queries)))]
     raise ValueError(f"unsupported research action: {action}")
+
+
+def _mcp_call_details(outcome: object) -> dict[str, object]:
+    return {
+        "tool": getattr(outcome, "tool", ""),
+        "server": getattr(outcome, "server", ""),
+        "status": getattr(outcome, "status", "ERROR"),
+        "duration_ms": getattr(outcome, "duration_ms", 0),
+        "executed": getattr(outcome, "executed", False),
+    }
+
+
+def _direct_fallback_enabled() -> bool:
+    return os.getenv("MCP_DIRECT_FALLBACK_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _direct_web_search(
+    queries: tuple[str, ...], provider: str, category: str, freshness: str
+) -> ToolResult:
+    if provider != "auto":
+        return _web_search_provider(queries, provider, category, freshness)
+    started = perf_counter()
+    try:
+        context = {
+            "intents": ["CURRENT_NEWS"] if category == "news" else [],
+            "freshness": "VERY_HIGH" if freshness == "high" else freshness,
+        }
+        results, metrics = search_many(queries, "DEEP_RESEARCH", context, include_metrics=True)
+        duration_ms = round((perf_counter() - started) * 1000)
+        return ToolResult(
+            "web_search", True, json.dumps(results, ensure_ascii=False), None, duration_ms,
+            {"execution": "conditional_fallback", "provider": "auto", **metrics},
+        )
+    except (RuntimeError, httpx.HTTPError) as error:
+        return ToolResult(
+            "web_search", False, "", str(error), round((perf_counter() - started) * 1000),
+            {"execution": "conditional_fallback", "provider": "auto"},
+        )
+
+
+def _mcp_web_search(
+    queries: tuple[str, ...], provider: str, category: str, freshness: str
+) -> dict[str, object]:
+    started = perf_counter()
+    results: list[dict[str, object]] = []
+    calls: list[dict[str, object]] = []
+    seen_urls: set[str] = set()
+    tool_name = "search_news" if category == "news" else "search_web"
+    for query in queries[:4]:
+        outcome = call_mcp_tool(tool_name, {
+            "query": query,
+            "max_results": 8,
+            "freshness": "high" if freshness == "high" else "normal",
+            "provider_hint": provider or "auto",
+        })
+        calls.append(_mcp_call_details(outcome))
+        if not outcome.success:
+            if not outcome.executed and not results and _direct_fallback_enabled():
+                fallback = _direct_web_search(queries, provider or "auto", category, freshness)
+                details = dict(fallback.details or {})
+                details.update({"mcp_fallback": "direct_adapter", "mcp_calls": calls})
+                return asdict(ToolResult(
+                    fallback.name, fallback.success, fallback.output, fallback.error,
+                    fallback.duration_ms, details,
+                ))
+            continue
+        output = outcome.output or {}
+        for result in output.get("results", []):
+            if not isinstance(result, dict):
+                continue
+            url = str(result.get("url", ""))
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                results.append(result)
+    duration_ms = round((perf_counter() - started) * 1000)
+    return asdict(ToolResult(
+        "web_search", bool(results), json.dumps(results[:24], ensure_ascii=False),
+        None if results else "MCP search returned no usable results", duration_ms,
+        {"execution": "mcp", "transport": "in_process", "mcp_calls": calls},
+    ))
+
+
+def _mcp_fetch_pages(urls: tuple[str, ...]) -> dict[str, object]:
+    started = perf_counter()
+    sources: list[dict[str, object]] = []
+    calls: list[dict[str, object]] = []
+    for url in tuple(dict.fromkeys(urls))[:3]:
+        outcome = call_mcp_tool("fetch_page", {"url": url, "extract_mode": "article"})
+        calls.append(_mcp_call_details(outcome))
+        if not outcome.success:
+            if not outcome.executed and not sources and _direct_fallback_enabled():
+                fallback = _web_sources(json.dumps([
+                    {"title": urlparse(item).hostname or "Selected source", "url": item}
+                    for item in urls[:3]
+                ]))
+                details = dict(fallback.details or {})
+                details.update({"mcp_fallback": "direct_adapter", "mcp_calls": calls})
+                return asdict(ToolResult(
+                    fallback.name, fallback.success, fallback.output, fallback.error,
+                    fallback.duration_ms, details,
+                ))
+            continue
+        output = outcome.output or {}
+        sources.append({
+            "title": output.get("title", "Selected source"),
+            "url": output.get("url", url),
+            "text": output.get("text", ""),
+            "published_date": output.get("published_at"),
+            "relevance_score": 0.8,
+        })
+    duration_ms = round((perf_counter() - started) * 1000)
+    return asdict(ToolResult(
+        "web_sources", bool(sources), json.dumps(sources, ensure_ascii=False),
+        None if sources else "MCP fetch returned no usable pages", duration_ms,
+        {"execution": "mcp", "transport": "in_process", "mcp_calls": calls},
+    ))
 
 
 def research_source_plan(query: str | tuple[str, ...]) -> ResearchSourcePlan:

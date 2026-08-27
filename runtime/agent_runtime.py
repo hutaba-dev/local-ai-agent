@@ -113,6 +113,7 @@ class ResearchDecision:
     freshness_importance: str = "normal"
     primary_source_importance: str = "normal"
     scholarly_evidence_value: str = "low"
+    urls: tuple[str, ...] = ()
 
 
 T = TypeVar("T")
@@ -344,6 +345,7 @@ class AgentRuntime:
                 "decision": decision.next_action,
                 "decision_summary": decision.decision_summary,
                 "queries": list(action_queries),
+                "urls": list(decision.urls),
                 "provider": decision.provider,
                 "unresolved": list(decision.unresolved_questions),
                 "ready_to_answer": decision.ready_to_answer,
@@ -400,7 +402,7 @@ class AgentRuntime:
                 round_activity.append(activity)
                 continue
             action_key = json.dumps(
-                [decision.next_action, decision.provider, action_queries], ensure_ascii=False
+                [decision.next_action, decision.provider, action_queries, decision.urls], ensure_ascii=False
             ).casefold()
             if action_key in executed_actions:
                 activity["decision_summary"] = "Duplicate action suppressed; choose a different action or finalize."
@@ -436,6 +438,7 @@ class AgentRuntime:
                         tuple(all_tools),
                         decision.search_category,
                         decision.freshness_importance,
+                        decision.urls,
                     ),
                 )
             tool_calls += 1
@@ -575,7 +578,9 @@ class AgentRuntime:
             "You are the Research Planner and Orchestrator. Choose the single best NEXT ACTION from the current state. "
             "The executor, not a keyword classifier, will run it and return the observation to you. Available actions are "
             "SEARCH_WEB, FETCH_PAGE, SEARCH_ACADEMIC, LOOKUP_AUTHOR, SEARCH_DOCUMENT, COMPARE_EVIDENCE, ANALYZE, CALCULATE, and FINAL_ANSWER. "
-            "For SEARCH_WEB select exactly one available provider and 1 to 4 focused queries. Use the least expensive tool likely "
+            "For SEARCH_WEB choose web or news search and 1 to 4 focused queries. Use provider=auto unless a specific provider has a "
+            "material advantage; the Search Router handles health, cost, and fallback. For FETCH_PAGE select 1 to 3 public HTTPS URLs "
+            "from prior search observations and return them in urls. Use the least expensive tool likely "
             "to obtain sufficient evidence, but do not sacrifice materially important quality. Before any specialized source, ask "
             "whether it can materially reduce uncertainty about the actual question. Do not call scholarly databases merely because "
             "the topic mentions AI, technology, a company, or research-adjacent language; use them when scholarly evidence itself matters. "
@@ -588,7 +593,7 @@ class AgentRuntime:
             "question, and important gaps can be honestly disclosed. If you say more search or checking is needed, choose the corresponding "
             "tool action instead of FINAL_ANSWER. Intent labels, if present elsewhere, are metadata hints and never constraints. "
             "Return exactly one JSON object with no prose: "
-            '{"next_action":"...","queries":[],"provider":"","search_category":"web|news",'
+            '{"next_action":"...","queries":[],"urls":[],"provider":"auto|searxng|serper|brave|","search_category":"web|news",'
             '"unresolved_questions":[],"decision_summary":"brief observable rationale",'
             '"ready_to_answer":false,"complexity":"SIMPLE|MODERATE|COMPLEX","use_critic":false,'
             '"freshness_importance":"low|normal|high","primary_source_importance":"low|normal|high",'
@@ -647,12 +652,15 @@ class AgentRuntime:
             return tuple(item.strip()[:500] for item in raw[:limit] if isinstance(item, str) and item.strip())
 
         provider = value.get("provider")
-        provider = provider if isinstance(provider, str) and provider in {"searxng", "serper", "brave"} else ""
+        provider = provider if isinstance(provider, str) and provider in {"auto", "searxng", "serper", "brave"} else ""
         queries = strings("queries", 4)
+        urls = strings("urls", 3)
         if action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT"} and not queries:
             raise ValueError("tool action requires at least one query")
         if action == "SEARCH_WEB" and not provider:
-            raise ValueError("web search action requires an explicit provider")
+            provider = "auto"
+        if action == "FETCH_PAGE" and not urls:
+            raise ValueError("page fetch action requires at least one URL")
         ready = value.get("ready_to_answer") is True
         unresolved = strings("unresolved_questions", 8)
         if action == "FINAL_ANSWER" and (not ready or unresolved):
@@ -674,6 +682,7 @@ class AgentRuntime:
             freshness if freshness in importance_values else "normal",
             primary if primary in importance_values else "normal",
             scholarly if scholarly in importance_values else "low",
+            urls,
         )
 
     def _resolve_researcher_identity_query(

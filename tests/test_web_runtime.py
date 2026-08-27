@@ -1371,7 +1371,7 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(result.route.agent, "research")
         self.assertEqual(result.route.search_mode, "DEEP_RESEARCH")
         run_tools.assert_called_once_with(
-            "SEARCH_ACADEMIC", ("liquefied hydrogen storage papers 2024 2026",), "searxng", (), "web", "normal"
+            "SEARCH_ACADEMIC", ("liquefied hydrogen storage papers 2024 2026",), "searxng", (), "web", "normal", ()
         )
 
     def test_deep_research_uses_evidence_analyst_critic_and_revision_passes(self) -> None:
@@ -1655,7 +1655,7 @@ class WebRuntimeTests(unittest.TestCase):
         with patch("runtime.agent_runtime.execute_research_action", return_value=observation) as execute:
             result = runtime.chat("Nvidia 최근 이슈 정리", "auto")
 
-        execute.assert_called_once_with("SEARCH_WEB", ("NVIDIA recent issues",), "searxng", (), "web", "normal")
+        execute.assert_called_once_with("SEARCH_WEB", ("NVIDIA recent issues",), "searxng", (), "web", "normal", ())
         self.assertEqual(result.content, "현재 근거에 따른 최종 답변")
         self.assertEqual([step["decision"] for step in result.research["rounds"]], [
             "FINAL_ANSWER", "SEARCH_WEB", "FINAL_ANSWER",
