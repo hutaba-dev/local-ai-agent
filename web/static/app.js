@@ -358,9 +358,12 @@ function activityElement(activity) {
         `merged corpus: ${escapeHtml(String(academic.merged_verified_corpus ?? 0))}; ` +
         `representative papers: ${escapeHtml(String(academic.representative_papers ?? 0))}`
       : "";
-    return `<div>Round ${escapeHtml(String(round.round))}: ${escapeHtml((round.queries || []).join(" | "))}<br>` +
+    return `<div>Step ${escapeHtml(String(round.round))}: ${escapeHtml(round.decision || "UNKNOWN")} ` +
+      `${round.provider ? `via ${escapeHtml(round.provider)} ` : ""}<br>` +
+      `${escapeHtml(round.decision_summary || "")}` +
+      `${(round.queries || []).length ? `<br>Queries: ${escapeHtml(round.queries.join(" | "))}` : ""}<br>` +
       `Tools: ${escapeHtml((round.tools || []).join(", ") || "none")}; sources: ${escapeHtml(String(round.sources_fetched ?? 0))}; ` +
-      `entity: ${escapeHtml(round.entity_confidence || "UNKNOWN")}; gap: ${round.ready_to_answer ? "ready" : "follow-up"}${academicDetail}</div>`;
+      `status: ${round.ready_to_answer ? "ready" : "continue"}; complexity: ${escapeHtml(round.complexity || "N/A")}${academicDetail}</div>`;
   }).join("") || "N/A";
   const llmCalls = (activity.llm_calls || []).map((call) => (
     `<div>#${escapeHtml(String(call.call_id))} ${escapeHtml(call.purpose)}: ${formatMs(call.total_llm_latency_ms)}${call.decode_tokens_per_second ? `, ${escapeHtml(String(call.decode_tokens_per_second))} tok/s decode` : ""}</div>`
@@ -376,11 +379,10 @@ function activityElement(activity) {
     ["Final synthesis TTFT", formatMs(finalCall.ttft_ms)], ["Final synthesis decode", formatMs(finalCall.generation_time_ms)],
     ["Final synthesis decode speed", finalCall.decode_tokens_per_second ? `${finalCall.decode_tokens_per_second} tok/s` : "N/A"],
     ["Research mode", research.mode || "N/A"], ["Research state", research.state || "N/A"],
-    ["Research Intent", (sourcePlan.intents || []).join(" + ") || "N/A"],
-    ["Freshness", sourcePlan.freshness_priority || "N/A"],
-    ["Selected Sources", (sourcePlan.selected_sources || []).join("; ") || "N/A"],
-    ["Skipped Sources", (sourcePlan.skipped_sources || []).join("; ") || "none"],
-    ["Required Evidence", (sourcePlan.required_evidence || []).join("; ") || "N/A"],
+    ["Intent metadata", (sourcePlan.intents || []).join(" + ") || "N/A"],
+    ["Metadata role", sourcePlan.role || "N/A"],
+    ["Tool budget", `${research.tool_calls || 0} / ${research.max_tool_calls || 0}`],
+    ["Search budget", `${research.search_calls || 0} / ${research.max_search_calls || 0}`],
     ["Search queries", `${search.initial_queries || 0} initial; ${search.followup_queries || 0} follow-up`],
     ["Search providers", searchProviders || "N/A"],
     ["Search cache", `${search.cache_hits || 0} hits; ${search.cache_misses || 0} misses`],
@@ -388,7 +390,7 @@ function activityElement(activity) {
     ["Analysis pipeline", (research.analysis_pipeline || []).join(" → ") || "N/A"],
     ["Claim taxonomy", (research.claim_taxonomy || []).join(" / ") || "N/A"],
     ["State history", (research.state_history || []).join(" → ") || "N/A"],
-    ["Research rounds", activity.research_rounds || "N/A"], ["Round detail", researchRounds],
+    ["Research steps", activity.research_rounds || "N/A"], ["Decision detail", researchRounds],
     ["Entity confidence", research.entity_confidence || "N/A"], ["Gap status", research.gap_status || "N/A"],
     ["Final synthesis executed", research.final_synthesis_executed ? "YES" : "NO"],
     ["Termination", research.termination_reason || "N/A"],

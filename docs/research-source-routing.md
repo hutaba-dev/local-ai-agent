@@ -1,4 +1,9 @@
-# Deep Research Source Routing
+# Deep Research Source Routing (Historical)
+
+> Superseded by [LLM Research Orchestration](llm-research-orchestration.md).
+> The classifiers and source-plan fields below remain only as compatibility
+> and telemetry metadata. They no longer select, enable, disable, or sequence
+> Research Agent tools.
 
 ## Purpose
 

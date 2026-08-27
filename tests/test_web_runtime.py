@@ -1195,18 +1195,14 @@ class WebRuntimeTests(unittest.TestCase):
         web_app.runtime = self.runtime
         try:
             guest = self.authenticated_client("test-guest")
-            with patch("runtime.agent_runtime.run_agent_tools", return_value=[]) as run_tools:
+            with patch("runtime.agent_runtime.execute_research_action", return_value=[]) as run_tools:
                 response = guest.post("/api/chat", json={"message": "수소 연구를 요약해줘", "selected_agent": "research"})
         finally:
             web_app.runtime = previous_runtime
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(run_tools.call_count, 2)
-        self.assertEqual(
-            run_tools.call_args_list[0].args,
-            ("research", ("수소 연구를 요약해줘",), "DEEP_RESEARCH", False),
-        )
-        self.assertTrue(all(call.args[-1] is False for call in run_tools.call_args_list))
+        self.assertEqual(run_tools.call_count, 1)
+        self.assertEqual(run_tools.call_args.args[:3], ("SEARCH_WEB", ("수소 연구를 요약해줘",), "searxng"))
         self.assertEqual(run_agent_tools("research", "수소 연구를 요약해줘", allow_local_tools=False), [])
 
     def test_admin_browser_research_has_no_local_project_tools(self) -> None:
@@ -1214,18 +1210,14 @@ class WebRuntimeTests(unittest.TestCase):
         web_app.runtime = self.runtime
         try:
             admin = self.authenticated_client()
-            with patch("runtime.agent_runtime.run_agent_tools", return_value=[]) as run_tools:
+            with patch("runtime.agent_runtime.execute_research_action", return_value=[]) as run_tools:
                 response = admin.post("/api/chat", json={"message": "수소 연구를 요약해줘", "selected_agent": "research"})
         finally:
             web_app.runtime = previous_runtime
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(run_tools.call_count, 2)
-        self.assertEqual(
-            run_tools.call_args_list[0].args,
-            ("research", ("수소 연구를 요약해줘",), "DEEP_RESEARCH", False),
-        )
-        self.assertTrue(all(call.args[-1] is False for call in run_tools.call_args_list))
+        self.assertEqual(run_tools.call_count, 1)
+        self.assertEqual(run_tools.call_args.args[:3], ("SEARCH_WEB", ("수소 연구를 요약해줘",), "searxng"))
 
     def test_guest_legacy_session_is_replaced_before_history_is_used(self) -> None:
         old_session = self.runtime.new_session()
@@ -1255,9 +1247,8 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(result.route.search_mode, "QUICK_SEARCH")
         self.assertEqual(result.tools[-1]["name"], "web_search")
         self.assertFalse(result.tools[-1]["success"])
-        self.assertIn("searxng=UNCONFIGURED", result.tools[-1]["error"])
-        self.assertIn("serper=UNCONFIGURED", result.tools[-1]["error"])
-        self.assertIn("brave=UNCONFIGURED", result.tools[-1]["error"])
+        self.assertIn("search provider unavailable: searxng", result.tools[-1]["error"])
+        self.assertEqual(result.research["rounds"][0]["provider"], "searxng")
 
     def test_model_search_decision_controls_search_mode(self) -> None:
         client = SearchDecisionClient()
@@ -1275,11 +1266,32 @@ class WebRuntimeTests(unittest.TestCase):
             {"role": "user", "content": "현재 repository 구조를 실제로 확인해줘"},
         )
 
+    def test_search_mode_prompt_requires_external_premises_for_real_world_impact_analysis(self) -> None:
+        client = SearchDecisionClient()
+        runtime = AgentRuntime(client=client)
+
+        runtime._search_decision("A사의 실적이 B산업에 미칠 영향을 분석해줘")
+
+        planner_prompt = client.requests[0]["json"]["messages"][0]["content"]
+        self.assertIn("materially depend on external facts", planner_prompt)
+        self.assertIn("impact analysis", planner_prompt)
+        self.assertIn("Do not confuse permission to reason", planner_prompt)
+        self.assertIn("Current UTC date", planner_prompt)
+
     def test_model_deep_research_decision_runs_search_with_model_query(self) -> None:
         class DeepResearchDecisionClient(FakeClient):
             def post(self, url: str, json: dict[str, object]) -> FakeResponse:
                 self.requests.append({"url": url, "json": json})
-                content = '{"search_mode":"DEEP_RESEARCH","queries":["liquefied hydrogen storage papers 2024 2026","liquefied hydrogen storage review"],"focus":["recent papers","reviews"]}' if len(self.requests) == 1 else "web-verified answer"
+                responses = (
+                    '{"search_mode":"DEEP_RESEARCH","queries":["liquefied hydrogen storage papers 2024 2026","liquefied hydrogen storage review"],"focus":["recent papers","reviews"]}',
+                    '{"next_action":"SEARCH_ACADEMIC","queries":["liquefied hydrogen storage papers 2024 2026"],'
+                    '"provider":"","unresolved_questions":["recent papers"],"decision_summary":"Find scholarly evidence",'
+                    '"ready_to_answer":false,"complexity":"MODERATE","use_critic":false}',
+                    '{"next_action":"FINAL_ANSWER","queries":[],"provider":"","unresolved_questions":[],'
+                    '"decision_summary":"Evidence sufficient","ready_to_answer":true,"complexity":"MODERATE","use_critic":false}',
+                    "web-verified answer",
+                )
+                content = responses[len(self.requests) - 1]
                 response = FakeResponse()
                 response.json = lambda: {  # type: ignore[method-assign]
                     "choices": [{"message": {"content": content}}],
@@ -1289,20 +1301,13 @@ class WebRuntimeTests(unittest.TestCase):
 
         runtime = AgentRuntime(client=DeepResearchDecisionClient())
         message = "수소 액화 저장 관련 최근 2년간 논문, 세미나, 보고서를 검색해줘"
-        with patch("runtime.agent_runtime.run_agent_tools", return_value=[]) as run_tools:
+        with patch("runtime.agent_runtime.execute_research_action", return_value=[]) as run_tools:
             result = runtime.chat(message, "auto")
 
         self.assertEqual(result.route.agent, "research")
         self.assertEqual(result.route.search_mode, "DEEP_RESEARCH")
-        self.assertEqual(run_tools.call_count, 2)
-        self.assertEqual(
-            run_tools.call_args_list[0].args,
-            (
-                "research",
-                (message, "liquefied hydrogen storage papers 2024 2026", "liquefied hydrogen storage review"),
-                "DEEP_RESEARCH",
-                True,
-            ),
+        run_tools.assert_called_once_with(
+            "SEARCH_ACADEMIC", ("liquefied hydrogen storage papers 2024 2026",), "searxng", (), "web", "normal"
         )
 
     def test_deep_research_uses_evidence_analyst_critic_and_revision_passes(self) -> None:
@@ -1544,21 +1549,56 @@ class WebRuntimeTests(unittest.TestCase):
                 return response
 
         runtime = AgentRuntime(client=FollowupClient())
-        with patch("runtime.agent_runtime.run_agent_tools", return_value=[]) as run_tools:
+        with patch("runtime.agent_runtime.execute_research_action", return_value=[]) as run_tools:
             result = runtime.chat("안호선 교수의 연구 역량을 평가해줘", "auto")
 
-        self.assertEqual(run_tools.call_count, 2)
+        self.assertEqual(run_tools.call_count, 1)
         self.assertEqual(
-            run_tools.call_args_list[1].args[1],
-            ("안호선 교수의 연구 역량을 평가해줘", "second query"),
+            run_tools.call_args.args[1],
+            ("second query",),
         )
         self.assertEqual(len(result.research["rounds"]), 2)
         self.assertFalse(result.research["rounds"][0]["ready_to_answer"])
         self.assertTrue(result.research["final_synthesis_executed"])
         self.assertEqual(result.research["state_history"][0], "PLANNING")
-        self.assertIn("FOLLOWUP", result.research["state_history"])
+        self.assertIn("SEARCHING", result.research["state_history"])
         self.assertEqual(result.research["state_history"][-2:], ["SYNTHESIZING", "COMPLETE"])
         self.assertEqual(result.content, "최종 평가")
+
+    def test_premature_final_decision_continues_with_requested_tool_action(self) -> None:
+        class NextActionClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                responses = (
+                    '{"search_mode":"DEEP_RESEARCH","queries":["NVIDIA recent issues"]}',
+                    '{"next_action":"FINAL_ANSWER","queries":[],"provider":"",'
+                    '"unresolved_questions":["current developments"],"decision_summary":"More search is needed",'
+                    '"ready_to_answer":false,"complexity":"SIMPLE","use_critic":false}',
+                    '{"next_action":"SEARCH_WEB","queries":["NVIDIA recent issues"],"provider":"searxng",'
+                    '"unresolved_questions":["current developments"],"decision_summary":"Find current evidence",'
+                    '"ready_to_answer":false,"complexity":"SIMPLE","use_critic":false}',
+                    '{"next_action":"FINAL_ANSWER","queries":[],"provider":"",'
+                    '"unresolved_questions":[],"decision_summary":"Evidence is sufficient",'
+                    '"ready_to_answer":true,"complexity":"SIMPLE","use_critic":false}',
+                    "현재 근거에 따른 최종 답변",
+                )
+                response = FakeResponse()
+                response.json = lambda: {"choices": [{"message": {"content": responses[len(self.requests) - 1]}}], "usage": {}}  # type: ignore[method-assign]
+                return response
+
+        runtime = AgentRuntime(client=NextActionClient())
+        observation = [{"name": "web_search", "success": True, "output": "[]", "error": None}]
+        with patch("runtime.agent_runtime.execute_research_action", return_value=observation) as execute:
+            result = runtime.chat("Nvidia 최근 이슈 정리", "auto")
+
+        execute.assert_called_once_with("SEARCH_WEB", ("NVIDIA recent issues",), "searxng", (), "web", "normal")
+        self.assertEqual(result.content, "현재 근거에 따른 최종 답변")
+        self.assertEqual([step["decision"] for step in result.research["rounds"]], [
+            "FINAL_ANSWER", "SEARCH_WEB", "FINAL_ANSWER",
+        ])
+        self.assertFalse(result.research["rounds"][0]["ready_to_answer"])
+        self.assertEqual(result.research["termination_reason"], "llm_evidence_sufficient")
+        self.assertEqual(result.llm_calls[-1]["purpose"], "direct_research_synthesis")
 
     def test_invalid_gap_output_triggers_followup_instead_of_early_completion(self) -> None:
         class InvalidGapClient(FakeClient):
@@ -1576,11 +1616,11 @@ class WebRuntimeTests(unittest.TestCase):
                 return response
 
         runtime = AgentRuntime(client=InvalidGapClient())
-        with patch("runtime.agent_runtime.run_agent_tools", return_value=[]) as run_tools:
+        with patch("runtime.agent_runtime.execute_research_action", return_value=[]) as run_tools:
             result = runtime.chat("안호선 교수의 연구 역량을 평가해줘", "research")
 
-        self.assertEqual(run_tools.call_count, 2)
-        self.assertEqual(result.research["rounds"][0]["entity_confidence"], "UNRESOLVED")
+        self.assertEqual(run_tools.call_count, 1)
+        self.assertEqual(result.research["rounds"][0]["decision"], "SEARCH_WEB")
         self.assertFalse(result.research["rounds"][0]["ready_to_answer"])
         self.assertEqual(result.research["state"], "COMPLETE")
         self.assertTrue(result.research["final_synthesis_executed"])
@@ -1594,6 +1634,11 @@ class WebRuntimeTests(unittest.TestCase):
                     '{"missing":[],"uncertain":[],"next_queries":[],"next_tools":[],"ready_to_answer":true,"entity_confidence":"HIGH"}',
                     "analyst", "critic",
                     "I'll investigate this. Let me search more specifically.",
+                    '{"next_action":"SEARCH_WEB","queries":["specific evidence"],"provider":"searxng",'
+                    '"unresolved_questions":["specific evidence"],"decision_summary":"Run the needed search",'
+                    '"ready_to_answer":false,"complexity":"SIMPLE","use_critic":false}',
+                    '{"next_action":"FINAL_ANSWER","queries":[],"provider":"","unresolved_questions":[],'
+                    '"decision_summary":"Evidence sufficient","ready_to_answer":true,"complexity":"SIMPLE","use_critic":false}',
                     "## 결론\n검증된 근거에 따른 최종 답변입니다.",
                 )
                 response = FakeResponse()
@@ -1601,14 +1646,15 @@ class WebRuntimeTests(unittest.TestCase):
                 return response
 
         runtime = AgentRuntime(client=ProgressClient())
-        with patch("runtime.agent_runtime.run_agent_tools", return_value=[]):
+        with patch("runtime.agent_runtime.execute_research_action", return_value=[]) as execute:
             result = runtime.chat("근거를 찾아 평가해줘", "auto")
 
         self.assertNotIn("I'll investigate", result.content)
-        self.assertEqual(result.llm_calls[-1]["purpose"], "final_synthesis_retry")
+        execute.assert_called_once()
+        self.assertEqual(result.llm_calls[-1]["purpose"], "direct_research_synthesis")
         self.assertTrue(result.research["final_synthesis_executed"])
 
-    def test_repeated_research_progress_output_fails_instead_of_completing(self) -> None:
+    def test_repeated_research_progress_output_requires_another_action(self) -> None:
         class RepeatedProgressClient(FakeClient):
             def post(self, url: str, json: dict[str, object]) -> FakeResponse:
                 self.requests.append({"url": url, "json": json})
@@ -1618,16 +1664,29 @@ class WebRuntimeTests(unittest.TestCase):
                     '"ready_to_answer":true,"entity_confidence":"HIGH"}',
                     "analyst", "critic",
                     "I'll investigate this. Let me search more specifically.",
+                    '{"next_action":"SEARCH_WEB","queries":["another source"],"provider":"searxng",'
+                    '"unresolved_questions":["another source"],"decision_summary":"Search another source",'
+                    '"ready_to_answer":false,"complexity":"SIMPLE","use_critic":false}',
+                    '{"next_action":"FINAL_ANSWER","queries":[],"provider":"","unresolved_questions":[],'
+                    '"decision_summary":"Ready","ready_to_answer":true,"complexity":"SIMPLE","use_critic":false}',
                     "I need more information. I'll check another source.",
+                    '{"next_action":"SEARCH_WEB","queries":["last verification"],"provider":"serper",'
+                    '"unresolved_questions":["last verification"],"decision_summary":"Perform last verification",'
+                    '"ready_to_answer":false,"complexity":"SIMPLE","use_critic":false}',
+                    '{"next_action":"FINAL_ANSWER","queries":[],"provider":"","unresolved_questions":[],'
+                    '"decision_summary":"Ready","ready_to_answer":true,"complexity":"SIMPLE","use_critic":false}',
+                    "완료된 최종 답변",
                 )
                 response = FakeResponse()
                 response.json = lambda: {"choices": [{"message": {"content": responses[len(self.requests) - 1]}}], "usage": {}}  # type: ignore[method-assign]
                 return response
 
         runtime = AgentRuntime(client=RepeatedProgressClient())
-        with patch("runtime.agent_runtime.run_agent_tools", return_value=[]):
-            with self.assertRaisesRegex(ValueError, "terminal final answer"):
-                runtime.chat("근거를 찾아 평가해줘", "research")
+        with patch("runtime.agent_runtime.execute_research_action", return_value=[]) as execute:
+            result = runtime.chat("근거를 찾아 평가해줘", "research")
+
+        self.assertEqual(execute.call_count, 2)
+        self.assertEqual(result.content, "완료된 최종 답변")
 
     def test_general_and_project_chat_use_same_deep_research_runtime(self) -> None:
         class EquivalentClient(FakeClient):
@@ -1644,7 +1703,7 @@ class WebRuntimeTests(unittest.TestCase):
 
         question = "연구자에 대해서 찾아보고 연구자로서의 역량을 평가해줘"
         project_scope = object()
-        with patch("runtime.agent_runtime.run_agent_tools", return_value=[]) as run_tools:
+        with patch("runtime.agent_runtime.execute_research_action", return_value=[]) as run_tools:
             general = AgentRuntime(client=EquivalentClient()).chat(question, "auto")
             project = AgentRuntime(client=EquivalentClient()).chat(
                 question, "auto", persistent_context="Prior project note", project_scope=project_scope  # type: ignore[arg-type]
@@ -1654,8 +1713,7 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(general.content, project.content)
         self.assertEqual([call["purpose"] for call in general.llm_calls], [call["purpose"] for call in project.llm_calls])
         self.assertEqual(len(general.research["rounds"]), len(project.research["rounds"]))
-        self.assertEqual(run_tools.call_args_list[0].args[:4], run_tools.call_args_list[1].args[:4])
-        self.assertIs(run_tools.call_args_list[1].args[4], project_scope)
+        run_tools.assert_not_called()
 
     def test_korean_person_name_is_preserved_as_exact_query(self) -> None:
         queries = AgentRuntime._initial_research_queries(

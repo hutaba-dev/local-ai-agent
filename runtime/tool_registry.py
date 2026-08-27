@@ -15,7 +15,8 @@ from urllib.parse import urlparse
 import httpx
 
 from runtime.project_tools import ProjectTools
-from runtime.academic_intelligence import academic_intelligence
+from runtime.academic_intelligence import academic_intelligence, academic_source_status
+from runtime.search_providers import SearchRequest, SearchRouter
 from runtime.web_search import academic_papers, search_many, semantic_scholar_evidence, unpaywall_oa_locations
 
 
@@ -91,6 +92,109 @@ COMPANY_SOURCE_DOMAINS = {
     "NVIDIA": ("investor.nvidia.com", "nvidianews.nvidia.com"),
     "TSMC": ("investor.tsmc.com",),
 }
+
+RESEARCH_TOOL_DESCRIPTIONS = {
+    "searxng": {
+        "action": "SEARCH_WEB",
+        "cost": "very_low",
+        "freshness": "current web/news discovery; coverage varies by upstream engine",
+        "description": "Low-cost default web discovery. Good first choice for broad web or news search.",
+    },
+    "serper": {
+        "action": "SEARCH_WEB",
+        "cost": "paid",
+        "freshness": "current Google-style web/news results",
+        "description": "Paid Google-result search. Use when stronger coverage or relevance is materially useful.",
+    },
+    "brave": {
+        "action": "SEARCH_WEB",
+        "cost": "paid",
+        "freshness": "current independent web index",
+        "description": "Paid independent search. Useful as a fallback or important cross-check.",
+    },
+    "secure_page_fetch": {
+        "action": "FETCH_PAGE",
+        "cost": "very_low",
+        "freshness": "retrieves the current public page",
+        "description": "Fetch validated public HTML pages from prior search results for primary-source detail.",
+    },
+    "academic_papers": {
+        "action": "SEARCH_ACADEMIC",
+        "cost": "low",
+        "freshness": "scholarly metadata may lag very recent announcements",
+        "description": "OpenAlex and related scholarly work metadata. Use when scholarly evidence itself is relevant.",
+    },
+    "academic_intelligence": {
+        "action": "LOOKUP_AUTHOR",
+        "cost": "mixed",
+        "freshness": "provider-dependent scholarly identity and citation metadata",
+        "description": "Scopus, Web of Science, OpenAlex, Semantic Scholar, Crossref, and ORCID evidence for researcher identity, publications, and citations.",
+    },
+    "scopus": {
+        "action": "LOOKUP_AUTHOR", "cost": "licensed", "freshness": "curated scholarly metadata; indexing may lag",
+        "description": "Scholarly author, publication, citation, and affiliation metadata within the integrated author lookup.",
+    },
+    "web_of_science": {
+        "action": "LOOKUP_AUTHOR", "cost": "licensed", "freshness": "curated scholarly metadata; indexing may lag",
+        "description": "Curated publication, researcher identity, and citation evidence within the integrated author lookup.",
+    },
+    "openalex": {
+        "action": "SEARCH_ACADEMIC", "cost": "very_low", "freshness": "broad public scholarly graph; indexing may lag",
+        "description": "Broad public works and author metadata for scholarly discovery and cross-checking.",
+    },
+    "semantic_scholar": {
+        "action": "LOOKUP_AUTHOR", "cost": "very_low", "freshness": "public scholarly graph; provider-dependent lag",
+        "description": "Independent author, paper, citation, and abstract metadata cross-check.",
+    },
+    "crossref": {
+        "action": "LOOKUP_AUTHOR", "cost": "very_low", "freshness": "publisher-deposited DOI metadata",
+        "description": "DOI and publisher metadata used to verify scholarly works and identities.",
+    },
+    "orcid": {
+        "action": "LOOKUP_AUTHOR", "cost": "very_low", "freshness": "researcher-maintained identity records",
+        "description": "Researcher identifiers and self-maintained affiliation/work records for identity resolution.",
+    },
+}
+
+
+def research_tool_catalog() -> list[dict[str, object]]:
+    router = SearchRouter()
+    academic_status = academic_source_status()
+    catalog: list[dict[str, object]] = []
+    for name, description in RESEARCH_TOOL_DESCRIPTIONS.items():
+        available = True
+        if name in router.providers:
+            available = router.providers[name].configured()
+        status = academic_status.get(name)
+        if status is not None:
+            available = status != "UNAVAILABLE"
+        catalog.append({"name": name, "available": available, "status": status or ("AVAILABLE" if available else "UNAVAILABLE"), **description})
+    return catalog
+
+
+def execute_research_action(
+    action: str,
+    queries: tuple[str, ...] = (),
+    provider: str = "searxng",
+    prior_tools: tuple[dict[str, object], ...] = (),
+    search_category: str = "web",
+    freshness: str = "normal",
+) -> list[dict[str, object]]:
+    if action == "SEARCH_WEB":
+        return [asdict(_web_search_provider(queries, provider, search_category, freshness))]
+    if action == "FETCH_PAGE":
+        search_tool = next(
+            (tool for tool in reversed(prior_tools) if tool.get("name") == "web_search" and tool.get("success")),
+            None,
+        )
+        if search_tool is None:
+            return [asdict(ToolResult("web_sources", False, "", "no successful web search results to fetch", 0))]
+        return [asdict(_web_sources(str(search_tool.get("output", ""))))]
+    if action == "SEARCH_ACADEMIC":
+        return [asdict(_academic_papers(queries))]
+    if action == "LOOKUP_AUTHOR":
+        return [asdict(_academic_intelligence("\n".join(queries)))]
+    raise ValueError(f"unsupported research action: {action}")
 
 
 def research_source_plan(query: str | tuple[str, ...]) -> ResearchSourcePlan:
@@ -321,6 +425,55 @@ def _web_search(
         )
     except (RuntimeError, httpx.HTTPError) as error:
         return ToolResult("web_search", False, "", str(error), round((perf_counter() - started) * 1000))
+
+
+def _web_search_provider(
+    queries: tuple[str, ...], provider_name: str, category: str = "web", freshness: str = "normal"
+) -> ToolResult:
+    started = perf_counter()
+    router = SearchRouter()
+    provider = router.providers.get(provider_name)
+    if provider is None:
+        return ToolResult("web_search", False, "", f"unknown search provider: {provider_name}", 0)
+    if not provider.configured():
+        return ToolResult("web_search", False, "", f"search provider unavailable: {provider_name}", 0)
+    results: list[dict[str, object]] = []
+    diagnostics: list[dict[str, object]] = []
+    seen_urls: set[str] = set()
+    try:
+        for query in queries[:4]:
+            response = provider.search(SearchRequest(
+                query=query,
+                category="news" if category == "news" else "web",
+                freshness="VERY_HIGH" if freshness == "high" else None,
+                count=8,
+            ))
+            diagnostics.append({
+                "provider": provider_name,
+                "status": response.status.value,
+                "latency_ms": response.latency_ms,
+                "error": response.error,
+            })
+            if response.status.value != "AVAILABLE":
+                continue
+            for item in response.results:
+                value = item.to_dict()
+                url = str(value.get("url", ""))
+                if url and url not in seen_urls:
+                    seen_urls.add(url)
+                    results.append(value)
+        if not results:
+            raise RuntimeError(f"{provider_name} returned no usable search results")
+        duration_ms = round((perf_counter() - started) * 1000)
+        return ToolResult(
+            "web_search", True, json.dumps(results[:24], ensure_ascii=False), None, duration_ms,
+            {"provider": provider_name, "query_count": len(queries[:4]), "requests": diagnostics},
+        )
+    except (RuntimeError, httpx.HTTPError) as error:
+        return ToolResult(
+            "web_search", False, "", str(error), round((perf_counter() - started) * 1000),
+            {"provider": provider_name, "requests": diagnostics, "failure_reason": _failure_reason(error)},
+        )
 
 
 def _rank_relevant_web_results(

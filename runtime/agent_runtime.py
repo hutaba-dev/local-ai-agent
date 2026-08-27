@@ -20,14 +20,22 @@ from hangul_romanize.rule import academic as academic_romanization
 
 from runtime.router import Route, route_request
 from runtime.sessions import SessionStore
-from runtime.tool_registry import ProjectToolScope, research_source_plan, run_agent_tools
+from runtime.tool_registry import (
+    ProjectToolScope,
+    execute_research_action,
+    research_source_plan,
+    research_tool_catalog,
+    run_agent_tools,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENT_DIR = REPO_ROOT / "agents"
 MODEL = os.getenv("OPENAI_MODEL", "qwen3.8-27b")
 BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
-MAX_RESEARCH_ROUNDS = 4
+MAX_RESEARCH_ITERATIONS = 12
+MAX_RESEARCH_TOOL_CALLS = 12
+MAX_RESEARCH_SEARCH_CALLS = 12
 DEFAULT_MAX_TOKENS = 1024
 RESEARCH_MAX_TOKENS = 6144
 ANALYST_MAX_TOKENS = 2000
@@ -88,6 +96,22 @@ class ResearchGap:
     next_tools: tuple[str, ...]
     ready_to_answer: bool
     entity_confidence: str
+
+
+@dataclass(frozen=True)
+class ResearchDecision:
+    next_action: str
+    queries: tuple[str, ...] = ()
+    provider: str = ""
+    unresolved_questions: tuple[str, ...] = ()
+    decision_summary: str = ""
+    ready_to_answer: bool = False
+    complexity: str = "SIMPLE"
+    use_critic: bool = False
+    search_category: str = "web"
+    freshness_importance: str = "normal"
+    primary_source_importance: str = "normal"
+    scholarly_evidence_value: str = "low"
 
 
 T = TypeVar("T")
@@ -190,7 +214,7 @@ class AgentRuntime:
             "final_synthesis_executed": False,
             "termination_reason": "non_deep_response",
         }
-        if route.agent == "research" and route.search_mode == "DEEP_RESEARCH":
+        if route.agent == "research" and route.search_mode != "NO_SEARCH":
             tools, answer, payload, research = self._run_deep_research(
                 message,
                 decision.queries,
@@ -200,6 +224,7 @@ class AgentRuntime:
                 persistent_context,
                 project_scope,
             )
+            research["mode"] = route.search_mode
         else:
             tool_message = decision.queries or (message,)
             tools = latency.stage(
@@ -290,95 +315,162 @@ class AgentRuntime:
         all_tools: list[dict[str, object]] = []
         round_activity: list[dict[str, object]] = []
         state_history = [ResearchState.PLANNING.value]
-        queries = self._initial_research_queries(question, planned_queries)
-        person_query = PERSON_RESEARCH_PATTERN.search(question) is not None
-        entity_confidence = "UNKNOWN"
-        gap_status = "NOT_EVALUATED"
-        termination_reason = "research_budget_exhausted"
-        identity_query_cache: dict[str, str] = {}
         source_plan = research_source_plan(question)
-        executed_query_fingerprints: set[str] = set()
+        executed_actions: set[str] = set()
+        tool_calls = 0
+        search_calls = 0
+        termination_reason = "research_iteration_limit"
+        final_decision: ResearchDecision | None = None
+        answer: str | None = None
+        payload: dict[str, object] | None = None
 
-        def resolve_researcher_query(tool_queries: tuple[str, ...], web_output: str) -> str:
-            if "query" not in identity_query_cache:
-                identity_query_cache["query"] = self._resolve_researcher_identity_query(
-                    question, tool_queries, web_output, system_prompt, latency
-                )
-            return identity_query_cache["query"]
-
-        for round_number in range(1, MAX_RESEARCH_ROUNDS + 1):
-            from runtime.search_providers import normalize_query
-
-            queries = tuple(
-                query for query in queries
-                if normalize_query(query) not in executed_query_fingerprints
-            )
-            if not queries:
-                termination_reason = "no_new_followup_queries"
-                break
-            executed_query_fingerprints.update(normalize_query(query) for query in queries)
-            state_history.append(ResearchState.SEARCHING.value)
-            if person_query:
-                state_history.append(ResearchState.IDENTIFYING.value)
-            tool_queries = tuple(dict.fromkeys((question, *queries)))
-            round_tools = latency.stage(
-                f"research_round_{round_number}_tools",
-                lambda tool_queries=tool_queries: self._run_tools(
-                    "research", tool_queries, "DEEP_RESEARCH", allow_local_tools, project_scope,
-                    resolve_researcher_query if person_query else None,
+        for iteration in range(1, MAX_RESEARCH_ITERATIONS + 1):
+            decision = latency.stage(
+                f"research_iteration_{iteration}_decision",
+                lambda: self._decide_research_action(
+                    question, planned_queries, all_tools, round_activity, system_prompt, latency,
+                    MAX_RESEARCH_TOOL_CALLS - tool_calls,
+                    MAX_RESEARCH_SEARCH_CALLS - search_calls,
+                    persistent_context,
+                    project_scope is not None,
                 ),
             )
-            all_tools.extend(round_tools)
-            state_history.extend((ResearchState.READING.value, ResearchState.VERIFYING.value))
-            state_history.append(ResearchState.GAP_ANALYSIS.value)
-            gap = latency.stage(
-                f"research_round_{round_number}_gap_analysis",
-                lambda: self._research_gap(question, queries, all_tools, source_plan, system_prompt, latency),
-            )
-            entity_confidence = gap.entity_confidence
-            gap_status = "READY" if gap.ready_to_answer else "FOLLOWUP_REQUIRED"
-            round_activity.append({
-                "round": round_number,
-                "queries": list(queries),
-                "tools": [str(tool.get("name", "")) for tool in round_tools],
-                "sources_fetched": self._source_count(round_tools),
-                "entity_confidence": entity_confidence,
-                "missing": list(gap.missing),
-                "uncertain": list(gap.uncertain),
-                "next_queries": list(gap.next_queries),
-                "next_tools": list(gap.next_tools),
-                "ready_to_answer": gap.ready_to_answer,
-                "academic_intelligence": self._academic_activity(round_tools),
-            })
-            identity_unresolved = person_query and entity_confidence in {
-                "UNKNOWN", "LOW", "UNRESOLVED", "AMBIGUOUS"
+            action_queries = decision.queries
+            if decision.next_action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT"}:
+                action_queries = action_queries[:max(0, MAX_RESEARCH_SEARCH_CALLS - search_calls)]
+            activity = {
+                "round": iteration,
+                "decision": decision.next_action,
+                "decision_summary": decision.decision_summary,
+                "queries": list(action_queries),
+                "provider": decision.provider,
+                "unresolved": list(decision.unresolved_questions),
+                "ready_to_answer": decision.ready_to_answer,
+                "complexity": decision.complexity,
+                "freshness_importance": decision.freshness_importance,
+                "primary_source_importance": decision.primary_source_importance,
+                "scholarly_evidence_value": decision.scholarly_evidence_value,
+                "tools": [],
+                "sources_fetched": 0,
             }
-            if gap.ready_to_answer and not (round_number == 1 and identity_unresolved):
-                termination_reason = "evidence_ready"
+            if decision.next_action == "FINAL_ANSWER":
+                if not decision.ready_to_answer or decision.unresolved_questions:
+                    activity["ready_to_answer"] = False
+                    activity["decision_summary"] = "Finalization rejected: unresolved critical work remains."
+                    round_activity.append(activity)
+                    continue
+                final_decision = decision
+                state_history.append(ResearchState.SYNTHESIZING.value)
+                candidate_answer, candidate_payload = latency.stage(
+                    "final_synthesis",
+                    lambda: self._synthesize_research(
+                        question, all_tools, system_prompt, latency, persistent_context, source_plan,
+                        use_critic=decision.use_critic or decision.complexity == "COMPLEX",
+                    ),
+                )
+                if RESEARCH_PROGRESS_PATTERN.search(candidate_answer):
+                    activity["ready_to_answer"] = False
+                    activity["decision_summary"] = (
+                        "Finalization rejected: synthesis requested additional research. Choose and execute the next action."
+                    )
+                    all_tools.append({
+                        "name": "finalization_validation",
+                        "success": False,
+                        "output": "",
+                        "error": "synthesis indicated that additional research is required",
+                        "duration_ms": 0,
+                    })
+                    final_decision = None
+                    round_activity.append(activity)
+                    continue
+                answer, payload = candidate_answer, candidate_payload
+                termination_reason = "llm_evidence_sufficient"
+                round_activity.append(activity)
                 break
-            if round_number == MAX_RESEARCH_ROUNDS:
-                break
-            queries = gap.next_queries or self._fallback_followup_queries(question)
-            if not queries:
-                termination_reason = "no_followup_queries"
-                break
-            state_history.append(ResearchState.FOLLOWUP.value)
+            if decision.next_action in {"ANALYZE", "COMPARE_EVIDENCE", "CALCULATE"}:
+                round_activity.append(activity)
+                continue
+            if tool_calls >= MAX_RESEARCH_TOOL_CALLS:
+                activity["decision_summary"] = "Tool budget exhausted; planner must finalize with explicit limitations."
+                round_activity.append(activity)
+                continue
+            if decision.next_action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT"} and not action_queries:
+                activity["decision_summary"] = "Search budget exhausted; planner must finalize with explicit limitations."
+                round_activity.append(activity)
+                continue
+            action_key = json.dumps(
+                [decision.next_action, decision.provider, action_queries], ensure_ascii=False
+            ).casefold()
+            if action_key in executed_actions:
+                activity["decision_summary"] = "Duplicate action suppressed; choose a different action or finalize."
+                round_activity.append(activity)
+                continue
+            executed_actions.add(action_key)
+            if round_activity:
+                state_history.append(ResearchState.FOLLOWUP.value)
+            state_history.append({
+                "SEARCH_WEB": ResearchState.SEARCHING.value,
+                "FETCH_PAGE": ResearchState.READING.value,
+                "SEARCH_ACADEMIC": ResearchState.SEARCHING.value,
+                "LOOKUP_AUTHOR": ResearchState.IDENTIFYING.value,
+                "SEARCH_DOCUMENT": ResearchState.SEARCHING.value,
+            }.get(decision.next_action, ResearchState.VERIFYING.value))
+            if decision.next_action == "SEARCH_DOCUMENT":
+                if project_scope is None:
+                    round_tools = []
+                else:
+                    round_tools = latency.stage(
+                        f"research_iteration_{iteration}_search_document",
+                        lambda: self._run_tools(
+                            "main", action_queries, "NO_SEARCH", False, project_scope,
+                        ),
+                    )
+            else:
+                round_tools = latency.stage(
+                    f"research_iteration_{iteration}_{decision.next_action.lower()}",
+                    lambda: execute_research_action(
+                        decision.next_action,
+                        action_queries,
+                        decision.provider or "searxng",
+                        tuple(all_tools),
+                        decision.search_category,
+                        decision.freshness_importance,
+                    ),
+                )
+            tool_calls += 1
+            if decision.next_action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT"}:
+                search_calls += len(action_queries)
+            all_tools.extend(round_tools)
+            activity["tools"] = [str(tool.get("name", "")) for tool in round_tools]
+            activity["sources_fetched"] = self._source_count(round_tools)
+            activity["academic_intelligence"] = self._academic_activity(round_tools)
+            round_activity.append(activity)
+            state_history.append(ResearchState.VERIFYING.value)
 
-        state_history.append(ResearchState.SYNTHESIZING.value)
-        answer, payload = latency.stage(
-            "final_synthesis",
-            lambda: self._synthesize_research(
-                question, all_tools, system_prompt, latency, persistent_context, source_plan
-            ),
-        )
+        if answer is None or payload is None:
+            final_decision = ResearchDecision(
+                "FINAL_ANSWER", ready_to_answer=True, complexity="COMPLEX", use_critic=True,
+                decision_summary="Executor limit reached; answer with explicit evidence limitations.",
+            )
+
+            state_history.append(ResearchState.SYNTHESIZING.value)
+            answer, payload = latency.stage(
+                "final_synthesis",
+                lambda: self._synthesize_research(
+                    question, all_tools, system_prompt, latency, persistent_context, source_plan,
+                    use_critic=True,
+                ),
+            )
+            if RESEARCH_PROGRESS_PATTERN.search(answer):
+                raise ValueError("deep research did not produce a terminal final answer")
         state_history.append(ResearchState.COMPLETE.value)
         return all_tools, answer, payload, {
             "mode": "DEEP_RESEARCH",
             "state": ResearchState.COMPLETE.value,
             "state_history": state_history,
             "rounds": round_activity,
-            "entity_confidence": entity_confidence,
-            "gap_status": gap_status,
+            "entity_confidence": "LLM_ASSESSED",
+            "gap_status": "READY" if termination_reason == "llm_evidence_sufficient" else "LIMIT_REACHED",
             "final_synthesis_executed": True,
             "termination_reason": termination_reason,
             "source_plan": {
@@ -388,13 +480,159 @@ class AgentRuntime:
                 "selected_sources": list(source_plan.selected_sources),
                 "skipped_sources": list(source_plan.skipped_sources),
                 "academic_enabled": source_plan.academic_enabled,
+                "role": "metadata_hint_only",
             },
+            "tool_catalog": research_tool_catalog(),
+            "tool_calls": tool_calls,
+            "max_tool_calls": MAX_RESEARCH_TOOL_CALLS,
+            "search_calls": search_calls,
+            "max_search_calls": MAX_RESEARCH_SEARCH_CALLS,
             "search": self._search_activity(all_tools, round_activity),
             "analysis_pipeline": (
                 "EVIDENCE_NORMALIZATION", "CAUSAL_ANALYST", "RESEARCH_CRITIC", "FINAL_SYNTHESIS",
             ),
             "claim_taxonomy": ("FACT", "INFERENCE", "FORECAST", "UNKNOWN"),
         }
+
+    def _decide_research_action(
+        self,
+        question: str,
+        planned_queries: tuple[str, ...],
+        tools: list[dict[str, object]],
+        activity: list[dict[str, object]],
+        system_prompt: str,
+        latency: LatencyRecorder,
+        remaining_tool_calls: int,
+        remaining_search_calls: int,
+        persistent_context: str = "",
+        project_search_available: bool = False,
+    ) -> ResearchDecision:
+        available_tools = research_tool_catalog()
+        available_tools.append({
+            "name": "project_document_search",
+            "action": "SEARCH_DOCUMENT",
+            "cost": "very_low",
+            "freshness": "current indexed project documents",
+            "available": project_search_available,
+            "status": "AVAILABLE" if project_search_available else "UNAVAILABLE",
+            "description": "Scoped hybrid search over the authenticated user's current project documents.",
+        })
+        state = {
+            "user_goal": question,
+            "current_utc_date": datetime.now(timezone.utc).date().isoformat(),
+            "initial_query_suggestions": list(planned_queries),
+            "evidence_so_far": self._evidence_package(tools, persistent_context),
+            "observations": tools[-4:],
+            "previous_decisions": activity[-4:],
+            "available_tools": available_tools,
+            "remaining_tool_calls": remaining_tool_calls,
+            "remaining_search_calls": remaining_search_calls,
+            "remaining_iterations": MAX_RESEARCH_ITERATIONS - len(activity),
+        }
+        prompt = (
+            "You are the Research Planner and Orchestrator. Choose the single best NEXT ACTION from the current state. "
+            "The executor, not a keyword classifier, will run it and return the observation to you. Available actions are "
+            "SEARCH_WEB, FETCH_PAGE, SEARCH_ACADEMIC, LOOKUP_AUTHOR, SEARCH_DOCUMENT, COMPARE_EVIDENCE, ANALYZE, CALCULATE, and FINAL_ANSWER. "
+            "For SEARCH_WEB select exactly one available provider and 1 to 4 focused queries. Use the least expensive tool likely "
+            "to obtain sufficient evidence, but do not sacrifice materially important quality. Before any specialized source, ask "
+            "whether it can materially reduce uncertainty about the actual question. Do not call scholarly databases merely because "
+            "the topic mentions AI, technology, a company, or research-adjacent language; use them when scholarly evidence itself matters. "
+            "Search snippets are discovery evidence, so FETCH_PAGE important primary or supporting pages before relying on factual claims. "
+            "Ask: What important uncertainty still prevents a high-quality answer? Choose follow-up search, another source, page fetch, "
+            "academic lookup, comparison, calculation, analysis, or finalization accordingly. Search budget is a maximum, not a quota. "
+            "Set complexity=COMPLEX and use_critic=true only when causal reasoning, consequential market/investment analysis, conflicting "
+            "evidence, identity ambiguity, or multiple scenarios materially benefit from critique. Simple questions should avoid extra calls. "
+            "Choose FINAL_ANSWER only when a substantive answer can be written now, there is no pending tool call or critical unresolved "
+            "question, and important gaps can be honestly disclosed. If you say more search or checking is needed, choose the corresponding "
+            "tool action instead of FINAL_ANSWER. Intent labels, if present elsewhere, are metadata hints and never constraints. "
+            "Return exactly one JSON object with no prose: "
+            '{"next_action":"...","queries":[],"provider":"","search_category":"web|news",'
+            '"unresolved_questions":[],"decision_summary":"brief observable rationale",'
+            '"ready_to_answer":false,"complexity":"SIMPLE|MODERATE|COMPLEX","use_critic":false,'
+            '"freshness_importance":"low|normal|high","primary_source_importance":"low|normal|high",'
+            '"scholarly_evidence_value":"low|normal|high"}.\n\n'
+            f"Research state:\n{self._bounded_evidence_json(state)}"
+        )
+        try:
+            content, _ = self._complete(
+                [{"role": "system", "content": system_prompt}, {"role": "user", "content": prompt}],
+                700,
+                latency,
+                "research_next_action",
+                temperature=0,
+            )
+            return self._parse_research_decision(content)
+        except (httpx.HTTPError, ValueError):
+            if remaining_tool_calls > 0:
+                return ResearchDecision(
+                    "SEARCH_WEB", (question,), "searxng", ("planner output invalid",),
+                    "Planner output was invalid; execute one low-cost discovery search.",
+                )
+            return ResearchDecision(
+                "FINAL_ANSWER", ready_to_answer=True, complexity="COMPLEX", use_critic=True,
+                decision_summary="Planner unavailable and execution budget exhausted.",
+            )
+
+    @staticmethod
+    def _parse_research_decision(content: str) -> ResearchDecision:
+        value = AgentRuntime._parse_json_object(content)
+        if "next_action" not in value and isinstance(value.get("ready_to_answer"), bool):
+            ready = bool(value["ready_to_answer"])
+            next_queries = value.get("next_queries")
+            queries = tuple(item for item in next_queries or [] if isinstance(item, str) and item.strip())[:4]
+            return ResearchDecision(
+                "FINAL_ANSWER" if ready else "SEARCH_WEB",
+                queries,
+                "" if ready else "searxng",
+                () if ready else tuple(str(item) for item in value.get("missing", []) if isinstance(item, str)),
+                "Legacy evidence-gap decision adapted to next-action protocol.",
+                ready,
+                "COMPLEX",
+                True,
+            )
+        action = value.get("next_action")
+        allowed = {
+            "SEARCH_WEB", "FETCH_PAGE", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR",
+            "SEARCH_DOCUMENT", "COMPARE_EVIDENCE", "ANALYZE", "CALCULATE", "FINAL_ANSWER",
+        }
+        if action not in allowed:
+            raise ValueError("model returned an unsupported research action")
+
+        def strings(key: str, limit: int) -> tuple[str, ...]:
+            raw = value.get(key)
+            if not isinstance(raw, list):
+                return ()
+            return tuple(item.strip()[:500] for item in raw[:limit] if isinstance(item, str) and item.strip())
+
+        provider = value.get("provider")
+        provider = provider if isinstance(provider, str) and provider in {"searxng", "serper", "brave"} else ""
+        queries = strings("queries", 4)
+        if action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT"} and not queries:
+            raise ValueError("tool action requires at least one query")
+        if action == "SEARCH_WEB" and not provider:
+            raise ValueError("web search action requires an explicit provider")
+        ready = value.get("ready_to_answer") is True
+        unresolved = strings("unresolved_questions", 8)
+        if action == "FINAL_ANSWER" and (not ready or unresolved):
+            return ResearchDecision(action, queries, provider, unresolved, "Premature finalization rejected.", False)
+        complexity = value.get("complexity")
+        if complexity not in {"SIMPLE", "MODERATE", "COMPLEX"}:
+            complexity = "MODERATE"
+        summary = value.get("decision_summary")
+        importance_values = {"low", "normal", "high"}
+        freshness = value.get("freshness_importance")
+        primary = value.get("primary_source_importance")
+        scholarly = value.get("scholarly_evidence_value")
+        category = value.get("search_category")
+        return ResearchDecision(
+            action, queries, provider, unresolved,
+            summary.strip()[:500] if isinstance(summary, str) else "",
+            ready, complexity, value.get("use_critic") is True,
+            category if category in {"web", "news"} else "web",
+            freshness if freshness in importance_values else "normal",
+            primary if primary in importance_values else "normal",
+            scholarly if scholarly in importance_values else "low",
+        )
 
     def _resolve_researcher_identity_query(
         self,
@@ -706,16 +944,16 @@ class AgentRuntime:
         latency: LatencyRecorder,
         persistent_context: str = "",
         source_plan: object | None = None,
+        use_critic: bool = True,
     ) -> tuple[str, dict[str, object]]:
         evidence_package = self._evidence_package(tools, persistent_context)
         source_plan = source_plan or research_source_plan(question)
         evidence_package["analysis_contract"] = self._analysis_contract(question, source_plan)
-        if "MARKET_FINANCE" in source_plan.intents:
-            now = datetime.now(timezone.utc)
-            evidence_package["research_as_of"] = {
-                "utc": now.isoformat(timespec="minutes"),
-                "kst": now.astimezone(ZoneInfo("Asia/Seoul")).isoformat(timespec="minutes"),
-            }
+        now = datetime.now(timezone.utc)
+        evidence_package["research_as_of"] = {
+            "utc": now.isoformat(timespec="minutes"),
+            "kst": now.astimezone(ZoneInfo("Asia/Seoul")).isoformat(timespec="minutes"),
+        }
         package_json = self._bounded_evidence_json(evidence_package)
         plan_json = json.dumps({
             "intents": list(source_plan.intents),
@@ -723,16 +961,11 @@ class AgentRuntime:
             "academic_enabled": source_plan.academic_enabled,
             "required_evidence": list(source_plan.required_evidence),
         }, ensure_ascii=False)
-        market_instruction = (
-            "For current market questions, organize the answer around schedule, consensus, watch points, current market reaction, "
-            "bull/base/bear scenarios, and post-release checks. Show US Eastern and Korea Standard times for events. "
-            "Prefer current primary sources and fetched page text. Never add academic-paper or bibliometric sections. "
-            "If figures differ across sources, state the discrepancy. Label unresolved factual claims UNKNOWN, not analytical inferences. "
-            if "MARKET_FINANCE" in source_plan.intents else ""
-        )
-        mixed_instruction = (
-            "For MIXED requests, separate Current Market Evidence from Academic Context and never treat academic work as direct evidence "
-            "of the current earnings event. " if "MIXED" in source_plan.intents else ""
+        contextual_instruction = (
+            "Adapt the answer to the actual question and evidence rather than an intent label. For time-sensitive claims, state the "
+            "research time and prefer current primary sources. Use scholarly evidence only for claims it can support. When current and "
+            "scholarly evidence are both relevant, keep their evidentiary roles distinct. Use scenarios, causal analysis, or bibliometrics "
+            "only when they materially improve the answer. If figures differ across sources, state the discrepancy. "
         )
         analyst_prompt = (
             "You are not merely an evidence summarizer. You are an analytical research agent. "
@@ -759,9 +992,20 @@ class AgentRuntime:
             "product specifications, or company exposure. Omit a named-company comparison when company-specific evidence is absent. "
             "Separate Evidence from Interpretation, state uncertainty, and cite supplied URLs beside factual claims. "
             "More sources is not better. Use only evidence that materially answers the user's question. "
-            f"{market_instruction}{mixed_instruction}\n\nResearch Source Plan:\n{plan_json}\n\n"
+            f"{contextual_instruction}\n\nIntent metadata (non-binding):\n{plan_json}\n\n"
             f"Question:\n{question}\n\nEvidence Package:\n{package_json}"
         )
+        if not use_critic:
+            answer, payload = self._complete(
+                [{"role": "system", "content": system_prompt}, {"role": "user", "content": (
+                    analyst_prompt
+                    + "\n\nWrite the completed terminal answer now. Do not output a plan, promise future research, or expose private reasoning."
+                )}],
+                RESEARCH_MAX_TOKENS,
+                latency,
+                "direct_research_synthesis",
+            )
+            return answer, payload
         draft, _ = self._complete(
             [{"role": "system", "content": system_prompt}, {"role": "user", "content": analyst_prompt}],
             ANALYST_MAX_TOKENS,
@@ -804,7 +1048,7 @@ class AgentRuntime:
             "within the response budget: prioritize material facts and 2 to 4 key inferences, use qualitative scenarios unless sourced numbers exist, "
             "and avoid repeating the same premise across sections. Before returning, audit every number and named-company relationship against the "
             "Evidence Package; delete unsupported details rather than turning them into precise-looking forecasts.\n\n"
-            f"{market_instruction}{mixed_instruction}\n\nResearch Source Plan:\n{plan_json}\n\n"
+            f"{contextual_instruction}\n\nIntent metadata (non-binding):\n{plan_json}\n\n"
             f"Question:\n{question}\n\nEvidence Package:\n{package_json}\n\nAnalyst Draft:\n{bounded_draft}\n\nCritic Feedback:\n{bounded_critique}"
         )
         answer, payload = self._complete(
@@ -813,34 +1057,10 @@ class AgentRuntime:
             latency,
             "final_revision",
         )
-        if not RESEARCH_PROGRESS_PATTERN.search(answer):
-            return answer, payload
-        repair_prompt = (
-            "The prior output was a research progress message, which is not a valid final answer. "
-            "Using only the Evidence Package, write the completed terminal research answer now in the user's language. "
-            "Include identity confidence, evidence-based findings, limitations, overall assessment, and source URLs. "
-            "Never introduce a number or named-company relationship absent from the Evidence Package. "
-            "Do not describe future work or the research process.\n\n"
-            f"{market_instruction}{mixed_instruction}\n\nQuestion:\n{question}\n\nEvidence Package:\n{package_json}"
-        )
-        repaired_answer, repaired_payload = self._complete(
-            [{"role": "system", "content": system_prompt}, {"role": "user", "content": repair_prompt}],
-            RESEARCH_MAX_TOKENS,
-            latency,
-            "final_synthesis_retry",
-        )
-        if RESEARCH_PROGRESS_PATTERN.search(repaired_answer):
-            raise ValueError("deep research did not produce a terminal final answer")
-        return repaired_answer, repaired_payload
+        return answer, payload
 
     @staticmethod
     def _analysis_contract(question: str, source_plan: object) -> dict[str, object]:
-        market_analysis = any(intent in source_plan.intents for intent in ("MARKET_FINANCE", "COMPANY_RESEARCH"))
-        impact_question = bool(re.search(
-            r"(?:impact|effect|affect|read[- ]?through|outlook|benefit|harm|영향|전망|수혜|피해|섹터|산업)",
-            question,
-            re.IGNORECASE,
-        ))
         contract: dict[str, object] = {
             "claim_taxonomy": {
                 "FACT": "directly supported by cited evidence",
@@ -853,6 +1073,7 @@ class AgentRuntime:
                 "FACTS", "CAUSAL_DRIVERS", "FIRST_ORDER_EFFECTS", "SECOND_ORDER_EFFECTS",
                 "BENEFICIARIES_AND_LOSERS", "RISKS", "SCENARIOS", "FORECAST",
             ),
+            "causal_analysis_use": "optional_when_material_to_the_user_goal",
             "inference_object": {
                 "claim": "string", "type": "INFERENCE", "premises": ["string"],
                 "causal_chain": ["string"], "confidence": "HIGH|MEDIUM|LOW",
@@ -860,21 +1081,18 @@ class AgentRuntime:
                 "evidence_ids": ["S1"],
             },
         }
-        if market_analysis:
-            contract["scenario_object"] = {
-                "scenario": "BULL|BASE|BEAR", "trigger": "string", "mechanism": ["string"],
-                "beneficiaries_or_losers": ["string"], "risks": ["string"],
-                "confidence": "HIGH|MEDIUM|LOW",
-            }
-        if impact_question:
-            contract["analytical_subquestions"] = (
-                "What are the focal company's verified performance drivers?",
-                "What supply-chain or value-chain relationship connects the company and target sector?",
-                "What are the target sector's current demand, supply, pricing, capacity, and inventory fundamentals?",
-                "How does the signal transmit through volume, price, mix, margin, earnings, and valuation?",
-                "Which companies are exposed, and where do qualification, customer mix, or execution create differences?",
-                "What expectations are already priced in, and what evidence supports the counter-case?",
-            )
+        contract["optional_scenario_object"] = {
+            "use_only_when_material": True,
+            "scenario": "BULL|BASE|BEAR", "trigger": "string", "mechanism": ["string"],
+            "beneficiaries_or_losers": ["string"], "risks": ["string"],
+            "confidence": "HIGH|MEDIUM|LOW",
+        }
+        contract["optional_analytical_subquestions"] = (
+            "What verified drivers matter to the user's actual question?",
+            "What structural relationship connects the relevant actors or systems?",
+            "How does the effect transmit, and where does it strengthen or weaken?",
+            "What expectations, counterarguments, and unknowns materially change the conclusion?",
+        )
         return contract
 
     @staticmethod
@@ -1166,9 +1384,13 @@ class AgentRuntime:
     ) -> SearchDecision:
         decision_prompt = (
             "Decide whether this request needs external web evidence before answering. "
+            f"Current UTC date: {datetime.now(timezone.utc).date().isoformat()}. "
             "Return exactly one JSON object and no other text in this form: "
             '{"search_mode":"NO_SEARCH|QUICK_SEARCH|DEEP_RESEARCH","queries":["search query"],"focus":["research question"]}. '
-            "Use NO_SEARCH for writing, translation, supplied-text work, stable concepts, or local server/repository questions. "
+            "Use NO_SEARCH for writing, translation, supplied-text work, stable concepts, or local server/repository questions whose answer "
+            "does not materially depend on external facts. A real company, market, industry, policy, person, publication, or current-event "
+            "analysis requires external evidence when its premises were not supplied by the user, even if the requested output is framed as "
+            "an inference or impact analysis. Do not confuse permission to reason with permission to invent current premises. "
             "Use QUICK_SEARCH for a current fact, recent event, price, availability, schedule, policy, or fact check. "
             "Use DEEP_RESEARCH for a multi-source comparison, report, recommendation, academic or technical source search, "
             "medical/legal/financial guidance, contested claim, or an evidence-based evaluation of why a person is notable, "

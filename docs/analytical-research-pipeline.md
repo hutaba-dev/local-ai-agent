@@ -44,7 +44,7 @@ The selector preserves at least one high-relevance item from each available role
 
 ## Query Planning
 
-For company-to-sector questions, the planner searches for evidence supporting causal premises, not only an article containing the desired conclusion. Within the bounded query budget, it prioritizes:
+Qwen chooses each next action from the user goal, evidence so far, live tool status, unresolved uncertainty, and remaining budget. Intent labels are non-binding metadata and keywords do not select source classes. For company-to-sector questions, the model may search for evidence supporting causal premises, not only an article containing the desired conclusion. Relevant considerations include:
 
 1. The focal company's current performance drivers and official release
 2. The supply-chain or value-chain relationship to the target sector
@@ -53,7 +53,7 @@ For company-to-sector questions, the planner searches for evidence supporting ca
 5. Exposed beneficiaries and losers, including company-specific differences
 6. Market expectations, counterarguments, and already-priced-in risk
 
-Generated follow-up queries remain constrained by the original source-intent plan. Academic Intelligence is still enabled only for explicit academic intent.
+Generated follow-up queries are not constrained by an original source-intent category. Before selecting a specialized source, the model asks whether it can materially reduce uncertainty about the actual question.
 
 ## Evidence Gap Policy
 
@@ -64,7 +64,7 @@ The gap evaluator distinguishes missing factual premises from missing direct wor
 - Identity ambiguity or missing critical current fact: keep `ready_to_answer=false` and perform bounded follow-up.
 - Missing non-critical detail: synthesize with an assumption, limitation, or lower confidence.
 
-The gap stage is therefore a search and confidence control, not a blanket prohibition on reasoning.
+Evidence gaps are evaluated inside each next-action decision rather than by a mandatory standalone stage. The planner may search, fetch, compare, calculate, analyze, or finalize.
 
 ## Analysis Contract
 
@@ -75,7 +75,7 @@ The compact Evidence Package contains a machine-readable `analysis_contract`. It
 - causal stages from facts through first- and second-order effects
 - an inference object schema
 - a bull/base/bear scenario schema for market or company analysis
-- analytical sub-questions for impact questions
+- optional analytical sub-questions when causal analysis is material
 
 The internal inference object includes:
 
@@ -94,16 +94,15 @@ The internal inference object includes:
 
 This is a structured analytical artifact supplied to later stages, not hidden chain-of-thought.
 
-## Multi-Pass Synthesis
+## Dynamic Synthesis
 
-The existing separate Qwen calls are retained and strengthened:
+Evidence normalization always runs. Later calls are selected from Qwen's complexity assessment:
 
 1. Evidence normalization removes duplicate sources, bounds text, adds IDs and roles, and preserves role diversity.
-2. Causal Analyst builds facts, drivers, first- and second-order effects, beneficiaries/losers, scenarios, forecasts, and unknowns.
-3. Research Critic tests unsupported facts, omitted causal links, correlation/causation errors, assumptions, already-priced-in effects, company differences, contradictory evidence, and confidence calibration.
-4. Final Synthesis integrates the analyst and critic in the user's language while keeping facts cited and forecasts conditional.
+2. Simple and moderate questions can proceed directly to final synthesis.
+3. Complex causal, market, conflict, identity, or scenario questions can invoke the Causal Analyst and Research Critic before final revision.
 
-The critic improves inference quality; it does not delete valid analysis solely because the conclusion lacks a direct quotation.
+The critic improves inference quality; it does not delete valid analysis solely because the conclusion lacks a direct quotation. If synthesis requests more research, the executor rejects finalization and returns control to the next-action loop.
 
 ## Response Shape
 
@@ -132,7 +131,9 @@ The canonical production case is defined in `agents/research/evaluation-tasks.md
 - analysis contract delivery to the Analyst
 - critic treatment of valid inference
 - final `FACT / INFERENCE / FORECAST / UNKNOWN` policy
-- preservation of the existing Research state machine and analyst/critic/final call sequence
+- LLM-selected next actions and bounded executor guardrails
+- rejection of premature finalization and progress-only answers
+- dynamic direct versus Analyst/Critic synthesis
 
 ## Production Benchmark: NVIDIA to Memory Sector
 
