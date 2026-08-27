@@ -1198,7 +1198,7 @@ class WebRuntimeTests(unittest.TestCase):
             web_app.runtime = previous_runtime
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(run_tools.call_count, 4)
+        self.assertEqual(run_tools.call_count, 2)
         self.assertEqual(
             run_tools.call_args_list[0].args,
             ("research", ("수소 연구를 요약해줘",), "DEEP_RESEARCH", False),
@@ -1217,7 +1217,7 @@ class WebRuntimeTests(unittest.TestCase):
             web_app.runtime = previous_runtime
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(run_tools.call_count, 4)
+        self.assertEqual(run_tools.call_count, 2)
         self.assertEqual(
             run_tools.call_args_list[0].args,
             ("research", ("수소 연구를 요약해줘",), "DEEP_RESEARCH", False),
@@ -1243,14 +1243,18 @@ class WebRuntimeTests(unittest.TestCase):
 
     def test_auto_current_fact_routes_to_research_and_reports_missing_search_key(self) -> None:
         runtime = AgentRuntime(client=SearchDecisionClient())
-        with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": ""}):
+        with patch.dict(os.environ, {
+            "SEARXNG_URL": "", "SERPER_API_KEY": "", "BRAVE_SEARCH_API_KEY": "",
+        }):
             result = runtime.chat("오늘 서울 날씨는 어때?", "auto")
 
         self.assertEqual(result.route.agent, "research")
         self.assertEqual(result.route.search_mode, "QUICK_SEARCH")
         self.assertEqual(result.tools[-1]["name"], "web_search")
         self.assertFalse(result.tools[-1]["success"])
-        self.assertIn("BRAVE_SEARCH_API_KEY", result.tools[-1]["error"])
+        self.assertIn("searxng=UNCONFIGURED", result.tools[-1]["error"])
+        self.assertIn("serper=UNCONFIGURED", result.tools[-1]["error"])
+        self.assertIn("brave=UNCONFIGURED", result.tools[-1]["error"])
 
     def test_model_search_decision_controls_search_mode(self) -> None:
         client = SearchDecisionClient()
@@ -1283,7 +1287,7 @@ class WebRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result.route.agent, "research")
         self.assertEqual(result.route.search_mode, "DEEP_RESEARCH")
-        self.assertEqual(run_tools.call_count, 4)
+        self.assertEqual(run_tools.call_count, 2)
         self.assertEqual(
             run_tools.call_args_list[0].args,
             (
@@ -1628,7 +1632,10 @@ class WebRuntimeTests(unittest.TestCase):
 
     def test_korean_deep_research_uses_naver_and_reddit(self) -> None:
         responses = [NaverResponse(), RedditResponse()]
-        with patch.dict(os.environ, {"BRAVE_SEARCH_API_KEY": "", "NAVER_SEARCH_CLIENT_ID": "naver-id", "NAVER_SEARCH_CLIENT_SECRET": "naver-secret"}), patch("runtime.web_search.httpx.get", side_effect=responses) as get:
+        with patch.dict(os.environ, {
+            "SEARXNG_URL": "", "SERPER_API_KEY": "", "BRAVE_SEARCH_API_KEY": "",
+            "NAVER_SEARCH_CLIENT_ID": "naver-id", "NAVER_SEARCH_CLIENT_SECRET": "naver-secret",
+        }), patch("runtime.web_search.httpx.get", side_effect=responses) as get:
             results = search("국내 최신 정책 비교", "DEEP_RESEARCH")
 
         self.assertEqual({result["provider"] for result in results}, {"naver", "reddit"})

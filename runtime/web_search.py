@@ -14,6 +14,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from runtime.search_providers import SearchRequest, SearchRouter, normalize_query
+
 BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 BRAVE_IMAGE_ENDPOINT = "https://api.search.brave.com/res/v1/images/search"
 NAVER_ENDPOINT = "https://openapi.naver.com/v1/search/webkr.json"
@@ -60,48 +62,67 @@ class SearchResult:
     description: str
 
 
-def search(query: str, mode: str) -> list[dict[str, str]]:
-    """Return bounded search results chosen for Korean or global intent.
-
-    Deep research may include Reddit discussion results as non-authoritative
-    context. Provider failures are recorded only when no primary provider works.
-    """
+def search(
+    query: str,
+    mode: str,
+    context: dict[str, object] | None = None,
+    include_metrics: bool = False,
+) -> list[dict[str, object]] | tuple[list[dict[str, object]], dict[str, object]]:
+    """Return normalized results through the conditional provider router."""
     result_count = 5 if mode == "QUICK_SEARCH" else 8
-    providers = _primary_providers(query)
-    results: list[SearchResult] = []
+    results: list[dict[str, object]] = []
     errors: list[str] = []
-    for provider in providers:
+    metrics: dict[str, object] = {}
+    try:
+        request = SearchRequest(
+            query=query,
+            category="news" if "CURRENT_NEWS" in set((context or {}).get("intents", [])) else "web",
+            freshness=str((context or {}).get("freshness") or "") or None,
+            count=result_count,
+            language="ko" if KOREAN_PATTERN.search(query) else "en",
+        )
+        batch = SearchRouter().search(request, context)
+        results.extend(batch.results)
+        metrics = batch.metrics
+    except RuntimeError as error:
+        errors.append(str(error))
+    if KOREAN_PATTERN.search(query) and _naver_configured():
         try:
-            results.extend(provider(query, result_count))
-        except (RuntimeError, httpx.HTTPError) as error:
+            results.extend(_legacy_result(result) for result in _naver_search(query, result_count))
+        except httpx.HTTPError as error:
             errors.append(str(error))
     if mode == "DEEP_RESEARCH":
         try:
-            results.extend(_reddit_search(query, min(3, result_count)))
+            results.extend(_legacy_result(result) for result in _reddit_search(query, min(3, result_count)))
         except httpx.HTTPError:
             pass
     if not results:
         detail = "; ".join(errors) or "no configured search provider returned results"
         raise RuntimeError(f"web search is required but unavailable: {detail}")
-    return [asdict(result) for result in _unique(results)[:result_count]]
+    unique = _unique_dict_results(results)[:result_count]
+    return (unique, metrics) if include_metrics else unique
 
 
-def search_many(queries: tuple[str, ...], mode: str) -> list[dict[str, str]]:
-    """Search each bounded research query and deduplicate the combined results."""
-    results: list[SearchResult] = []
-    errors: list[str] = []
-    for query in queries:
-        try:
-            results.extend(SearchResult(**result) for result in search(query, mode))
-        except RuntimeError as error:
-            errors.append(str(error))
-    unique_results = _unique(results)
-    anchor_terms = _query_terms(queries[0]) if queries else ()
-    unique_results.sort(key=lambda result: _relevance_score(result, anchor_terms), reverse=True)
-    unique = [asdict(result) for result in unique_results]
-    if not unique:
-        raise RuntimeError("; ".join(errors) or "no search results were returned")
-    return unique[:24]
+def search_many(
+    queries: tuple[str, ...],
+    mode: str,
+    context: dict[str, object] | None = None,
+    include_metrics: bool = False,
+) -> list[dict[str, object]] | tuple[list[dict[str, object]], dict[str, object]]:
+    """Search deduplicated queries and preserve provider usage metrics."""
+    deduplicated = tuple(dict.fromkeys(
+        query.strip() for query in queries if query.strip() and normalize_query(query)
+    ))
+    batch = SearchRouter().search_many(deduplicated, mode, context)
+    results = list(batch.results)
+    if mode == "DEEP_RESEARCH":
+        for query in deduplicated:
+            try:
+                results.extend(_legacy_result(result) for result in _reddit_search(query, 2))
+            except httpx.HTTPError:
+                continue
+    unique = _unique_dict_results(results)[:24]
+    return (unique, batch.metrics) if include_metrics else unique
 
 
 def visual_search(query: str, result_count: int = 3) -> list[dict[str, str]]:
@@ -153,6 +174,41 @@ def _query_terms(query: str) -> tuple[str, ...]:
 def _relevance_score(result: SearchResult, terms: tuple[str, ...]) -> int:
     haystack = f"{result.title} {result.description}".lower()
     return sum(1 for term in terms if term in haystack)
+
+
+def _legacy_result(result: SearchResult) -> dict[str, object]:
+    return {
+        "title": result.title,
+        "url": result.url,
+        "snippet": result.description,
+        "published_at": None,
+        "source": urlparse(result.url).netloc.lower().removeprefix("www."),
+        "provider": result.provider,
+        "category": "web",
+        "rank": 0,
+        "engine": None,
+        "score": None,
+        "providers_seen": [result.provider],
+    }
+
+
+def _unique_dict_results(results: list[dict[str, object]]) -> list[dict[str, object]]:
+    from runtime.search_providers import canonicalize_url
+
+    seen: dict[str, int] = {}
+    unique: list[dict[str, object]] = []
+    for result in results:
+        url = str(result.get("url", ""))
+        canonical = canonicalize_url(url)
+        if canonical in seen:
+            current = unique[seen[canonical]]
+            current["providers_seen"] = list(dict.fromkeys((
+                *current.get("providers_seen", []), *result.get("providers_seen", []),
+            )))
+            continue
+        seen[canonical] = len(unique)
+        unique.append(result)
+    return unique
 
 
 def academic_papers(

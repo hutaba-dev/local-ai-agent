@@ -303,10 +303,22 @@ def _web_search(
 ) -> ToolResult:
     started = perf_counter()
     try:
-        results = search_many(_queries(message), search_mode)
+        context = {
+            "intents": list(plan.intents) if plan is not None else [],
+            "freshness": plan.freshness_priority if plan is not None else None,
+            "required_evidence": list(plan.required_evidence) if plan is not None else [],
+            "requires_primary": bool(plan and any(
+                intent in plan.intents for intent in ("MARKET_FINANCE", "COMPANY_RESEARCH", "TECHNICAL_RESEARCH")
+            )),
+        }
+        results, search_metrics = search_many(_queries(message), search_mode, context, include_metrics=True)
         if plan is not None:
             results = _rank_relevant_web_results(results, plan)
-        return ToolResult("web_search", True, json.dumps(results, ensure_ascii=False), None, round((perf_counter() - started) * 1000))
+        duration_ms = round((perf_counter() - started) * 1000)
+        return ToolResult(
+            "web_search", True, json.dumps(results, ensure_ascii=False), None, duration_ms,
+            {"execution": "conditional_fallback", "wall_time_ms": duration_ms, **search_metrics},
+        )
     except (RuntimeError, httpx.HTTPError) as error:
         return ToolResult("web_search", False, "", str(error), round((perf_counter() - started) * 1000))
 
@@ -317,7 +329,7 @@ def _rank_relevant_web_results(
     ranked: list[dict[str, object]] = []
     for result in results:
         url = str(result.get("url", "")).lower()
-        text = f"{result.get('title', '')} {result.get('description', '')}".lower()
+        text = f"{result.get('title', '')} {result.get('snippet', result.get('description', ''))}".lower()
         if not plan.academic_enabled and any(domain in url for domain in ACADEMIC_DOMAINS):
             score = 0.05
         elif any(marker in url for marker in ("investor.", "/investor", "sec.gov", "nvidianews.nvidia.com")):

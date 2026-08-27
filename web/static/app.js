@@ -214,6 +214,15 @@ function activityElement(activity) {
   const finalCall = activity.final_call || {};
   const research = activity.research || {};
   const sourcePlan = research.source_plan || {};
+  const search = research.search || {};
+  const searchProviders = Object.entries(search.providers || {}).map(([provider, metrics]) => (
+    `${provider}: ${metrics.status || "UNKNOWN"}, ${metrics.query_count || 0} calls, ` +
+    `${metrics.success_count || 0} ok, ${metrics.failure_count || 0} failed, ` +
+    `${metrics.cache_hits || 0} cached, ${metrics.average_latency_ms || 0} ms avg`
+  )).join("; ");
+  const searchFallbacks = (search.fallbacks || []).map((fallback) => (
+    `${fallback.from || "provider"}: ${fallback.reason || "quality gate"}`
+  )).join("; ");
   const image = activity.image || {};
   const imageIntent = image.prompt_intent || {};
   const imageQuality = image.quality_gate || {};
@@ -260,6 +269,10 @@ function activityElement(activity) {
     ["Selected Sources", (sourcePlan.selected_sources || []).join("; ") || "N/A"],
     ["Skipped Sources", (sourcePlan.skipped_sources || []).join("; ") || "none"],
     ["Required Evidence", (sourcePlan.required_evidence || []).join("; ") || "N/A"],
+    ["Search queries", `${search.initial_queries || 0} initial; ${search.followup_queries || 0} follow-up`],
+    ["Search providers", searchProviders || "N/A"],
+    ["Search cache", `${search.cache_hits || 0} hits; ${search.cache_misses || 0} misses`],
+    ["Search fallbacks", searchFallbacks || "none"],
     ["State history", (research.state_history || []).join(" → ") || "N/A"],
     ["Research rounds", activity.research_rounds || "N/A"], ["Round detail", researchRounds],
     ["Entity confidence", research.entity_confidence || "N/A"], ["Gap status", research.gap_status || "N/A"],

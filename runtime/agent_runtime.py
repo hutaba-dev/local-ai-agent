@@ -297,6 +297,7 @@ class AgentRuntime:
         termination_reason = "research_budget_exhausted"
         identity_query_cache: dict[str, str] = {}
         source_plan = research_source_plan(question)
+        executed_query_fingerprints: set[str] = set()
 
         def resolve_researcher_query(tool_queries: tuple[str, ...], web_output: str) -> str:
             if "query" not in identity_query_cache:
@@ -306,6 +307,16 @@ class AgentRuntime:
             return identity_query_cache["query"]
 
         for round_number in range(1, MAX_RESEARCH_ROUNDS + 1):
+            from runtime.search_providers import normalize_query
+
+            queries = tuple(
+                query for query in queries
+                if normalize_query(query) not in executed_query_fingerprints
+            )
+            if not queries:
+                termination_reason = "no_new_followup_queries"
+                break
+            executed_query_fingerprints.update(normalize_query(query) for query in queries)
             state_history.append(ResearchState.SEARCHING.value)
             if person_query:
                 state_history.append(ResearchState.IDENTIFYING.value)
@@ -378,6 +389,7 @@ class AgentRuntime:
                 "skipped_sources": list(source_plan.skipped_sources),
                 "academic_enabled": source_plan.academic_enabled,
             },
+            "search": self._search_activity(all_tools, round_activity),
         }
 
     def _resolve_researcher_identity_query(
@@ -489,7 +501,51 @@ class AgentRuntime:
         if person_match:
             queries.append(f'"{person_match.group("name")}"')
         queries.extend((question, *planned_queries))
-        return tuple(dict.fromkeys(query.strip()[:500] for query in queries if query.strip()))
+        try:
+            configured_budget = int(os.getenv("INITIAL_SEARCH_QUERY_BUDGET", "3"))
+        except ValueError:
+            configured_budget = 3
+        budget = min(max(configured_budget, 1), 6)
+        return tuple(dict.fromkeys(query.strip()[:500] for query in queries if query.strip()))[:budget]
+
+    @staticmethod
+    def _search_activity(
+        tools: list[dict[str, object]], rounds: list[dict[str, object]]
+    ) -> dict[str, object]:
+        providers: dict[str, dict[str, object]] = {}
+        cache_hits = 0
+        cache_misses = 0
+        fallbacks: list[dict[str, str]] = []
+        for tool in tools:
+            if tool.get("name") != "web_search" or not isinstance(tool.get("details"), dict):
+                continue
+            details = tool["details"]
+            cache_hits += int(details.get("cache_hits", 0))
+            cache_misses += int(details.get("cache_misses", 0))
+            fallbacks.extend(details.get("fallbacks", []))
+            for name, raw in details.get("providers", {}).items():
+                values = raw if isinstance(raw, dict) else {}
+                aggregate = providers.setdefault(name, {
+                    "status": values.get("status", "UNCONFIGURED"), "query_count": 0,
+                    "success_count": 0, "failure_count": 0, "rate_limited_count": 0,
+                    "timeout_count": 0, "cache_hits": 0, "fallback_count": 0,
+                    "total_latency_ms": 0,
+                })
+                aggregate["status"] = values.get("status", aggregate["status"])
+                for key in ("query_count", "success_count", "failure_count", "rate_limited_count", "timeout_count", "cache_hits", "fallback_count"):
+                    aggregate[key] = int(aggregate[key]) + int(values.get(key, 0))
+                aggregate["total_latency_ms"] = int(aggregate["total_latency_ms"]) + int(values.get("average_latency_ms", 0)) * int(values.get("query_count", 0))
+        for values in providers.values():
+            calls = int(values["query_count"])
+            values["average_latency_ms"] = round(int(values.pop("total_latency_ms")) / calls) if calls else 0
+        return {
+            "initial_queries": len(rounds[0].get("queries", [])) if rounds else 0,
+            "followup_queries": sum(len(round_.get("queries", [])) for round_ in rounds[1:]),
+            "providers": providers,
+            "cache_hits": cache_hits,
+            "cache_misses": cache_misses,
+            "fallbacks": fallbacks,
+        }
 
     @staticmethod
     def _fallback_followup_queries(question: str) -> tuple[str, ...]:
