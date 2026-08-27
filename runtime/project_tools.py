@@ -24,6 +24,9 @@ class ProjectTools:
     def project_file_list(self, owner_id: str, project_id: str) -> list[dict[str, object]]:
         return self.store.list_files(owner_id, project_id)
 
+    def project_file_metadata(self, owner_id: str, project_id: str, limit: int = 100) -> list[dict[str, object]]:
+        return self.store.list_file_metadata(owner_id, project_id, limit)
+
     def project_file_search(self, owner_id: str, project_id: str, query: str) -> list[dict[str, object]]:
         return self.store.search(owner_id, project_id, query)["files"]
 

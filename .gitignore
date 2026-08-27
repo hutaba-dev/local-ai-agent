@@ -40,3 +40,5 @@ env/
 .vscode/settings.json
 .vscode/*.code-workspace
 .vscode/*.local.json
+mcp_external/bin/
+mcp_external/node_modules/

@@ -1,0 +1,11 @@
+{
+  "name": "ahnbys-mcp-external",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned official external MCP servers used by AHNBYS",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@playwright/mcp": "0.0.79",
+    "@upstash/context7-mcp": "4.0.3"
+  }
+}

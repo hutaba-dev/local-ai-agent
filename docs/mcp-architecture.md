@@ -12,13 +12,33 @@ AHNBYS adopts MCP as a standard tool interface, not as a replacement for its pla
 
 Phase 1 uses the official Python SDK and in-process transport. The same servers are executable over stdio, but AHNBYS does not expose an MCP network port or create another credential boundary.
 
-## Phase 1 Capabilities
+## Active Capabilities
 
 | MCP server | Tool | Existing implementation retained |
 | --- | --- | --- |
 | `ahnbys-search` | `search_web` | Conditional SearchRouter |
 | `ahnbys-search` | `search_news` | Conditional SearchRouter with news category |
 | `ahnbys-fetch` | `fetch_page` | Secure `fetch_sources()` extraction boundary |
+| `ahnbys-developer` | Time and local Git reads | Python timezone database and fixed AHNBYS repository |
+| `ahnbys-context7` | Documentation resolution and query | Official Context7 MCP through a two-tool facade |
+| `ahnbys-browser` | Public page browse and click | Official Playwright MCP through a two-tool facade |
+| `ahnbys-github` | Code search and repository reads | Official GitHub MCP in read-only mode |
+| `ahnbys-academic` | Researcher and publication reads | Existing Academic Intelligence |
+| `ahnbys-project` | Project search, files, and memories | Authenticated request-scoped ProjectTools |
+
+Main Qwen first receives a compact capability catalog. It may select no capability. Only the selected detailed schemas are sent on a tool turn, with a hard maximum of ten schemas. Main execution is limited to three rounds and four read calls. Research keeps its existing evidence-oriented state machine and SearchRouter policy.
+
+External servers are never exposed directly to Qwen. Context7 exposes two documentation operations. Playwright exposes only page and click operations, but remains disabled unless both `MCP_PLAYWRIGHT_ENABLED=true` and `MCP_PLAYWRIGHT_EGRESS_GUARD=true` certify an independently enforced network egress sandbox; application-level URL and redirect validation alone is not an SSRF boundary. GitHub starts with `--read-only --toolsets=repos,issues,pull_requests`; without `GITHUB_PERSONAL_ACCESS_TOKEN`, it remains `UNCONFIGURED` and no child process starts.
+
+Pinned external components:
+
+| Component | Version | License | Integrity source |
+| --- | --- | --- | --- |
+| Context7 MCP | 4.0.3 | MIT | npm lockfile integrity |
+| Microsoft Playwright MCP | 0.0.79 | Apache-2.0 | npm lockfile integrity |
+| GitHub MCP Server | 1.11.0 (`822c87761f8587395b3e1a04b5386b2611252cd1`) | MIT | Official release SHA-256 `3b73bb7be0c8b043f861e90410df8ebdfc71b83128c54ced75fb32c4ff697fc5` |
+
+Run `npm ci --prefix mcp_external` to restore npm dependencies. The platform-specific GitHub binary is intentionally not committed; install the official release into `mcp_external/bin/github-mcp-server` only after verifying the checksum above.
 
 The planner sees high-level capabilities rather than separate provider tools when MCP Search is enabled. `provider_hint=auto` lets SearchRouter choose SearXNG, Serper, or Brave. An explicit provider remains available for diagnosis or a deliberate planner choice.
 
@@ -57,12 +77,22 @@ Direct migration fallback is permitted only when `executed=false`. A timeout, in
 MCP_ENABLED=false
 MCP_SEARCH_ENABLED=true
 MCP_FETCH_ENABLED=true
+MCP_TIME_ENABLED=true
+MCP_GIT_ENABLED=true
+MCP_CONTEXT7_ENABLED=true
+MCP_PLAYWRIGHT_ENABLED=false
+# Set both flags only after deploying and verifying an external egress sandbox.
+MCP_PLAYWRIGHT_EGRESS_GUARD=false
+MCP_GITHUB_ENABLED=true
+MCP_ACADEMIC_ENABLED=true
+MCP_PROJECT_ENABLED=true
+MCP_IMAGE_ENABLED=false
 MCP_DIRECT_FALLBACK_ENABLED=true
 ```
 
 `MCP_ENABLED=false` is the default and preserves the direct executor. Enable capabilities independently after validation. To roll back immediately, set `MCP_ENABLED=false` and restart the web service. No provider or Academic Intelligence configuration changes are required.
 
-The host marks disabled tools `UNCONFIGURED`. Runtime Activity records MCP server, tool, status, duration, transport, and whether execution began. Provider-specific cost, cache, fallback, and health metrics remain supplied by SearchRouter.
+The host marks disabled or request-unscoped tools `UNCONFIGURED`. Runtime Activity records capability, action class, MCP server, tool, status, duration, and whether execution began, without exposing private reasoning. Provider-specific cost, cache, fallback, and health metrics remain supplied by SearchRouter.
 
 ## Failure Policy
 
@@ -110,3 +140,9 @@ Each phase must demonstrate:
 - feature-flag rollback without data or configuration migration
 
 Phase 1 automated coverage is in `tests/test_mcp_phase1.py`. Existing SearchRouter, fetch-security, Academic Intelligence, Project/Memory, and Research runtime suites remain the regression authority.
+
+## Dynamic Catalog Benchmark
+
+On 2026-08-28, the deployed Qwen selector chose the expected capability in seven planning-only cases: current time, local Git state, current FastAPI documentation, a JavaScript-rendered page, academic publication evidence, scoped project memory, and a stable Transformer explanation. The Transformer case selected no capability and executed no tool. GitHub remained `UNCONFIGURED` without a token.
+
+An end-to-end Main smoke test then produced `capability_selection -> get_current_time -> final answer` for a Seoul time request. The stable Transformer request produced `capability_selection -> response` with zero tool calls. These checks generated no paid search requests.

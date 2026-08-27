@@ -11,9 +11,15 @@ from time import perf_counter
 
 from mcp import Client
 
+from mcp_servers.academic_server import ACADEMIC_MCP
+from mcp_servers.browser_server import BROWSER_MCP
+from mcp_servers.context7_server import CONTEXT7_MCP
+from mcp_servers.developer_server import DEVELOPER_MCP
 from mcp_servers.fetch_server import fetch_mcp
-from mcp_servers.fetch_server import FETCH_PAGE_DESCRIPTION
-from mcp_servers.search_server import SEARCH_NEWS_DESCRIPTION, SEARCH_WEB_DESCRIPTION, search_mcp
+from mcp_servers.github_server import GITHUB_MCP
+from mcp_servers.project_server import ProjectScope, create_project_mcp
+from mcp_servers.search_server import search_mcp
+from runtime.capability_registry import CAPABILITIES, TOOL_SPECS
 
 
 class MCPHealth(str, Enum):
@@ -59,36 +65,69 @@ def _env_enabled(name: str, default: bool) -> bool:
 def mcp_tool_enabled(tool_name: str) -> bool:
 	if not _env_enabled("MCP_ENABLED", False):
 		return False
-	capability_flag = "MCP_FETCH_ENABLED" if tool_name == "fetch_page" else "MCP_SEARCH_ENABLED"
-	return _env_enabled(capability_flag, True)
+	if tool_name == "fetch_page":
+		return _env_enabled("MCP_FETCH_ENABLED", True)
+	spec = TOOL_SPECS.get(tool_name)
+	if spec is None:
+		return False
+	capability = next((item for item in CAPABILITIES if item.name == spec.capability), None)
+	default = False if spec.capability == "browser" else True
+	return bool(capability and _env_enabled(capability.feature_flag, default))
 
 
 class MCPHost:
 	def __init__(self) -> None:
-		self._servers = {"search-mcp": search_mcp, "web-mcp": fetch_mcp}
+		self._servers = {
+			"search-mcp": search_mcp,
+			"web-mcp": fetch_mcp,
+			"developer-mcp": DEVELOPER_MCP,
+			"context7-mcp": CONTEXT7_MCP,
+			"browser-mcp": BROWSER_MCP,
+			"academic-mcp": ACADEMIC_MCP,
+			"github-mcp": GITHUB_MCP,
+		}
 		self._tools = {
-			"search_web": MCPToolRecord(
-				"search_web", SEARCH_WEB_DESCRIPTION, "search-mcp", "low_variable", "public_network", 20,
-			),
-			"search_news": MCPToolRecord(
-				"search_news", SEARCH_NEWS_DESCRIPTION, "search-mcp", "low_variable", "public_network", 20,
-			),
-			"fetch_page": MCPToolRecord(
-				"fetch_page", FETCH_PAGE_DESCRIPTION, "web-mcp", "very_low", "public_https_only", 15,
-			),
+			name: MCPToolRecord(
+				name=spec.name,
+				description=spec.description,
+				server=spec.server,
+				cost=spec.cost_class,
+				permission=spec.permission,
+				timeout_seconds=30 if spec.server in {"browser-mcp", "github-mcp"} else 20,
+				input_schema=spec.input_schema,
+			)
+			for name, spec in TOOL_SPECS.items()
 		}
 		self._discovered = False
 		self._lock = Lock()
 
+	@staticmethod
+	def _configured(record: MCPToolRecord, project_scope: ProjectScope | None = None) -> bool:
+		if record.server == "browser-mcp":
+			return _env_enabled("MCP_PLAYWRIGHT_EGRESS_GUARD", False)
+		if record.server == "github-mcp":
+			return bool(os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN"))
+		if record.server == "project-mcp":
+			return project_scope is not None
+		return True
+
+	def _server_for(self, record: MCPToolRecord, project_scope: ProjectScope | None = None) -> object | None:
+		if record.server == "project-mcp":
+			return create_project_mcp(project_scope) if project_scope is not None else None
+		return self._servers.get(record.server)
+
 	async def _discover_async(self) -> None:
 		for server_name, server in self._servers.items():
+			server_records = [record for record in self._tools.values() if record.server == server_name]
+			if server_name == "github-mcp" and not os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN"):
+				for record in server_records:
+					record.health = MCPHealth.UNCONFIGURED.value
+				continue
 			try:
 				async with Client(server, read_timeout_seconds=5) as client:
 					result = await client.list_tools()
 				discovered = {tool.name: tool for tool in result.tools}
-				for record in self._tools.values():
-					if record.server != server_name:
-						continue
+				for record in server_records:
 					tool = discovered.get(record.name)
 					if tool is None:
 						record.health = MCPHealth.UNAVAILABLE.value
@@ -97,9 +136,8 @@ class MCPHost:
 					record.input_schema = tool.input_schema
 					record.health = MCPHealth.AVAILABLE.value
 			except Exception:
-				for record in self._tools.values():
-					if record.server == server_name:
-						record.health = MCPHealth.UNAVAILABLE.value
+				for record in server_records:
+					record.health = MCPHealth.UNAVAILABLE.value
 
 	def discover(self, force: bool = False) -> None:
 		with self._lock:
@@ -108,18 +146,27 @@ class MCPHost:
 			asyncio.run(self._discover_async())
 			self._discovered = True
 
-	def catalog(self) -> list[dict[str, object]]:
+	def catalog(self, project_scope: ProjectScope | None = None) -> list[dict[str, object]]:
 		self.discover()
 		catalog = []
 		for record in self._tools.values():
 			value = asdict(record)
-			if not mcp_tool_enabled(record.name):
+			if not self._configured(record, project_scope):
 				value["health"] = MCPHealth.UNCONFIGURED.value
+			elif not mcp_tool_enabled(record.name):
+				value["health"] = MCPHealth.UNCONFIGURED.value
+			elif record.server == "project-mcp":
+				value["health"] = MCPHealth.AVAILABLE.value
 			value["available"] = value["health"] == MCPHealth.AVAILABLE.value
 			catalog.append(value)
 		return catalog
 
-	async def _call_async(self, tool_name: str, arguments: dict[str, object]) -> MCPCallOutcome:
+	async def _call_async(
+		self,
+		tool_name: str,
+		arguments: dict[str, object],
+		project_scope: ProjectScope | None = None,
+	) -> MCPCallOutcome:
 		started = perf_counter()
 		record = self._tools.get(tool_name)
 		if record is None:
@@ -127,7 +174,17 @@ class MCPHost:
 				False, False, tool_name, "", MCPHealth.UNAVAILABLE.value, None,
 				"MCP tool is not registered", 0,
 			)
-		server = self._servers.get(record.server)
+		if not self._configured(record, project_scope):
+			return MCPCallOutcome(
+				False, False, tool_name, record.server, MCPHealth.UNCONFIGURED.value, None,
+				"MCP capability is not configured", 0,
+			)
+		if not mcp_tool_enabled(tool_name):
+			return MCPCallOutcome(
+				False, False, tool_name, record.server, MCPHealth.UNCONFIGURED.value, None,
+				"MCP capability is disabled", 0,
+			)
+		server = self._server_for(record, project_scope)
 		if server is None:
 			record.health = MCPHealth.UNAVAILABLE.value
 			return MCPCallOutcome(
@@ -176,16 +233,25 @@ class MCPHost:
 				"MCP connection or tool call failed", round((perf_counter() - started) * 1000),
 			)
 
-	def call(self, tool_name: str, arguments: dict[str, object]) -> MCPCallOutcome:
-		return asyncio.run(self._call_async(tool_name, arguments))
+	def call(
+		self,
+		tool_name: str,
+		arguments: dict[str, object],
+		project_scope: ProjectScope | None = None,
+	) -> MCPCallOutcome:
+		return asyncio.run(self._call_async(tool_name, arguments, project_scope))
 
 
 MCP_HOST = MCPHost()
 
 
-def mcp_tool_catalog() -> list[dict[str, object]]:
-	return MCP_HOST.catalog()
+def mcp_tool_catalog(project_scope: ProjectScope | None = None) -> list[dict[str, object]]:
+	return MCP_HOST.catalog(project_scope)
 
 
-def call_mcp_tool(tool_name: str, arguments: dict[str, object]) -> MCPCallOutcome:
-	return MCP_HOST.call(tool_name, arguments)
+def call_mcp_tool(
+	tool_name: str,
+	arguments: dict[str, object],
+	project_scope: ProjectScope | None = None,
+) -> MCPCallOutcome:
+	return MCP_HOST.call(tool_name, arguments, project_scope)

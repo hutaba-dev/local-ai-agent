@@ -12,6 +12,7 @@ from mcp import Client
 from mcp_servers.fetch_server import fetch_mcp
 from mcp_servers.search_server import search_mcp
 from runtime.agent_runtime import AgentRuntime
+from runtime.capability_registry import TOOL_SPECS
 from runtime.mcp_host import MCPCallOutcome, MCPHealth, MCPHost
 from runtime.search_providers import SearchBatch
 from runtime.tool_registry import ToolResult, execute_research_action, research_tool_catalog
@@ -30,7 +31,7 @@ class MCPPhase1Tests(unittest.TestCase):
         host = MCPHost()
         catalog = host.catalog()
 
-        self.assertEqual({tool["name"] for tool in catalog}, {"search_web", "search_news", "fetch_page"})
+        self.assertEqual({tool["name"] for tool in catalog}, set(TOOL_SPECS))
         self.assertTrue(all(tool["input_schema"] for tool in catalog))
         self.assertTrue(any("discovery metadata" in str(tool["description"]) for tool in catalog))
         self.assertTrue(any("public webpage" in str(tool["description"]) for tool in catalog))
@@ -74,11 +75,12 @@ class MCPPhase1Tests(unittest.TestCase):
         self.assertTrue(oversized.is_error)
 
     def test_host_handles_server_down_unknown_tool_and_invalid_arguments(self) -> None:
-        host = MCPHost()
-        host._servers.pop("search-mcp")
-        down = host.call("search_web", {"query": "topic"})
-        unknown = host.call("missing_tool", {})
-        invalid = MCPHost().call("search_web", {})
+        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_SEARCH_ENABLED": "true"}, clear=False):
+            host = MCPHost()
+            host._servers.pop("search-mcp")
+            down = host.call("search_web", {"query": "topic"})
+            unknown = host.call("missing_tool", {})
+            invalid = MCPHost().call("search_web", {})
 
         self.assertFalse(down.success)
         self.assertFalse(down.executed)
@@ -116,7 +118,7 @@ class MCPPhase1Tests(unittest.TestCase):
         for behavior, expected_status in cases:
             with self.subTest(status=expected_status, behavior=type(behavior).__name__):
                 FakeClient.behavior = behavior
-                with patch("runtime.mcp_host.Client", FakeClient):
+                with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_SEARCH_ENABLED": "true"}, clear=False), patch("runtime.mcp_host.Client", FakeClient):
                     outcome = MCPHost().call("search_web", {"query": "topic"})
 
                 self.assertFalse(outcome.success)
@@ -180,6 +182,16 @@ class MCPPhase1Tests(unittest.TestCase):
 
         catalog_call.assert_not_called()
         self.assertTrue({"searxng", "serper", "brave", "secure_page_fetch"} <= names)
+
+    def test_host_enforces_feature_flags_at_invocation_time(self) -> None:
+        with patch.dict(os.environ, {"MCP_ENABLED": "false"}, clear=False):
+            global_disabled = MCPHost().call("get_current_time", {})
+        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_TIME_ENABLED": "false"}, clear=False):
+            capability_disabled = MCPHost().call("get_current_time", {})
+
+        self.assertFalse(global_disabled.executed)
+        self.assertEqual(global_disabled.status, MCPHealth.UNCONFIGURED.value)
+        self.assertFalse(capability_disabled.executed)
 
     def test_qwen_decision_supports_auto_provider_and_explicit_fetch_urls(self) -> None:
         search = AgentRuntime._parse_research_decision(

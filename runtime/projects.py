@@ -455,6 +455,20 @@ class ProjectStore:
             ).fetchall()
         return [dict(row) for row in rows]
 
+    def list_file_metadata(self, owner_id: str, project_id: str, limit: int = 100) -> list[dict[str, object]]:
+        if not 1 <= limit <= 1_000:
+            raise ValueError("file limit must be between 1 and 1000")
+        with self._connect() as connection:
+            self._project_row(connection, owner_id, project_id)
+            rows = connection.execute(
+                """SELECT files.id, files.project_id, files.name, files.mime_type, files.size_bytes,
+                          files.created_at, artifacts.id AS artifact_id
+                   FROM files LEFT JOIN artifacts ON artifacts.file_id = files.id
+                   WHERE files.project_id = ? ORDER BY files.created_at DESC LIMIT ?""",
+                (project_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
     def get_file(self, owner_id: str, project_id: str, file_id: str) -> dict[str, object]:
         with self._connect() as connection:
             self._project_row(connection, owner_id, project_id)
@@ -567,13 +581,23 @@ class ProjectStore:
                         "memory_updated", owner_id, {"memory_id": memory_id, "type": memory_type})
         return self.get_memory(owner_id, project_id, memory_id)
 
-    def list_memories(self, owner_id: str, project_id: str, active_only: bool = False) -> list[dict[str, object]]:
+    def list_memories(
+        self,
+        owner_id: str,
+        project_id: str,
+        active_only: bool = False,
+        limit: int | None = None,
+    ) -> list[dict[str, object]]:
+        if limit is not None and not 1 <= limit <= 1_000:
+            raise ValueError("memory limit must be between 1 and 1000")
         with self._connect() as connection:
             self._project_row(connection, owner_id, project_id)
             clause = "AND active = 1" if active_only else ""
+            limit_clause = "LIMIT ?" if limit is not None else ""
+            parameters: tuple[object, ...] = (project_id, limit) if limit is not None else (project_id,)
             rows = connection.execute(
-                f"SELECT * FROM memories WHERE project_id = ? {clause} ORDER BY active DESC, updated_at DESC",
-                (project_id,),
+                f"SELECT * FROM memories WHERE project_id = ? {clause} ORDER BY active DESC, updated_at DESC {limit_clause}",
+                parameters,
             ).fetchall()
         return [dict(row) for row in rows]
 

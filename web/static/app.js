@@ -488,6 +488,8 @@ function formatMs(value) {
 
 function toolActivity(tool) {
   const details = tool.details || {};
+  const capability = tool.capability ? `${escapeHtml(tool.capability)} · ${escapeHtml(tool.action || "READ")} · ` : "";
+  const server = details.server ? ` via ${escapeHtml(details.server)} [${escapeHtml(details.status || "UNKNOWN")}]` : "";
   const reason = details.failure_reason ? `: ${escapeHtml(details.failure_reason)}` : "";
   const requests = (details.requests || []).map((request) => (
     `<div>${request.success ? "✓" : "!"} ${escapeHtml(request.path || request.query || request.operation || "request")} (${formatMs(request.duration_ms)})${request.attempt ? ` attempt ${escapeHtml(String(request.attempt))}` : ""}${request.failure_reason ? `: ${escapeHtml(request.failure_reason)}` : ""}</div>`
@@ -495,7 +497,7 @@ function toolActivity(tool) {
   const fetches = (details.fetches || []).map((fetch) => (
     `<div>${fetch.success ? "✓" : "!"} ${escapeHtml(fetch.url)} (${formatMs(fetch.total_fetch_time_ms)}, ${fetch.text_length ?? 0} chars${fetch.connect_time_ms === null ? ", connect N/A" : ""})${fetch.failure_reason ? `: ${escapeHtml(fetch.failure_reason)}` : ""}</div>`
   )).join("");
-  return `<div class="${tool.success ? "tool-ok" : "tool-failed"}">${tool.success ? "✓" : "!"} ${escapeHtml(tool.name)} (${formatMs(tool.duration_ms)})${reason}${requests}${fetches}</div>`;
+  return `<div class="${tool.success ? "tool-ok" : "tool-failed"}">${tool.success ? "✓" : "!"} ${capability}${escapeHtml(tool.name)} (${formatMs(tool.duration_ms)})${server}${reason}${requests}${fetches}</div>`;
 }
 
 async function request(path, options = {}) {
