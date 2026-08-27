@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from dataclasses import replace
 
 from runtime.web_search import _s2_author_queries, _select_s2_author, academic_papers, fetch_sources, s2_get_author, s2_get_author_papers, s2_get_paper, s2_search_author, search, unpaywall_get_oa_location
 import os
@@ -20,6 +21,7 @@ from runtime.image_client import (
     ImageQualityAssessment,
 )
 from runtime.projects import ProjectStore
+from runtime.router import Route
 from runtime.tool_registry import (
     ToolResult,
     _rank_relevant_web_results,
@@ -610,6 +612,68 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual([item["role"] for item in messages.json()["messages"]], ["user", "assistant"])
         self.assertEqual(memory.status_code, 200)
         self.assertEqual(forbidden.status_code, 404)
+
+    def test_general_and_project_research_share_canonical_result_schema(self) -> None:
+        research_result = {
+            "body_markdown": "### Findings\n**FACT:** Evidence. [S2]",
+            "sources": [{
+                "id": "S2", "title": "Primary evidence", "domain": "example.com",
+                "url": "https://example.com/evidence", "published_date": "2026-08-27", "provider": "searxng",
+            }],
+            "annotations": ["FACT"],
+        }
+        base_result = self.runtime.chat("hello", "main")
+        result = replace(
+            base_result,
+            content=research_result["body_markdown"],
+            route=Route("research", "Research fixture", "DEEP_RESEARCH"),
+            selected_agent="research",
+            research={"result": research_result, "rounds": []},
+        )
+        previous_runtime = web_app.runtime
+        web_app.runtime = self.runtime
+        try:
+            client = self.authenticated_client()
+            with patch("web.app.runtime.chat", return_value=result):
+                general = client.post("/api/chat", json={
+                    "message": "general research", "selected_agent": "research",
+                })
+                project_id = client.post("/api/projects", json={"name": "Research UI"}).json()["id"]
+                conversation_id = client.post(
+                    f"/api/projects/{project_id}/conversations", json={"title": "Research"}
+                ).json()["id"]
+                project = client.post("/api/chat", json={
+                    "message": "project research", "selected_agent": "research",
+                    "project_id": project_id, "conversation_id": conversation_id,
+                })
+            restored = client.get(
+                f"/api/projects/{project_id}/conversations/{conversation_id}/messages"
+            )
+        finally:
+            web_app.runtime = previous_runtime
+
+        self.assertEqual(general.json()["research_result"], research_result)
+        self.assertEqual(project.json()["research_result"], research_result)
+        assistant = next(item for item in restored.json()["messages"] if item["role"] == "assistant")
+        self.assertEqual(assistant["research_result"], research_result)
+        self.assertFalse(any(item.get("type") == "research_result" for item in assistant["tool_metadata"]))
+
+    def test_research_result_exposes_source_registry_without_rigid_sections(self) -> None:
+        result = AgentRuntime._research_result("Free-form answer. **INFERENCE:** result [S1]", [{
+            "name": "web_sources",
+            "success": True,
+            "output": json.dumps([{
+                "title": "Evidence title", "url": "https://news.example.com/report",
+                "text": "Evidence body", "published_date": "2026-08-27", "provider": "searxng",
+            }]),
+        }])
+
+        self.assertEqual(result["body_markdown"], "Free-form answer. **INFERENCE:** result [S1]")
+        self.assertEqual(result["annotations"], ["INFERENCE"])
+        self.assertEqual(result["sources"][0], {
+            "id": "S1", "title": "Evidence title", "domain": "news.example.com",
+            "url": "https://news.example.com/report", "published_date": "2026-08-27", "provider": "searxng",
+        })
 
     def test_project_api_allows_only_owner_to_delete_project(self) -> None:
         owner = self.authenticated_client()

@@ -13,12 +13,15 @@ SCRIPT = ROOT / "web" / "static" / "app.js"
 
 @unittest.skipUnless(shutil.which("node"), "Node.js is required for renderer tests")
 class AnswerRenderingTests(unittest.TestCase):
-    def render(self, markdown: str) -> str:
+    def render(self, markdown: str, sources: list[dict[str, str]] | None = None) -> str:
         source = SCRIPT.read_text(encoding="utf-8")
         start = source.index("function escapeHtml")
-        end = source.index("function enhanceResearchMessage")
+        end = source.index("function renderResearchAnswer")
         renderer = source[start:end]
-        program = f"{renderer}\nprocess.stdout.write(markdown({json.dumps(markdown)}));"
+        program = (
+            f"{renderer}\nprocess.stdout.write(markdown("
+            f"{json.dumps(markdown)}, {json.dumps(sources or [])}));"
+        )
         return subprocess.run(
             ["node", "-e", program], check=True, capture_output=True, text=True
         ).stdout
@@ -62,6 +65,47 @@ class AnswerRenderingTests(unittest.TestCase):
 
         self.assertIn("&lt;script&gt;", output)
         self.assertNotIn('class="external-link"', output)
+
+    def test_production_research_fixture_renders_headings_annotations_and_citations(self) -> None:
+        output = self.render(
+            "NVIDIA 최신 이슈 요약\n\n"
+            "### 1. 핵심 이슈\n**FACT:** 주요 발표가 있었다. [S2, S4]\n\n"
+            "### 2. 기타 NVIDIA 관련 이슈\n**UNKNOWN:** 추가 확인이 필요하다.\n\n"
+            "### 3. 한계 및 불확실성\n*본문과 출처를 구분한다.*",
+            [
+                {"id": "S2", "title": "NVIDIA report", "domain": "reuters.com", "url": "https://reuters.com/example"},
+                {"id": "S4", "title": "Industry analysis", "domain": "example.com", "url": "https://example.com/report"},
+            ],
+        )
+
+        self.assertIn("<h3>1. 핵심 이슈</h3>", output)
+        self.assertNotIn("###", output)
+        self.assertIn('class="verification-badge fact"', output)
+        self.assertIn('class="verification-badge unknown"', output)
+        self.assertIn('class="external-link citation-chip"', output)
+        self.assertIn('href="https://reuters.com/example"', output)
+        self.assertNotIn("[S2, S4]", output)
+        self.assertNotIn(">https://", output)
+
+    def test_all_research_entry_points_use_canonical_renderer(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn("function renderResearchAnswer(article, researchResult = {})", source)
+        self.assertIn("const normalizedResearch = researchResult || activity?.research?.result || null", source)
+        self.assertIn("markdown(body, normalizedResearch?.sources || [])", source)
+        self.assertIn("renderResearchAnswer(article, normalizedResearch || {})", source)
+        self.assertIn("message.research_result", source)
+        self.assertNotIn("enhanceResearchMessage", source)
+
+    def test_markdown_fallback_supports_standard_report_elements(self) -> None:
+        output = self.render(
+            "# Title\n\n**bold** and *italic* with [named link](https://example.com/page).\n\n"
+            "> quoted evidence\n\n- first\n- second\n\n1. one\n2. two\n\n"
+            "| A | B |\n|---|---|\n| x | `code` |\n\n```text\nblock code\n```"
+        )
+
+        for expected in ("<h1>Title</h1>", "<strong>bold</strong>", "<em>italic</em>", "<blockquote>", "<ul>", "<ol>", "<table>", "<code>code</code>", "<pre><code>block code</code></pre>"):
+            self.assertIn(expected, output)
 
 
 if __name__ == "__main__":

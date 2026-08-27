@@ -451,7 +451,26 @@ def create_project_conversation(
 @app.get("/api/projects/{project_id}/conversations/{conversation_id}/messages")
 def project_messages(project_id: str, conversation_id: str, request: Request) -> dict[str, object]:
     user = require_project_access(request)
-    return {"messages": project_store.list_messages(user.username, project_id, conversation_id)}
+    messages = project_store.list_messages(user.username, project_id, conversation_id)
+    for message in messages:
+        metadata = message.get("tool_metadata")
+        if not isinstance(metadata, list):
+            continue
+        presentation = next(
+            (
+                item.get("result")
+                for item in metadata
+                if isinstance(item, dict) and item.get("type") == "research_result"
+            ),
+            None,
+        )
+        if isinstance(presentation, dict):
+            message["research_result"] = presentation
+        message["tool_metadata"] = [
+            item for item in metadata
+            if not isinstance(item, dict) or item.get("type") != "research_result"
+        ]
+    return {"messages": messages}
 
 
 @app.get("/api/projects/{project_id}/files")
@@ -1051,13 +1070,17 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
     for attachment_id in request.attachment_ids:
         delete_attachment(attachment_id)
     if request.project_id and request.conversation_id:
+        persisted_tools = list(result.tools)
+        research_result = result.research.get("result")
+        if isinstance(research_result, dict):
+            persisted_tools.append({"type": "research_result", "result": research_result})
         project_store.add_message(
             user.username,
             request.project_id,
             request.conversation_id,
             "assistant",
             result.content,
-            result.tools,
+            persisted_tools,
         )
         background_tasks.add_task(
             project_store.process_durable_updates,
@@ -1085,6 +1108,7 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         "project_id": request.project_id,
         "conversation_id": request.conversation_id,
         "content": result.content,
+        "research_result": result.research.get("result"),
         "activity": {
             "selected_agent": result.selected_agent,
             "routed_agent": result.route.agent,

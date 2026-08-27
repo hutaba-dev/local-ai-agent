@@ -110,12 +110,29 @@ function linkMarkup(label, url) {
   return `<a class="external-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer" title="Open ${escapeHtml(hostname)}">${escapeHtml(label)}</a>`;
 }
 
-function tokenizeLinks(value, links) {
+function citationMarkup(source) {
+  const safeUrl = safeExternalUrl(source.url);
+  if (!safeUrl) return escapeHtml(`[${source.id}]`);
+  const label = String(source.id).replace(/^S/i, "");
+  const title = source.title || source.domain || sourceLabel(safeUrl);
+  return `<a class="external-link citation-chip" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(title)}">[${escapeHtml(label)}]</a>`;
+}
+
+function tokenizeLinks(value, links, sources = []) {
+  const sourceRegistry = new Map(sources.map((source) => [String(source.id || "").toUpperCase(), source]));
   let text = value.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (match, label, url) => {
     const safeUrl = safeExternalUrl(url);
     if (!safeUrl) return label;
     const id = links.push(linkMarkup(label, safeUrl)) - 1;
     return `@@LINK${id}@@`;
+  });
+  text = text.replace(/\[(S\d+(?:\s*,\s*S\d+)*)\]/gi, (match, value) => {
+    const sourceIds = value.split(",").map((sourceId) => sourceId.trim().toUpperCase());
+    if (sourceIds.some((sourceId) => !sourceRegistry.has(sourceId))) return match;
+    return sourceIds.map((sourceId) => {
+      const id = links.push(citationMarkup(sourceRegistry.get(sourceId))) - 1;
+      return `@@LINK${id}@@`;
+    }).join(" ");
   });
   return text.replace(/https?:\/\/[^\s<>()\]]+/g, (match) => {
     const trailing = match.match(/[.,;:!?]+$/)?.[0] || "";
@@ -137,6 +154,13 @@ function inlineMarkdown(value) {
       if (status === "VERIFIED") return '<span class="verification-badge verified">Verified</span>';
       if (status === "PARTIALLY VERIFIED") return '<span class="verification-badge partial">Partially verified</span>';
       return '<span class="verification-badge unverified">Not verified</span>';
+    })
+    .replace(/\b(FACT|INFERENCE|FORECAST|UNKNOWN)(?=\s*:|\s*[·|])/gi, (match) => {
+      const status = match.toLowerCase();
+      return `<span class="verification-badge ${status}">${status[0].toUpperCase()}${status.slice(1)}</span>`;
+    })
+    .replace(/\b(HIGH|MEDIUM|LOW)\s+CONFIDENCE\b/gi, (match) => {
+      return `<span class="verification-badge confidence">${match.toLowerCase().replace(/^./, (letter) => letter.toUpperCase())}</span>`;
     });
 }
 
@@ -154,7 +178,7 @@ function markdownTable(block) {
     `<tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${inlineMarkdown(cell)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
 }
 
-function markdown(value) {
+function markdown(value, sources = []) {
   const codeBlocks = [];
   const links = [];
   let text = String(value).replace(/```(?:[^\n]*)\n?([\s\S]*?)```/g, (_, code) => {
@@ -162,7 +186,8 @@ function markdown(value) {
     const id = codeBlocks.push(`<div class="code-block"><button class="copy-code" type="button" data-copy="${encodeURIComponent(trimmed)}">Copy code</button><pre><code>${escapeHtml(trimmed)}</code></pre></div>`) - 1;
     return `@@CODE${id}@@`;
   });
-  text = escapeHtml(tokenizeLinks(text, links));
+  text = escapeHtml(tokenizeLinks(text, links, sources));
+  text = text.replace(/(^|\n)(#{1,3}\s+[^\n]+)(?=\n|$)/g, "$1\n$2\n").replace(/\n{3,}/g, "\n\n").trim();
   const blocks = [];
   for (const rawBlock of text.split(/\n{2,}/)) {
     const block = rawBlock.trim();
@@ -173,8 +198,8 @@ function markdown(value) {
     if (table) { blocks.push(table); continue; }
     const heading = block.match(/^(#{1,3})\s+(.+)$/);
     if (heading) { blocks.push(`<h${heading[1].length}>${inlineMarkdown(heading[2])}</h${heading[1].length}>`); continue; }
-    if (block.split("\n").every((line) => /^>\s?/.test(line))) {
-      blocks.push(`<blockquote>${inlineMarkdown(block.replace(/^>\s?/gm, "").replaceAll("\n", "<br>"))}</blockquote>`);
+    if (block.split("\n").every((line) => /^&gt;\s?/.test(line))) {
+      blocks.push(`<blockquote>${inlineMarkdown(block.replace(/^&gt;\s?/gm, "").replaceAll("\n", "<br>"))}</blockquote>`);
       continue;
     }
     const lines = block.split("\n");
@@ -194,7 +219,7 @@ function markdown(value) {
     .replace(/@@LINK(\d+)@@/g, (_, id) => links[Number(id)]);
 }
 
-function enhanceResearchMessage(article) {
+function renderResearchAnswer(article, researchResult = {}) {
   const content = article.querySelector(".markdown");
   if (!content) return;
   article.classList.add("research-report");
@@ -202,33 +227,48 @@ function enhanceResearchMessage(article) {
   if (firstParagraph) firstParagraph.classList.add("report-summary");
   const links = [...content.querySelectorAll("a.external-link")];
   links.forEach((link) => link.classList.add("source-chip"));
-  const uniqueLinks = [...new Map(links.map((link) => [link.href, link])).values()];
-  if (!uniqueLinks.length) return;
+  const registeredSources = Array.isArray(researchResult.sources) ? researchResult.sources : [];
+  const sourceRecords = new Map();
+  registeredSources.forEach((source) => {
+    const safeUrl = safeExternalUrl(source.url || "");
+    if (safeUrl) sourceRecords.set(safeUrl, { ...source, url: safeUrl });
+  });
+  links.forEach((link) => {
+    if (!sourceRecords.has(link.href)) {
+      sourceRecords.set(link.href, { id: "", title: link.textContent, domain: link.hostname, url: link.href });
+    }
+  });
+  if (!sourceRecords.size) return;
   const sources = document.createElement("section");
   sources.className = "report-sources";
   const heading = document.createElement("h2");
   heading.textContent = "Sources";
   const list = document.createElement("div");
   list.className = "source-list";
-  uniqueLinks.forEach((source, index) => {
+  [...sourceRecords.values()].forEach((source, index) => {
     const link = document.createElement("a");
     link.className = "source-pill";
-    link.href = source.href;
+    link.href = source.url;
     link.target = "_blank";
     link.rel = "noopener noreferrer";
-    link.title = source.hostname;
-    link.textContent = `${index + 1}. ${sourceLabel(source.href)}`;
+    link.title = source.domain || sourceLabel(source.url);
+    const sourceNumber = String(source.id || "").replace(/^S/i, "") || String(index + 1);
+    link.textContent = `${sourceNumber}. ${source.title || sourceLabel(source.url)}`;
     list.append(link);
   });
   sources.append(heading, list);
   content.append(sources);
 }
 
-function addMessage(role, content, label, activity) {
+function addMessage(role, content, label, activity, researchResult = null) {
   const article = document.createElement("article");
   article.className = `message ${role}`;
-  article.innerHTML = `<div class="message-header"><div class="message-label">${escapeHtml(label)}</div></div><div class="markdown">${markdown(content)}</div>`;
-  if (role === "assistant" && activity?.routed_agent === "research") enhanceResearchMessage(article);
+  const normalizedResearch = researchResult || activity?.research?.result || null;
+  const body = normalizedResearch?.body_markdown || content;
+  article.innerHTML = `<div class="message-header"><div class="message-label">${escapeHtml(label)}</div></div><div class="markdown">${markdown(body, normalizedResearch?.sources || [])}</div>`;
+  if (role === "assistant" && (normalizedResearch || activity?.routed_agent === "research")) {
+    renderResearchAnswer(article, normalizedResearch || {});
+  }
   if (activity) article.append(activityElement(activity));
   messages.append(article);
   article.scrollIntoView({ behavior: "smooth", block: "end" });
@@ -536,7 +576,13 @@ async function openConversation(conversationId) {
   const payload = await request(`/api/projects/${encodeURIComponent(currentProject.id)}/conversations/${encodeURIComponent(conversationId)}/messages`);
   messages.innerHTML = "";
   for (const message of payload.messages) {
-    addMessage(message.role, message.content, message.role === "user" ? "You" : "main");
+    addMessage(
+      message.role,
+      message.content,
+      message.role === "user" ? "You" : message.research_result ? "research" : "main",
+      null,
+      message.research_result,
+    );
   }
   if (!payload.messages.length) addMessage("assistant", "This conversation shares the project's files, summary, and durable memory.", "Project Workspace");
   conversationContext.hidden = false;
@@ -797,7 +843,9 @@ form.addEventListener("submit", async (event) => {
     const payload = await request("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, selected_agent: selector.value, session_id: sessionId, attachment_ids: submittedAttachments.map((attachment) => attachment.attachment_id), continuation_image_id: continuationImageId, project_id: currentProject?.id || null, conversation_id: currentConversation?.id || null }) });
     sessionId = payload.session_id;
     if (payload.continuation_image_id) continuationImageId = payload.continuation_image_id;
-    const article = addMessage("assistant", payload.content, payload.activity.routed_agent, payload.activity);
+    const article = addMessage(
+      "assistant", payload.content, payload.activity.routed_agent, payload.activity, payload.research_result,
+    );
     addGeneratedImages(article, payload.generated_images);
   } catch (error) {
     if (error.status === 404 && (submittedAttachments.length || continuationImageId)) {

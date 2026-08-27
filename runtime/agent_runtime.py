@@ -12,6 +12,7 @@ from enum import Enum
 from pathlib import Path
 from time import perf_counter
 from typing import Callable, TypeVar
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 import httpx
@@ -464,6 +465,7 @@ class AgentRuntime:
             if RESEARCH_PROGRESS_PATTERN.search(answer):
                 raise ValueError("deep research did not produce a terminal final answer")
         state_history.append(ResearchState.COMPLETE.value)
+        research_result = self._research_result(answer, all_tools)
         return all_tools, answer, payload, {
             "mode": "DEEP_RESEARCH",
             "state": ResearchState.COMPLETE.value,
@@ -492,6 +494,46 @@ class AgentRuntime:
                 "EVIDENCE_NORMALIZATION", "CAUSAL_ANALYST", "RESEARCH_CRITIC", "FINAL_SYNTHESIS",
             ),
             "claim_taxonomy": ("FACT", "INFERENCE", "FORECAST", "UNKNOWN"),
+            "result": research_result,
+        }
+
+    @staticmethod
+    def _research_result(answer: str, tools: list[dict[str, object]]) -> dict[str, object]:
+        evidence = AgentRuntime._evidence_package(tools)
+        source_records = [
+            *evidence.get("sources", []),
+            *evidence.get("representative_works", []),
+        ]
+        sources: list[dict[str, object]] = []
+        seen_urls: set[str] = set()
+        for record in source_records:
+            if not isinstance(record, dict):
+                continue
+            url = str(record.get("url", "")).strip()
+            doi = str(record.get("doi", "")).strip()
+            if not url and doi:
+                url = f"https://doi.org/{doi.removeprefix('https://doi.org/')}"
+            if not url or url in seen_urls or urlparse(url).scheme not in {"http", "https"}:
+                continue
+            seen_urls.add(url)
+            source_id = str(record.get("evidence_id") or f"S{len(sources) + 1}")
+            sources.append({
+                "id": source_id,
+                "title": str(record.get("title") or urlparse(url).hostname or "Source")[:300],
+                "domain": (urlparse(url).hostname or "").removeprefix("www."),
+                "url": url[:1000],
+                "published_date": record.get("published_date") or record.get("year") or record.get("publication_year"),
+                "provider": str(record.get("provider") or record.get("venue") or record.get("journal") or ""),
+            })
+        annotations = [
+            label
+            for label in ("FACT", "INFERENCE", "FORECAST", "UNKNOWN")
+            if re.search(rf"\b{label}\b(?=\s*:|\s*[·|])", answer, re.IGNORECASE)
+        ]
+        return {
+            "body_markdown": answer,
+            "sources": sources,
+            "annotations": annotations,
         }
 
     def _decide_research_action(
@@ -1287,6 +1329,8 @@ class AgentRuntime:
                         "title": str(item.get("title", ""))[:300],
                         "url": str(item.get("url", ""))[:1000],
                         "text": str(item.get("text", ""))[:1200],
+                        "published_date": item.get("published_date") or item.get("date"),
+                        "provider": item.get("provider") or item.get("source"),
                         "relevance_score": float(item.get("relevance_score", 0.4)),
                         "evidence_role": AgentRuntime._web_evidence_role(item),
                         "evidence_group": "current_web",
@@ -1305,6 +1349,8 @@ class AgentRuntime:
         package["sources"] = AgentRuntime._select_evidence_sources(package["sources"], 6)
         for index, source in enumerate(package["sources"], 1):
             source["evidence_id"] = f"S{index}"
+        for index, work in enumerate(package["representative_works"], len(package["sources"]) + 1):
+            work["evidence_id"] = f"S{index}"
         return package
 
     @staticmethod
