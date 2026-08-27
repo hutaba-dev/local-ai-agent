@@ -1109,10 +1109,13 @@ class WebRuntimeTests(unittest.TestCase):
         index = client.get("/", follow_redirects=False)
         login = client.get("/login")
         script = client.get("/static/app.js")
+        answer_styles = client.get("/static/answer-rendering.css")
 
         self.assertEqual(index.status_code, 303)
         self.assertEqual(login.headers["cache-control"], "no-store")
         self.assertEqual(script.headers["cache-control"], "no-store")
+        self.assertEqual(answer_styles.status_code, 200)
+        self.assertEqual(answer_styles.headers["cache-control"], "no-store")
 
     def test_shared_account_cannot_reuse_another_browser_chat_session(self) -> None:
         first_browser = self.authenticated_client()

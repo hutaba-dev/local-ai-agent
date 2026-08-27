@@ -46,6 +46,10 @@ const fileSearch = document.querySelector("#file-search");
 const projectFilesElement = document.querySelector("#project-files");
 const projectMemoryElement = document.querySelector("#project-memory");
 const projectActivityElement = document.querySelector("#project-activity");
+const answerStylesheet = document.createElement("link");
+answerStylesheet.rel = "stylesheet";
+answerStylesheet.href = "/static/answer-rendering.css";
+document.head.append(answerStylesheet);
 let sessionId = null;
 let continuationImageId = null;
 let projects = [];
@@ -69,29 +73,104 @@ selectionCopyButton.hidden = true;
 document.body.append(selectionCopyButton);
 
 function escapeHtml(value) {
-  return value.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+  return String(value).replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll('"', "&quot;");
+}
+
+const SOURCE_LABELS = {
+  "finance.yahoo.com": "Yahoo Finance",
+  "investor.nvidia.com": "NVIDIA IR",
+  "nvidianews.nvidia.com": "NVIDIA Newsroom",
+  "nvidia.com": "NVIDIA",
+  "reuters.com": "Reuters",
+  "wsj.com": "Wall Street Journal",
+  "marketbeat.com": "MarketBeat",
+  "public.com": "Public",
+};
+
+function safeExternalUrl(value) {
+  try {
+    const url = new URL(value.replaceAll("&amp;", "&"));
+    return ["http:", "https:"].includes(url.protocol) ? url.href : null;
+  } catch (error) {
+    return null;
+  }
+}
+
+function sourceLabel(value) {
+  const url = safeExternalUrl(value);
+  if (!url) return "Source";
+  const hostname = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+  return SOURCE_LABELS[hostname] || hostname;
+}
+
+function linkMarkup(label, url) {
+  const safeUrl = safeExternalUrl(url);
+  if (!safeUrl) return escapeHtml(label);
+  const hostname = new URL(safeUrl).hostname.replace(/^www\./, "");
+  return `<a class="external-link" href="${escapeHtml(safeUrl)}" target="_blank" rel="noopener noreferrer" title="Open ${escapeHtml(hostname)}">${escapeHtml(label)}</a>`;
+}
+
+function tokenizeLinks(value, links) {
+  let text = value.replace(/\[([^\]\n]+)\]\(([^)\s]+)\)/g, (match, label, url) => {
+    const safeUrl = safeExternalUrl(url);
+    if (!safeUrl) return label;
+    const id = links.push(linkMarkup(label, safeUrl)) - 1;
+    return `@@LINK${id}@@`;
+  });
+  return text.replace(/https?:\/\/[^\s<>()\]]+/g, (match) => {
+    const trailing = match.match(/[.,;:!?]+$/)?.[0] || "";
+    const url = trailing ? match.slice(0, -trailing.length) : match;
+    const safeUrl = safeExternalUrl(url);
+    if (!safeUrl) return match;
+    const id = links.push(linkMarkup(sourceLabel(safeUrl), safeUrl)) - 1;
+    return `@@LINK${id}@@${trailing}`;
+  });
 }
 
 function inlineMarkdown(value) {
   return value
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/\*([^*]+)\*/g, "<em>$1</em>");
+    .replace(/\*([^*]+)\*/g, "<em>$1</em>")
+    .replace(/\b(PARTIALLY VERIFIED|NOT VERIFIED|VERIFIED)\b/gi, (match) => {
+      const status = match.toUpperCase();
+      if (status === "VERIFIED") return '<span class="verification-badge verified">Verified</span>';
+      if (status === "PARTIALLY VERIFIED") return '<span class="verification-badge partial">Partially verified</span>';
+      return '<span class="verification-badge unverified">Not verified</span>';
+    });
+}
+
+function tableCells(line) {
+  return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim());
+}
+
+function markdownTable(block) {
+  const lines = block.split("\n").filter((line) => line.trim());
+  if (lines.length < 2 || !tableCells(lines[1]).every((cell) => /^:?-{3,}:?$/.test(cell))) return null;
+  const headers = tableCells(lines[0]);
+  const rows = lines.slice(2).map(tableCells);
+  if (!headers.length || rows.some((row) => row.length !== headers.length)) return null;
+  return `<div class="table-scroll"><table><thead><tr>${headers.map((cell) => `<th>${inlineMarkdown(cell)}</th>`).join("")}</tr></thead>` +
+    `<tbody>${rows.map((row) => `<tr>${row.map((cell) => `<td>${inlineMarkdown(cell)}</td>`).join("")}</tr>`).join("")}</tbody></table></div>`;
 }
 
 function markdown(value) {
   const codeBlocks = [];
-  let text = escapeHtml(value).replace(/```([\s\S]*?)```/g, (_, code) => {
+  const links = [];
+  let text = String(value).replace(/```(?:[^\n]*)\n?([\s\S]*?)```/g, (_, code) => {
     const trimmed = code.trim();
-    const id = codeBlocks.push(`<div class="code-block"><button class="copy-code" type="button" data-copy="${encodeURIComponent(trimmed)}">Copy code</button><pre><code>${trimmed}</code></pre></div>`) - 1;
+    const id = codeBlocks.push(`<div class="code-block"><button class="copy-code" type="button" data-copy="${encodeURIComponent(trimmed)}">Copy code</button><pre><code>${escapeHtml(trimmed)}</code></pre></div>`) - 1;
     return `@@CODE${id}@@`;
   });
+  text = escapeHtml(tokenizeLinks(text, links));
   const blocks = [];
   for (const rawBlock of text.split(/\n{2,}/)) {
     const block = rawBlock.trim();
     if (!block) continue;
     if (/^@@CODE\d+@@$/.test(block)) { blocks.push(block); continue; }
     if (/^---+$/.test(block)) { blocks.push("<hr>"); continue; }
+    const table = markdownTable(block);
+    if (table) { blocks.push(table); continue; }
     const heading = block.match(/^(#{1,3})\s+(.+)$/);
     if (heading) { blocks.push(`<h${heading[1].length}>${inlineMarkdown(heading[2])}</h${heading[1].length}>`); continue; }
     if (block.split("\n").every((line) => /^>\s?/.test(line))) {
@@ -110,13 +189,46 @@ function markdown(value) {
     blocks.push(`<p>${inlineMarkdown(block.replaceAll("\n", "<br>"))}</p>`);
   }
   text = blocks.join("");
-  return text.replace(/@@CODE(\d+)@@/g, (_, id) => codeBlocks[Number(id)]);
+  return text
+    .replace(/@@CODE(\d+)@@/g, (_, id) => codeBlocks[Number(id)])
+    .replace(/@@LINK(\d+)@@/g, (_, id) => links[Number(id)]);
+}
+
+function enhanceResearchMessage(article) {
+  const content = article.querySelector(".markdown");
+  if (!content) return;
+  article.classList.add("research-report");
+  const firstParagraph = content.querySelector(":scope > p");
+  if (firstParagraph) firstParagraph.classList.add("report-summary");
+  const links = [...content.querySelectorAll("a.external-link")];
+  links.forEach((link) => link.classList.add("source-chip"));
+  const uniqueLinks = [...new Map(links.map((link) => [link.href, link])).values()];
+  if (!uniqueLinks.length) return;
+  const sources = document.createElement("section");
+  sources.className = "report-sources";
+  const heading = document.createElement("h2");
+  heading.textContent = "Sources";
+  const list = document.createElement("div");
+  list.className = "source-list";
+  uniqueLinks.forEach((source, index) => {
+    const link = document.createElement("a");
+    link.className = "source-pill";
+    link.href = source.href;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.title = source.hostname;
+    link.textContent = `${index + 1}. ${sourceLabel(source.href)}`;
+    list.append(link);
+  });
+  sources.append(heading, list);
+  content.append(sources);
 }
 
 function addMessage(role, content, label, activity) {
   const article = document.createElement("article");
   article.className = `message ${role}`;
   article.innerHTML = `<div class="message-header"><div class="message-label">${escapeHtml(label)}</div></div><div class="markdown">${markdown(content)}</div>`;
+  if (role === "assistant" && activity?.routed_agent === "research") enhanceResearchMessage(article);
   if (activity) article.append(activityElement(activity));
   messages.append(article);
   article.scrollIntoView({ behavior: "smooth", block: "end" });
