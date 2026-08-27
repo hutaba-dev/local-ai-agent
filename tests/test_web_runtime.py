@@ -1266,6 +1266,10 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(runtime._search_mode("현재 repository 구조를 실제로 확인해줘"), "QUICK_SEARCH")
         decision_request = client.requests[0]["json"]
         self.assertEqual(decision_request["max_tokens"], 256)
+        planner_prompt = decision_request["messages"][0]["content"]
+        self.assertIn("supply-chain or value-chain relationship", planner_prompt)
+        self.assertIn("pricing/volume/mix/margin transmission", planner_prompt)
+        self.assertIn("evidence supporting each causal premise", planner_prompt)
         self.assertEqual(
             decision_request["messages"][1],
             {"role": "user", "content": "현재 repository 구조를 실제로 확인해줘"},
@@ -1333,8 +1337,83 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertIn("Project decision: pressure is 12 bar", critic_input)
         self.assertIn("Project decision: pressure is 12 bar", final_input)
         self.assertIn("Analyst Draft", critic_input)
+        self.assertIn("FACT, INFERENCE", analyst_input)
+        self.assertIn("causal_chain", analyst_input)
+        self.assertIn("BULL/BASE/BEAR", analyst_input)
+        self.assertIn("do not delete a valid inference", critic_input)
+        self.assertIn("Explicitly list every number", critic_input)
+        self.assertIn("Facts are sourced; inferences are reasoned", final_input)
+        self.assertIn("never apply it to an inference or forecast", final_input)
+        self.assertIn("audit every number and named-company relationship", final_input)
+        self.assertIn("qualitative scenarios unless sourced numbers exist", final_input)
+        self.assertIn('"analysis_contract"', analyst_input)
+        self.assertIn('"FIRST_ORDER_EFFECTS"', analyst_input)
+        self.assertIn('"inference_object"', analyst_input)
         self.assertTrue(result.research["final_synthesis_executed"])
         self.assertEqual(result.research["state"], "COMPLETE")
+        self.assertEqual(result.research["claim_taxonomy"], ("FACT", "INFERENCE", "FORECAST", "UNKNOWN"))
+
+    def test_web_evidence_pack_assigns_analytical_roles_and_ids(self) -> None:
+        sources = [
+            {"title": "Official results", "url": "https://investor.example.com/results", "text": "Revenue increased."},
+            {"title": "Supply chain", "url": "https://example.com/chain", "text": "Supplier capacity and pricing affect margin."},
+            {"title": "Demand risk", "url": "https://example.com/risk", "text": "However, demand weakness is a risk."},
+            {"title": "Market report", "url": "https://example.com/report", "text": "Independent market context."},
+        ]
+
+        package = AgentRuntime._evidence_package([{
+            "name": "web_sources", "success": True, "output": json.dumps(sources), "error": None,
+        }])
+
+        self.assertEqual([source["evidence_id"] for source in package["sources"]], ["S1", "S2", "S3", "S4"])
+        self.assertEqual(
+            [source["evidence_role"] for source in package["sources"]],
+            ["DIRECT", "STRUCTURAL", "CONTRADICTORY", "SUPPORTING"],
+        )
+
+    def test_evidence_pack_preserves_role_diversity_before_relevance_fill(self) -> None:
+        sources = [
+            {"title": f"Official {index}", "url": f"https://investor.example.com/{index}", "text": "Results", "relevance_score": 1 - index / 100}
+            for index in range(8)
+        ] + [
+            {"title": "Value chain", "url": "https://industry.example.com/chain", "text": "Supplier capacity affects margin", "relevance_score": 0.5},
+            {"title": "Counter case", "url": "https://market.example.com/risk", "text": "However demand weakness is a risk", "relevance_score": 0.4},
+        ]
+
+        package = AgentRuntime._evidence_package([{
+            "name": "web_sources", "success": True, "output": json.dumps(sources), "error": None,
+        }])
+        roles = {source["evidence_role"] for source in package["sources"]}
+
+        self.assertEqual(len(package["sources"]), 6)
+        self.assertIn("DIRECT", roles)
+        self.assertIn("STRUCTURAL", roles)
+        self.assertIn("CONTRADICTORY", roles)
+
+    def test_gap_analysis_allows_supported_inference_without_direct_conclusion(self) -> None:
+        class GapClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                response = FakeResponse()
+                response.json = lambda: {"choices": [{"message": {"content": (
+                    '{"missing":[],"uncertain":["valuation transmission assumption"],'
+                    '"next_queries":[],"next_tools":[],"ready_to_answer":true,'
+                    '"entity_confidence":"NOT_APPLICABLE"}'
+                )}}], "usage": {}}  # type: ignore[method-assign]
+                return response
+
+        client = GapClient()
+        runtime = AgentRuntime(client=client)
+        question = "A 회사 실적이 B 산업에 어떤 영향을 줄까?"
+        gap = runtime._research_gap(
+            question, (question,), [], research_source_plan(question), "system", LatencyRecorder()
+        )
+
+        prompt = client.requests[0]["json"]["messages"][1]["content"]
+        self.assertTrue(gap.ready_to_answer)
+        self.assertIn("Absence of a source stating the final conclusion verbatim", prompt)
+        self.assertIn("value-chain relationship", prompt)
+        self.assertNotIn("Mark unavailable material NOT VERIFIED", prompt)
 
     def test_deep_research_bounds_large_evidence_and_revision_drafts(self) -> None:
         class LargePipelineClient(FakeClient):
@@ -1612,7 +1691,7 @@ class WebRuntimeTests(unittest.TestCase):
         client = TruncatedClient()
         result = AgentRuntime(client=client).chat("논문을 분석해줘", "research")
 
-        self.assertEqual(client.requests[-1]["json"]["max_tokens"], 4096)
+        self.assertEqual(client.requests[-1]["json"]["max_tokens"], 6144)
         self.assertIn("truncated", result.content)
 
     def test_brave_search_limits_quick_results(self) -> None:

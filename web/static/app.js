@@ -385,6 +385,8 @@ function activityElement(activity) {
     ["Search providers", searchProviders || "N/A"],
     ["Search cache", `${search.cache_hits || 0} hits; ${search.cache_misses || 0} misses`],
     ["Search fallbacks", searchFallbacks || "none"],
+    ["Analysis pipeline", (research.analysis_pipeline || []).join(" → ") || "N/A"],
+    ["Claim taxonomy", (research.claim_taxonomy || []).join(" / ") || "N/A"],
     ["State history", (research.state_history || []).join(" → ") || "N/A"],
     ["Research rounds", activity.research_rounds || "N/A"], ["Round detail", researchRounds],
     ["Entity confidence", research.entity_confidence || "N/A"], ["Gap status", research.gap_status || "N/A"],

@@ -29,7 +29,7 @@ MODEL = os.getenv("OPENAI_MODEL", "qwen3.8-27b")
 BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
 MAX_RESEARCH_ROUNDS = 4
 DEFAULT_MAX_TOKENS = 1024
-RESEARCH_MAX_TOKENS = 4096
+RESEARCH_MAX_TOKENS = 6144
 ANALYST_MAX_TOKENS = 2000
 CRITIC_MAX_TOKENS = 800
 MAX_EVIDENCE_JSON_CHARS = 12_000
@@ -390,6 +390,10 @@ class AgentRuntime:
                 "academic_enabled": source_plan.academic_enabled,
             },
             "search": self._search_activity(all_tools, round_activity),
+            "analysis_pipeline": (
+                "EVIDENCE_NORMALIZATION", "CAUSAL_ANALYST", "RESEARCH_CRITIC", "FINAL_SYNTHESIS",
+            ),
+            "claim_taxonomy": ("FACT", "INFERENCE", "FORECAST", "UNKNOWN"),
         }
 
     def _resolve_researcher_identity_query(
@@ -585,9 +589,15 @@ class AgentRuntime:
             "a large publication, citation, affiliation, timeline, or subject conflict requires follow-up verification. "
             "Preserve the original Korean name exactly in follow-up queries; romanizations are additional aliases only. "
             "Judge completeness against the Research Source Plan and required_evidence, not source count. "
+            "Distinguish missing FACT evidence from an analytical conclusion that can be reasoned from DIRECT, SUPPORTING, or "
+            "STRUCTURAL evidence. Absence of a source stating the final conclusion verbatim is not a material gap when its premises "
+            "and causal mechanism are supported. In that case allow synthesis and put residual assumptions in uncertain. "
+            "For company-to-sector impact questions, seek evidence for causal-chain nodes: company drivers, value-chain relationship, "
+            "sector fundamentals, volume/price/mix/margin transmission, beneficiaries or losers, market expectations, and counterarguments. "
             "For current market questions, retry official sources, financial sources, current web queries, and page fetches; "
-            "never substitute academic papers for missing market evidence. Mark unavailable material NOT VERIFIED. "
-            "Set ready_to_answer=false whenever identity or a material evidence gap remains. Do not include prose.\n\n"
+            "never substitute academic papers for missing market evidence. Use UNKNOWN for a material fact or premise that remains unavailable. "
+            "Set ready_to_answer=false only when identity or a material premise needed for responsible analysis remains missing; do not require "
+            "direct evidence for the analytical conclusion itself. Do not include prose.\n\n"
             f"Question:\n{question}\n\nResearch Source Plan:\n{plan_json}\n\n"
             f"Queries executed:\n{json.dumps(round_queries, ensure_ascii=False)}\n\n"
             f"External Evidence Package:\n{json.dumps(evidence_package, ensure_ascii=False)}"
@@ -699,6 +709,7 @@ class AgentRuntime:
     ) -> tuple[str, dict[str, object]]:
         evidence_package = self._evidence_package(tools, persistent_context)
         source_plan = source_plan or research_source_plan(question)
+        evidence_package["analysis_contract"] = self._analysis_contract(question, source_plan)
         if "MARKET_FINANCE" in source_plan.intents:
             now = datetime.now(timezone.utc)
             evidence_package["research_as_of"] = {
@@ -714,9 +725,9 @@ class AgentRuntime:
         }, ensure_ascii=False)
         market_instruction = (
             "For current market questions, organize the answer around schedule, consensus, watch points, current market reaction, "
-            "bull/base/bear scenarios, and post-release checks where evidence permits. Show US Eastern and Korea Standard times for events. "
+            "bull/base/bear scenarios, and post-release checks. Show US Eastern and Korea Standard times for events. "
             "Prefer current primary sources and fetched page text. Never add academic-paper or bibliometric sections. "
-            "If figures differ across sources, state the discrepancy. Mark missing facts NOT VERIFIED. "
+            "If figures differ across sources, state the discrepancy. Label unresolved factual claims UNKNOWN, not analytical inferences. "
             if "MARKET_FINANCE" in source_plan.intents else ""
         )
         mixed_instruction = (
@@ -724,13 +735,28 @@ class AgentRuntime:
             "of the current earnings event. " if "MIXED" in source_plan.intents else ""
         )
         analyst_prompt = (
-            "You are the Analyst / Synthesizer. Use only the supplied Evidence Package. "
+            "You are not merely an evidence summarizer. You are an analytical research agent. "
+            "Use the supplied Evidence Package as the sole authority for FACTS, then reason from those facts. "
+            "Never invent facts, numbers, events, relationships, or citations, but do not refuse to analyze merely because the final conclusion "
+            "is not explicitly written in a source. Absence of direct evidence does not prohibit analytical inference when each material premise "
+            "and a credible causal chain are supported by established evidence. "
             "Project context is user workspace context, not independently verified evidence; never use it to prove an external claim. "
             "For researcher evaluation, preserve bibliometric metrics by source, explain coverage differences, and do not sum database counts. "
             "A split, incomplete, or misresolved author profile cannot define the researcher's total output. "
             "Do not merely summarize facts. Explain what each evidence item means for the requested evaluation. "
             "Do not judge from publication or citation counts alone: assess topic consistency, development, originality, "
             "representative-work significance, recent activity, collaboration, and leadership where evidence exists. "
+            "Build a structured analytical result, not private chain-of-thought. Distinguish every material conclusion as FACT, INFERENCE, "
+            "FORECAST, or UNKNOWN. FACT is directly sourced; INFERENCE follows from stated premises and causal structure; FORECAST is conditional "
+            "and scenario-dependent; UNKNOWN lacks enough support. Never label an INFERENCE or FORECAST as NOT VERIFIED. "
+            "For each important INFERENCE provide claim, premises, causal_chain, confidence (HIGH/MEDIUM/LOW), assumptions, counterarguments, "
+            "and evidence_ids. Trace meaningful first- and second-order effects through demand, value-chain exposure, volume, price, mix, margin, "
+            "earnings, and valuation, explicitly noting where transmission strengthens or weakens. "
+            "For market, industry, or company outlooks produce BULL/BASE/BEAR scenarios with trigger, mechanism, beneficiaries or losers, risks, "
+            "and confidence. Generate a counterargument for each directional inference and check whether expectations may already be priced in. "
+            "Scenario values must remain qualitative unless their numbers are present in the Evidence Package or are transparent arithmetic from "
+            "cited inputs. Do not invent ASP changes, margins, valuation multiples, market shares, qualification status, supplier relationships, "
+            "product specifications, or company exposure. Omit a named-company comparison when company-specific evidence is absent. "
             "Separate Evidence from Interpretation, state uncertainty, and cite supplied URLs beside factual claims. "
             "More sources is not better. Use only evidence that materially answers the user's question. "
             f"{market_instruction}{mixed_instruction}\n\nResearch Source Plan:\n{plan_json}\n\n"
@@ -745,9 +771,15 @@ class AgentRuntime:
         bounded_draft = self._bounded_text(draft, MAX_ANALYST_DRAFT_CHARS)
         critic_prompt = (
             "You are the Critic. Review the Analyst Draft only against the Evidence Package. "
-            "Do not add facts. Identify: unsupported claims, excessive praise or criticism, citation-metric overinterpretation, "
+            "Do not add facts and do not delete a valid inference merely because no source states its conclusion verbatim. Test whether each "
+            "inference follows from its premises and whether the causal chain omits an important intermediate step. Identify correlation presented "
+            "as causation, unsupported assumptions, confidence that is too high, overlooked counterarguments, already-priced-in effects, "
+            "company-specific differences, contradictory evidence, excessive praise or criticism, citation-metric overinterpretation, "
             "identity confusion, unsourced numbers, shallow representative-work explanations, inadequate answer to the question, "
-            "repetition, and missing limitations or counterarguments. Return concise actionable revision notes.\n\n"
+            "repetition, and missing limitations. Classify defects as unsupported FACT, weak INFERENCE, overconfident FORECAST, or legitimate UNKNOWN. "
+            "Explicitly list every number, named supplier/customer relationship, product specification, qualification claim, market share, margin, "
+            "ASP change, or valuation multiple in the draft that is absent from the Evidence Package. Require its deletion or UNKNOWN classification. "
+            "Your role is to improve analytical quality, not prohibit analysis. Return concise actionable revision notes.\n\n"
             f"Evidence Package:\n{package_json}\n\nAnalyst Draft:\n{bounded_draft}"
         )
         critique, _ = self._complete(
@@ -759,11 +791,19 @@ class AgentRuntime:
         bounded_critique = self._bounded_text(critique, MAX_CRITIQUE_CHARS)
         revision_prompt = (
             "Write the final research answer in the user's language. Use the Analyst Draft and Critic Feedback, "
-            "but treat the Evidence Package as the sole factual authority. Do not add facts absent from it or expose this workflow. "
+            "but treat the Evidence Package as the sole factual authority. Facts are sourced; inferences are reasoned; forecasts are conditional; "
+            "unknowns are acknowledged. Do not add factual claims absent from the package or expose this workflow. "
             "Return a completed answer, never a plan, progress update, promise to search, or follow-up instruction. "
             "Do not assume praise in the question is true; state when the evidence is insufficient for that characterization. "
             "Report database-specific publication/citation metrics separately and explain material coverage conflicts. "
-            "Connect facts to meaning, comparative judgment, limitations, and a clear overall assessment. Preserve URL citations.\n\n"
+            "Connect facts to meaning, comparative judgment, limitations, and a clear overall assessment. Preserve URL citations. "
+            "Use labels such as FACT, INFERENCE, FORECAST, and UNKNOWN where they clarify epistemic status. Reserve NOT VERIFIED only for a factual "
+            "claim presented as fact but not confirmed; never apply it to an inference or forecast. For analytical questions, naturally adapt sections "
+            "such as Executive View, Verified Facts, What It Means, Causal Chain, Sector or Company Impact, Bull/Base/Bear Scenarios, Key Risks and "
+            "Counterarguments, What to Watch Next, and Confidence/Unknowns. Do not force irrelevant sections. Keep the answer concise enough to finish "
+            "within the response budget: prioritize material facts and 2 to 4 key inferences, use qualitative scenarios unless sourced numbers exist, "
+            "and avoid repeating the same premise across sections. Before returning, audit every number and named-company relationship against the "
+            "Evidence Package; delete unsupported details rather than turning them into precise-looking forecasts.\n\n"
             f"{market_instruction}{mixed_instruction}\n\nResearch Source Plan:\n{plan_json}\n\n"
             f"Question:\n{question}\n\nEvidence Package:\n{package_json}\n\nAnalyst Draft:\n{bounded_draft}\n\nCritic Feedback:\n{bounded_critique}"
         )
@@ -779,6 +819,7 @@ class AgentRuntime:
             "The prior output was a research progress message, which is not a valid final answer. "
             "Using only the Evidence Package, write the completed terminal research answer now in the user's language. "
             "Include identity confidence, evidence-based findings, limitations, overall assessment, and source URLs. "
+            "Never introduce a number or named-company relationship absent from the Evidence Package. "
             "Do not describe future work or the research process.\n\n"
             f"{market_instruction}{mixed_instruction}\n\nQuestion:\n{question}\n\nEvidence Package:\n{package_json}"
         )
@@ -791,6 +832,50 @@ class AgentRuntime:
         if RESEARCH_PROGRESS_PATTERN.search(repaired_answer):
             raise ValueError("deep research did not produce a terminal final answer")
         return repaired_answer, repaired_payload
+
+    @staticmethod
+    def _analysis_contract(question: str, source_plan: object) -> dict[str, object]:
+        market_analysis = any(intent in source_plan.intents for intent in ("MARKET_FINANCE", "COMPANY_RESEARCH"))
+        impact_question = bool(re.search(
+            r"(?:impact|effect|affect|read[- ]?through|outlook|benefit|harm|영향|전망|수혜|피해|섹터|산업)",
+            question,
+            re.IGNORECASE,
+        ))
+        contract: dict[str, object] = {
+            "claim_taxonomy": {
+                "FACT": "directly supported by cited evidence",
+                "INFERENCE": "analytical conclusion from stated premises and causal structure",
+                "FORECAST": "conditional future outcome tied to a scenario or trigger",
+                "UNKNOWN": "insufficient support for fact or responsible inference",
+            },
+            "evidence_roles": ("DIRECT", "SUPPORTING", "STRUCTURAL", "CONTRADICTORY"),
+            "causal_stages": (
+                "FACTS", "CAUSAL_DRIVERS", "FIRST_ORDER_EFFECTS", "SECOND_ORDER_EFFECTS",
+                "BENEFICIARIES_AND_LOSERS", "RISKS", "SCENARIOS", "FORECAST",
+            ),
+            "inference_object": {
+                "claim": "string", "type": "INFERENCE", "premises": ["string"],
+                "causal_chain": ["string"], "confidence": "HIGH|MEDIUM|LOW",
+                "assumptions": ["string"], "counterarguments": ["string"],
+                "evidence_ids": ["S1"],
+            },
+        }
+        if market_analysis:
+            contract["scenario_object"] = {
+                "scenario": "BULL|BASE|BEAR", "trigger": "string", "mechanism": ["string"],
+                "beneficiaries_or_losers": ["string"], "risks": ["string"],
+                "confidence": "HIGH|MEDIUM|LOW",
+            }
+        if impact_question:
+            contract["analytical_subquestions"] = (
+                "What are the focal company's verified performance drivers?",
+                "What supply-chain or value-chain relationship connects the company and target sector?",
+                "What are the target sector's current demand, supply, pricing, capacity, and inventory fundamentals?",
+                "How does the signal transmit through volume, price, mix, margin, earnings, and valuation?",
+                "Which companies are exposed, and where do qualification, customer mix, or execution create differences?",
+                "What expectations are already priced in, and what evidence supports the counter-case?",
+            )
+        return contract
 
     @staticmethod
     def _bounded_text(value: str, limit: int) -> str:
@@ -985,6 +1070,7 @@ class AgentRuntime:
                         "url": str(item.get("url", ""))[:1000],
                         "text": str(item.get("text", ""))[:1200],
                         "relevance_score": float(item.get("relevance_score", 0.4)),
+                        "evidence_role": AgentRuntime._web_evidence_role(item),
                         "evidence_group": "current_web",
                     }
                     for item in output if isinstance(item, dict)
@@ -998,8 +1084,38 @@ class AgentRuntime:
         package["representative_works"] = AgentRuntime._deduplicate_records(
             package["representative_works"], ("doi", "url", "title"), 12
         )
-        package["sources"] = AgentRuntime._deduplicate_records(package["sources"], ("url", "title"), 6)
+        package["sources"] = AgentRuntime._select_evidence_sources(package["sources"], 6)
+        for index, source in enumerate(package["sources"], 1):
+            source["evidence_id"] = f"S{index}"
         return package
+
+    @staticmethod
+    def _select_evidence_sources(records: object, limit: int) -> list[dict[str, object]]:
+        unique = AgentRuntime._deduplicate_records(records, ("url", "title"), 24)
+        ranked = sorted(unique, key=lambda item: float(item.get("relevance_score", 0)), reverse=True)
+        selected: list[dict[str, object]] = []
+        for role in ("DIRECT", "STRUCTURAL", "CONTRADICTORY", "SUPPORTING"):
+            candidate = next((item for item in ranked if item.get("evidence_role") == role), None)
+            if candidate is not None:
+                selected.append(candidate)
+        selected_ids = {id(item) for item in selected}
+        selected.extend(item for item in ranked if id(item) not in selected_ids)
+        return selected[:limit]
+
+    @staticmethod
+    def _web_evidence_role(source: dict[str, object]) -> str:
+        text = " ".join(str(source.get(key, "")) for key in ("title", "url", "text")).lower()
+        if re.search(r"(?:investor\.|sec\.gov|/investor|newsroom|nvidianews\.)", text):
+            return "DIRECT"
+        if re.search(r"\b(?:however|contrary|decline|weakness|risk|반면|감소|약세|위험)\b", text):
+            return "CONTRADICTORY"
+        if re.search(
+            r"\b(?:supply chain|value chain|supplier|customer|capacity|utilization|content per|pricing|margin|"
+            r"공급망|가치사슬|공급사|고객사|생산능력|가동률|가격|마진)\b",
+            text,
+        ):
+            return "STRUCTURAL"
+        return "SUPPORTING"
 
     @staticmethod
     def _compact_work(work: dict[str, object]) -> dict[str, object]:
@@ -1064,6 +1180,10 @@ class AgentRuntime:
             "For QUICK_SEARCH provide exactly one concise query. "
             "For DEEP_RESEARCH provide 2 to 4 complementary queries covering the question's major evidence needs; include a query for "
             "primary or official sources and include academic papers only when the user explicitly asks for scholarly evidence. "
+            "When the user asks how company A affects industry B, decompose queries across: A's current performance drivers; the A-to-B supply-chain "
+            "or value-chain relationship; B's current fundamentals and pricing/volume/mix/margin transmission; exposed beneficiaries and losers; "
+            "market expectations; and risks or counterarguments. Search for evidence supporting each causal premise rather than only articles that "
+            "state the final conclusion. Fit the most material nodes into the 2 to 4 query budget. "
             "More sources is not better. Use only sources that can materially answer the user's question. Academic sources are specialized "
             "tools, not general research tools. For current news and market questions, prioritize freshness, primary sources, financial data, "
             "and current reporting. Do not request scholarly search merely because the subject is AI, technology, a company, or adjacent to research. "
