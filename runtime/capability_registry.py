@@ -80,7 +80,11 @@ CAPABILITIES = (
         "local_compute", "MCP_PROJECT_ENABLED",
         ("project_get_context", "project_search", "project_list_files", "project_read_file", "project_get_memories", "project_save_memory", "project_list_artifacts", "project_save_artifact"),
     ),
-    CapabilitySpec("image", "Image Work", "Generate or edit images through the existing AHN7 worker.", "gpu_compute", "MCP_IMAGE_ENABLED", ("generate_image", "edit_image", "adjust_face_pose")),
+    CapabilitySpec(
+        "media", "Media", "Plan, generate, edit, adjust, and optionally save images as Project artifacts.",
+        "gpu_compute", "MCP_MEDIA_ENABLED",
+        ("media_inspect_capability", "media_get_status", "media_generate_image", "media_edit_image", "media_adjust_pose"),
+    ),
 )
 
 
@@ -128,6 +132,11 @@ TOOL_SPECS = {
     "project_save_memory": AgentToolSpec("project_save_memory", "project", "Save only durable project knowledge that remains useful beyond this exchange, preserving supersession history.", "project-mcp", "local_compute", "WRITE_MEMORY", _object({"memory_type": {"type": "string", "enum": ["fact", "decision", "goal", "constraint", "preference", "todo", "research_result", "summary"]}, "content": _string("Durable non-ephemeral project knowledge", 12000), "confidence": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]}, "supersedes_ids": {"type": "array", "items": _string("Existing project memory ID", 100), "maxItems": 20}}, ("memory_type", "content"))),
     "project_list_artifacts": AgentToolSpec("project_list_artifacts", "project", "List bounded artifact metadata and provenance for the authorized current project.", "project-mcp", "local_compute", "READ_PROJECT", _object({"limit": {"type": "integer", "minimum": 1, "maximum": 200}})),
     "project_save_artifact": AgentToolSpec("project_save_artifact", "project", "Save a bounded text report, document, analysis export, or code output as a project artifact when requested.", "project-mcp", "local_compute", "WRITE_ARTIFACT", _object({"name": _string("Artifact filename only", 160), "content": _string("Artifact text content", 12000), "artifact_type": {"type": "string", "enum": ["report", "document", "analysis", "code", "text"]}, "description": _string("Artifact purpose or provenance", 500)}, ("name", "content"))),
+    "media_inspect_capability": AgentToolSpec("media_inspect_capability", "media", "Inspect available visual operations and current limits before choosing an image workflow.", "media-mcp", "gpu_compute", "READ", _object({})),
+    "media_get_status": AgentToolSpec("media_get_status", "media", "Get current Media health or one recent job state without retrieving image bytes.", "media-mcp", "gpu_compute", "READ", _object({"job_id": _string("Optional opaque media job ID", 100)})),
+    "media_generate_image": AgentToolSpec("media_generate_image", "media", "Generate one image from explicit subject, composition, style, camera, lighting, and background intent; optionally save it to the current Project.", "media-mcp", "gpu_compute", "EXECUTE_MEDIA", _object({"subject": _string("Primary visual subject", 500), "intent": _string("Additional visual intent", 2000), "composition": _string("Composition", 300), "style": _string("Visual style", 300), "camera": _string("Camera or framing", 300), "lighting": _string("Lighting", 300), "background": _string("Background", 300), "quality_priority": {"type": "string", "enum": ["FAST", "BALANCED", "QUALITY"]}, "latency_priority": {"type": "string", "enum": ["FAST", "BALANCED"]}, "output_size": {"type": "string", "enum": ["512x512"]}, "save_to_project": {"type": "boolean"}}, ("subject",))),
+    "media_edit_image": AgentToolSpec("media_edit_image", "media", "Apply every requested visual change to one authorized logical source image while preserving identity and unchanged elements.", "media-mcp", "gpu_compute", "EXECUTE_MEDIA", _object({"source_image_id": _string("Opaque generated image or current Project file ID", 100), "intent": _string("Complete edit request; preserve all distinct modifications", 2000), "preserve_identity": {"type": "boolean"}, "preserve_elements": {"type": "array", "items": _string("Element to preserve", 200), "maxItems": 20}, "quality_priority": {"type": "string", "enum": ["FAST", "BALANCED", "QUALITY"]}, "latency_priority": {"type": "string", "enum": ["FAST", "BALANCED"]}, "output_size": {"type": "string", "enum": ["512x512"]}, "save_to_project": {"type": "boolean"}}, ("source_image_id", "intent"))),
+    "media_adjust_pose": AgentToolSpec("media_adjust_pose", "media", "Adjust one authorized portrait source image to a front-facing pose while preserving identity.", "media-mcp", "gpu_compute", "EXECUTE_MEDIA", _object({"source_image_id": _string("Opaque generated image or current Project file ID", 100), "pose": {"type": "string", "enum": ["front_facing"]}, "preserve_identity": {"type": "boolean"}, "save_to_project": {"type": "boolean"}}, ("source_image_id",))),
 }
 
 
@@ -139,8 +148,11 @@ def _enabled(flag: str, default: bool = True) -> bool:
 def capability_catalog(*, project_available: bool = False, image_available: bool = False) -> list[dict[str, object]]:
     catalog = []
     for capability in CAPABILITIES:
-        default = False if capability.name == "browser" else True
-        enabled = _enabled("MCP_ENABLED", False) and _enabled(capability.feature_flag, default)
+        default = False if capability.name in {"browser", "media"} else True
+        if capability.name == "media" and os.getenv(capability.feature_flag) is None:
+            enabled = _enabled("MCP_ENABLED", False) and _enabled("MCP_IMAGE_ENABLED", False)
+        else:
+            enabled = _enabled("MCP_ENABLED", False) and _enabled(capability.feature_flag, default)
         configured = True
         if capability.name == "browser":
             configured = _enabled("MCP_PLAYWRIGHT_EGRESS_GUARD", False)
@@ -148,7 +160,7 @@ def capability_catalog(*, project_available: bool = False, image_available: bool
             configured = bool(os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN"))
         elif capability.name == "project":
             configured = project_available
-        elif capability.name == "image":
+        elif capability.name == "media":
             configured = image_available
         provider_states: dict[str, str] | None = None
         health = "AVAILABLE" if enabled and configured else ("UNCONFIGURED" if enabled else "DISABLED")

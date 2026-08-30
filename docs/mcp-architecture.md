@@ -25,8 +25,9 @@ Phase 1 uses the official Python SDK and in-process transport. The same servers 
 | `ahnbys-github` | Code search and repository reads | Official GitHub MCP in read-only mode |
 | `ahnbys-academic` | Researcher and publication reads | Existing Academic Intelligence |
 | `ahnbys-project` | Project search, files, and memories | Authenticated request-scoped ProjectTools |
+| `ahnbys-media` | Visual capability inspection, status, generation, editing, and pose adjustment | Existing MediaDirector and authenticated image worker |
 
-Main or Coding Qwen first receives a compact capability catalog plus active role metadata. It may select no capability or combine a materially useful capability outside the primary role. Only the selected detailed schemas are sent on a tool turn, with a hard maximum of ten schemas. Execution is limited to three rounds and four read calls. Research keeps its existing evidence-oriented state machine and SearchRouter policy.
+Main or Coding Qwen first receives a compact capability catalog plus active role metadata. It may select no capability or combine a materially useful capability outside the primary role. Only the selected detailed schemas are sent on a tool turn, with a hard maximum of ten schemas. Execution is limited to three rounds and four calls. Research keeps its evidence-oriented state machine and may choose `CREATE_MEDIA` after gathering enough evidence for an explicitly requested visual deliverable.
 
 External servers are never exposed directly to Qwen. Context7 exposes two documentation operations. Playwright exposes only page and click operations, but remains disabled unless both `MCP_PLAYWRIGHT_ENABLED=true` and `MCP_PLAYWRIGHT_EGRESS_GUARD=true` certify an independently enforced network egress sandbox; application-level URL and redirect validation alone is not an SSRF boundary. GitHub starts with `--read-only --toolsets=repos,issues,pull_requests`; without `GITHUB_PERSONAL_ACCESS_TOKEN`, it remains `UNCONFIGURED` and no child process starts.
 
@@ -86,7 +87,7 @@ MCP_PLAYWRIGHT_EGRESS_GUARD=false
 MCP_GITHUB_ENABLED=true
 MCP_ACADEMIC_ENABLED=true
 MCP_PROJECT_ENABLED=true
-MCP_IMAGE_ENABLED=false
+MCP_MEDIA_ENABLED=false
 MCP_DIRECT_FALLBACK_ENABLED=true
 ```
 
@@ -121,7 +122,7 @@ Expose scoped project search and memory retrieval. The host must derive owner/pr
 
 ### Phase 4: Image and Media
 
-Expose generation and inspection as asynchronous capabilities with explicit cost, queue, artifact, and cancellation metadata. Keep GPU worker isolation and artifact authorization outside the model-visible arguments.
+Expose high-level visual inspection, status, generation, editing, and front-facing pose adjustment. Calls return normalized job/result metadata and opaque image IDs, never raw image bytes. Source IDs are resolved against owner-scoped generated assets or the authorized current Project; model-supplied owners, projects, paths, worker names, model names, and hardware are not accepted. Project image artifacts retain operation, worker, model, seed, source IDs, execution capabilities, and creation time. Worker failures normalize to `BUSY`, `OOM`, `TIMEOUT`, `UNAVAILABLE`, `MODEL_LIMITED`, or `CAPABILITY_LIMITED`, with no Main GPU fallback.
 
 ### Phase 5: External Clients
 

@@ -36,6 +36,7 @@ from runtime.image_client import (
     prefers_original_source,
     requests_reference_research,
 )
+from runtime.media import execute_media_edit, execute_media_generation
 from runtime.projects import ProjectNotFoundError, ProjectPathError, ProjectStorageOfflineError, ProjectStore
 from runtime.project_tools import ProjectTools
 from runtime.role_registry import get_role, selectable_roles
@@ -718,54 +719,23 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             edit_completion = None
             executed_edit_tools: list[str] = []
             if mode in {"edit", "pose"}:
-                original_edit_source = source_image
-                edit_plan = await run_in_threadpool(build_image_edit_plan, prompt)
-                planned_prompt = edit_plan_prompt(edit_plan)
-                prompt_plan = await run_in_threadpool(
-                    build_image_prompt,
-                    planned_prompt,
-                    editing=True,
-                    original_request=prompt,
+                edit_execution = await run_in_threadpool(
+                    execute_media_edit,
+                    prompt,
+                    source_image,
+                    plan_builder=build_image_edit_plan,
+                    prompt_builder=build_image_prompt,
+                    pose_executor=correct_portrait_pose,
+                    edit_executor=create_image,
+                    completion_assessor=assess_image_edit_completion,
                 )
-                generated = GeneratedImage(source_image, 0, "edit", "edit-intermediate.png")
-                if any(edit.capability == "pose_correction" for edit in edit_plan.edits):
-                    generated = await run_in_threadpool(correct_portrait_pose, generated.content)
-                    executed_edit_tools.append("portrait.frontalize")
-                generative_source = generated.content
-                if any(edit.capability == "generative_edit" for edit in edit_plan.edits):
-                    appearance_sensitive = any(edit.type == "appearance_refinement" for edit in edit_plan.edits)
-                    if appearance_sensitive:
-                        generated = await run_in_threadpool(create_image, prompt_plan.prompt, generated.content, 0.25)
-                    else:
-                        generated = await run_in_threadpool(create_image, prompt_plan.prompt, generated.content)
-                    executed_edit_tools.append("image.edit")
-                edit_completion = await run_in_threadpool(
-                    assess_image_edit_completion, edit_plan, original_edit_source, generated.content
-                )
+                edit_plan = edit_execution.edit_plan
+                prompt_plan = edit_execution.prompt_plan
+                generated = edit_execution.generated
+                edit_completion = edit_execution.completion
+                executed_edit_tools = list(edit_execution.executed_capabilities)
                 quality = None
-                retry_count = 0
-                if edit_completion.checked and not edit_completion.passed:
-                    pending = [edit_type for edit_type, complete in edit_completion.edit_status if not complete]
-                    if edit_plan.preserve_identity and not edit_completion.identity_preserved:
-                        pending.append("identity_preservation")
-                    retry_prompt = f"{planned_prompt} Retry incomplete edits: {', '.join(pending)}."
-                    retry_plan = await run_in_threadpool(
-                        build_image_prompt, retry_prompt, editing=True, original_request=prompt
-                    )
-                    if any(edit.capability == "generative_edit" for edit in edit_plan.edits):
-                        retry_source = generative_source if "identity_preservation" in pending else generated.content
-                        if appearance_sensitive:
-                            generated = await run_in_threadpool(create_image, retry_plan.prompt, retry_source, 0.25)
-                        else:
-                            generated = await run_in_threadpool(create_image, retry_plan.prompt, retry_source)
-                        executed_edit_tools.append("image.edit.retry")
-                    else:
-                        generated = await run_in_threadpool(correct_portrait_pose, original_edit_source)
-                        executed_edit_tools.append("portrait.frontalize.retry")
-                    edit_completion = await run_in_threadpool(
-                        assess_image_edit_completion, edit_plan, original_edit_source, generated.content
-                    )
-                    retry_count = 1
+                retry_count = edit_execution.retry_count
                 structured_feedback = ()
                 candidate_reviews = []
                 preference_context = ""
@@ -827,58 +797,29 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
                     reference_cues=reference_cues,
                 )
                 quality_request = original_request or prompt
-                retry_count = 0
-                candidate_reviews: list[dict[str, object]] = []
                 candidate_count = 2 if mode == "image" and source_image is None and prompt_plan.quality_sensitive else 1
-                candidates = []
-                for candidate_number in range(1, candidate_count + 1):
-                    candidate = await run_in_threadpool(create_image, prompt_plan.prompt, source_image)
-                    candidate_quality = await run_in_threadpool(
-                        assess_image_quality, quality_request, candidate.content
-                    )
-                    candidates.append((candidate, candidate_quality))
-                    candidate_reviews.append({
-                        "candidate": candidate_number,
-                        "seed": candidate.seed,
-                        "score": candidate_quality.overall_score,
-                        "passed": candidate_quality.passed,
-                        "failures": list(candidate_quality.failures),
-                    })
-                generated, quality = max(
-                    candidates,
-                    key=lambda candidate: (
-                        candidate[1].passed,
-                        candidate[1].overall_score if candidate[1].checked else 0,
-                    ),
+                generation = await run_in_threadpool(
+                    execute_media_generation,
+                    quality_request,
+                    source=source_image,
+                    prompt_plan=prompt_plan,
+                    prompt_builder=build_image_prompt,
+                    image_executor=create_image,
+                    quality_assessor=assess_image_quality,
+                    candidate_count=candidate_count,
+                    preference_context=preference_context,
+                    reference_cues=reference_cues,
                 )
+                generated = generation.generated
+                prompt_plan = generation.prompt_plan
+                quality = generation.quality
+                candidate_reviews = list(generation.candidate_reviews)
+                retry_count = generation.retry_count
                 if candidate_count > 1:
-                    retry_count = 1
                     decision_reason = (
                         "quality-sensitive person request; selected the highest-scoring of two generated candidates"
                     )
-                elif quality.checked and not quality.passed:
-                    failure_summary = ", ".join(quality.failures)
-                    if quality.summary:
-                        failure_summary = f"{failure_summary}. {quality.summary}"
-                    prompt_plan = await run_in_threadpool(
-                        build_image_prompt,
-                        quality_request,
-                        original_request=quality_request,
-                        quality_feedback=failure_summary,
-                        simplify_composition=True,
-                        preference_context=preference_context,
-                        reference_cues=reference_cues,
-                    )
-                    generated = await run_in_threadpool(create_image, prompt_plan.prompt, None)
-                    quality = await run_in_threadpool(assess_image_quality, quality_request, generated.content)
-                    candidate_reviews.append({
-                        "candidate": 2,
-                        "seed": generated.seed,
-                        "score": quality.overall_score,
-                        "passed": quality.passed,
-                        "failures": list(quality.failures),
-                    })
-                    retry_count = 1
+                elif retry_count:
                     decision_reason = "quality gate found multiple major failures; regenerated from scratch"
         except httpx.HTTPError as error:
             raise HTTPException(status_code=503, detail="image worker is unavailable") from error
@@ -924,6 +865,7 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             if edit_plan
             else f"이미지를 {'편집' if generated.mode == 'edit' else '생성'}했습니다. Seed: {generated.seed}"
         )
+        effective_mode = "regenerate" if internal_regenerate else generated.mode
         project_artifact = None
         if request.project_id and request.conversation_id:
             if is_explicit_visual_preference(request.message):
@@ -935,6 +877,19 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
                     source_type="conversation",
                     source_id=request.conversation_id,
                 )
+            artifact_provenance = json.dumps({
+                "media_operation": "multi_step_edit" if len(executed_edit_tools) > 1 else effective_mode,
+                "worker": "ahn7",
+                "model": "LivePortrait" if generated.mode == "pose" else "stabilityai/sd-turbo",
+                "seed": generated.seed,
+                "source_image_ids": list(dict.fromkeys([
+                    *request.attachment_ids,
+                    *([request.continuation_image_id] if request.continuation_image_id else []),
+                ])),
+                "executed_capabilities": executed_edit_tools or [
+                    "image.edit" if generated.mode == "edit" else "image.generate"
+                ],
+            }, ensure_ascii=True, separators=(",", ":"))
             project_artifact = project_store.save_file(
                 user.username,
                 request.project_id,
@@ -945,13 +900,12 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
                 request.conversation_id,
                 artifact=True,
                 creator="assistant",
-                description=assistant_content,
+                description=artifact_provenance,
                 source_message_id=project_user_message_id,
             )
             project_store.add_message(
                 user.username, request.project_id, request.conversation_id, "assistant", assistant_content
             )
-        effective_mode = "regenerate" if internal_regenerate else generated.mode
         image_activity = {
             "mode": effective_mode,
             "reason": decision_reason,

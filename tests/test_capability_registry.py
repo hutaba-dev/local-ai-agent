@@ -17,7 +17,7 @@ class CapabilityRegistryTests(unittest.TestCase):
         self.assertLess(len(json.dumps(catalog)), 3_000)
         status = {item["name"]: item["status"] for item in catalog}
         self.assertEqual(status["project"], "UNCONFIGURED")
-        self.assertEqual(status["image"], "UNCONFIGURED")
+        self.assertEqual(status["media"], "DISABLED")
         self.assertEqual(status["github"], "UNCONFIGURED")
         documentation = next(item for item in catalog if item["name"] == "documentation")
         git = next(item for item in catalog if item["name"] == "git")

@@ -17,6 +17,7 @@ from mcp_servers.context7_server import CONTEXT7_MCP
 from mcp_servers.developer_server import DEVELOPER_MCP
 from mcp_servers.fetch_server import fetch_mcp
 from mcp_servers.github_server import GITHUB_MCP
+from mcp_servers.media_server import create_media_mcp
 from mcp_servers.project_server import ProjectScope, create_project_mcp
 from mcp_servers.search_server import search_mcp
 from runtime.capability_registry import CAPABILITIES, TOOL_SPECS
@@ -29,6 +30,11 @@ class MCPHealth(str, Enum):
 	UNCONFIGURED = "UNCONFIGURED"
 	DEGRADED = "DEGRADED"
 	RATE_LIMITED = "RATE_LIMITED"
+	BUSY = "BUSY"
+	OOM = "OOM"
+	TIMEOUT = "TIMEOUT"
+	MODEL_LIMITED = "MODEL_LIMITED"
+	CAPABILITY_LIMITED = "CAPABILITY_LIMITED"
 	PROJECT_STORAGE_OFFLINE = "PROJECT_STORAGE_OFFLINE"
 	ERROR = "ERROR"
 
@@ -73,6 +79,8 @@ def mcp_tool_enabled(tool_name: str) -> bool:
 	if spec is None:
 		return False
 	capability = next((item for item in CAPABILITIES if item.name == spec.capability), None)
+	if spec.capability == "media":
+		return _env_enabled("MCP_MEDIA_ENABLED", _env_enabled("MCP_IMAGE_ENABLED", False))
 	default = False if spec.capability == "browser" else True
 	return bool(capability and _env_enabled(capability.feature_flag, default))
 
@@ -95,7 +103,7 @@ class MCPHost:
 				server=spec.server,
 				cost=spec.cost_class,
 				permission=spec.permission,
-				timeout_seconds=30 if spec.server in {"browser-mcp", "github-mcp"} else 20,
+				timeout_seconds=180 if spec.server == "media-mcp" else 30 if spec.server in {"browser-mcp", "github-mcp"} else 20,
 				input_schema=spec.input_schema,
 			)
 			for name, spec in TOOL_SPECS.items()
@@ -111,11 +119,29 @@ class MCPHost:
 			return bool(os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN"))
 		if record.server == "project-mcp":
 			return project_scope is not None
+		if record.server == "media-mcp":
+			from runtime import image_client
+
+			return bool(image_client.IMAGE_WORKER_URL and image_client.IMAGE_WORKER_TOKEN)
 		return True
 
-	def _server_for(self, record: MCPToolRecord, project_scope: ProjectScope | None = None) -> object | None:
+	def _server_for(
+		self,
+		record: MCPToolRecord,
+		project_scope: ProjectScope | None = None,
+		media_owner_id: str | None = None,
+	) -> object | None:
 		if record.server == "project-mcp":
 			return create_project_mcp(project_scope) if project_scope is not None else None
+		if record.server == "media-mcp":
+			if project_scope is not None:
+				return create_media_mcp(project_scope)
+			from types import SimpleNamespace
+
+			return create_media_mcp(SimpleNamespace(
+				owner_id=media_owner_id or f"host-{id(self)}",
+				project_id=None, conversation_id=None, tools=None,
+			))
 		return self._servers.get(record.server)
 
 	async def _discover_async(self) -> None:
@@ -161,6 +187,11 @@ class MCPHost:
 			except Exception:
 				project_health = MCPHealth.UNAVAILABLE.value
 		catalog = []
+		media_health = None
+		if any(record.server == "media-mcp" for record in self._tools.values()):
+			from runtime.media import MEDIA_DIRECTOR
+
+			media_health = str(MEDIA_DIRECTOR.status().get("health", MCPHealth.UNAVAILABLE.value))
 		for record in self._tools.values():
 			value = asdict(record)
 			if not self._configured(record, project_scope):
@@ -169,6 +200,8 @@ class MCPHost:
 				value["health"] = MCPHealth.UNCONFIGURED.value
 			elif record.server == "project-mcp":
 				value["health"] = project_health
+			elif record.server == "media-mcp" and media_health is not None:
+				value["health"] = media_health
 			value["available"] = value["health"] == MCPHealth.AVAILABLE.value
 			catalog.append(value)
 		return catalog
@@ -178,6 +211,7 @@ class MCPHost:
 		tool_name: str,
 		arguments: dict[str, object],
 		project_scope: ProjectScope | None = None,
+		media_owner_id: str | None = None,
 	) -> MCPCallOutcome:
 		started = perf_counter()
 		record = self._tools.get(tool_name)
@@ -196,7 +230,7 @@ class MCPHost:
 				False, False, tool_name, record.server, MCPHealth.UNCONFIGURED.value, None,
 				"MCP capability is disabled", 0,
 			)
-		server = self._server_for(record, project_scope)
+		server = self._server_for(record, project_scope, media_owner_id)
 		if server is None:
 			record.health = MCPHealth.UNAVAILABLE.value
 			return MCPCallOutcome(
@@ -250,8 +284,9 @@ class MCPHost:
 		tool_name: str,
 		arguments: dict[str, object],
 		project_scope: ProjectScope | None = None,
+		media_owner_id: str | None = None,
 	) -> MCPCallOutcome:
-		return asyncio.run(self._call_async(tool_name, arguments, project_scope))
+		return asyncio.run(self._call_async(tool_name, arguments, project_scope, media_owner_id))
 
 
 MCP_HOST = MCPHost()
@@ -265,5 +300,6 @@ def call_mcp_tool(
 	tool_name: str,
 	arguments: dict[str, object],
 	project_scope: ProjectScope | None = None,
+	media_owner_id: str | None = None,
 ) -> MCPCallOutcome:
-	return MCP_HOST.call(tool_name, arguments, project_scope)
+	return MCP_HOST.call(tool_name, arguments, project_scope, media_owner_id)

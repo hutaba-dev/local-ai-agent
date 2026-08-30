@@ -144,6 +144,7 @@ class ResearchDecision:
     primary_source_importance: str = "normal"
     scholarly_evidence_value: str = "low"
     urls: tuple[str, ...] = ()
+    save_to_project: bool = False
 
 
 T = TypeVar("T")
@@ -253,6 +254,7 @@ class AgentRuntime:
                 allow_local_tools,
                 persistent_context,
                 project_scope,
+                session.id,
             )
             research["mode"] = route.search_mode
         else:
@@ -289,7 +291,7 @@ class AgentRuntime:
                 messages.append({"role": "user", "content": public_context})
             if route.agent in {"main", "coding"}:
                 answer, payload, dynamic_tools = self._run_main_tool_loop(
-                    message, messages, self._max_tokens(route), latency, project_scope, route.agent,
+                    message, messages, self._max_tokens(route), latency, project_scope, route.agent, session.id,
                 )
                 tools.extend(dynamic_tools)
             else:
@@ -322,9 +324,16 @@ class AgentRuntime:
         latency: LatencyRecorder,
         project_scope: ProjectToolScope | None,
         agent: str = "main",
+        media_owner_id: str | None = None,
     ) -> tuple[str, dict[str, object], list[dict[str, object]]]:
         role = get_role(agent)
-        catalog = capability_catalog(project_available=project_scope is not None, image_available=False)
+        from runtime.media import MEDIA_DIRECTOR, MediaStatus
+
+        media_health = str(MEDIA_DIRECTOR.status().get("health", MediaStatus.UNAVAILABLE.value))
+        catalog = capability_catalog(
+            project_available=project_scope is not None,
+            image_available=media_health == MediaStatus.AVAILABLE.value,
+        )
         available = [item for item in catalog if item["available"]]
         if not available:
             answer, payload = self._complete(messages, max_tokens, latency, "response")
@@ -359,7 +368,7 @@ class AgentRuntime:
             answer, payload = self._complete(messages, max_tokens, latency, "response")
             return answer, payload, []
 
-        allowed_permissions = {"READ", "READ_PROJECT", "WRITE_MEMORY", "WRITE_ARTIFACT"}
+        allowed_permissions = {"READ", "READ_PROJECT", "WRITE_MEMORY", "WRITE_ARTIFACT", "EXECUTE_MEDIA"}
         schemas = [spec.openai_schema() for spec in specifications if spec.permission in allowed_permissions]
         allowed = {spec.name: spec for spec in specifications if spec.permission in allowed_permissions}
         tool_policy = (
@@ -407,7 +416,7 @@ class AgentRuntime:
                     server, status, call_executed, duration_ms = "", "ERROR", False, 0
                 else:
                     executed_signatures.add(signature)
-                    outcome = call_mcp_tool(name, arguments, project_scope)
+                    outcome = call_mcp_tool(name, arguments, project_scope, media_owner_id)
                     observation = outcome.output or {"status": outcome.status, "error": outcome.error}
                     success = outcome.success
                     server, status, call_executed, duration_ms = (
@@ -542,6 +551,7 @@ class AgentRuntime:
         allow_local_tools: bool,
         persistent_context: str,
         project_scope: ProjectToolScope | None,
+        media_owner_id: str,
     ) -> tuple[list[dict[str, object]], str, dict[str, object], dict[str, object]]:
         all_tools: list[dict[str, object]] = []
         round_activity: list[dict[str, object]] = []
@@ -660,7 +670,33 @@ class AgentRuntime:
                 "LOOKUP_AUTHOR": ResearchState.IDENTIFYING.value,
                 "SEARCH_DOCUMENT": ResearchState.SEARCHING.value,
             }.get(decision.next_action, ResearchState.VERIFYING.value))
-            if decision.next_action == "SEARCH_DOCUMENT":
+            if decision.next_action == "CREATE_MEDIA":
+                media_outcome = latency.stage(
+                    f"research_iteration_{iteration}_create_media",
+                    lambda: call_mcp_tool(
+                        "media_generate_image",
+                        {
+                            "subject": action_queries[0],
+                            "intent": "Create a visual grounded in the collected research evidence.",
+                            "save_to_project": bool(decision.save_to_project and project_scope is not None),
+                        },
+                        project_scope,
+                        media_owner_id,
+                    ),
+                )
+                round_tools = [{
+                    "name": "media_generate_image",
+                    "capability": "media",
+                    "success": media_outcome.success,
+                    "output": json.dumps(media_outcome.output or {}, ensure_ascii=False),
+                    "error": media_outcome.error,
+                    "duration_ms": media_outcome.duration_ms,
+                    "details": {
+                        "execution": "mcp", "server": media_outcome.server,
+                        "status": media_outcome.status, "executed": media_outcome.executed,
+                    },
+                }]
+            elif decision.next_action == "SEARCH_DOCUMENT":
                 if project_scope is None:
                     round_tools = []
                 else:
@@ -828,6 +864,19 @@ class AgentRuntime:
             "status": "AVAILABLE" if project_search_available else "UNAVAILABLE",
             "description": "Scoped hybrid search over the authenticated user's current project documents.",
         })
+        from runtime.media import MEDIA_DIRECTOR, MediaStatus
+        from runtime.mcp_host import mcp_tool_enabled
+
+        media_health = str(MEDIA_DIRECTOR.status().get("health", MediaStatus.UNAVAILABLE.value))
+        media_available = mcp_tool_enabled("media_generate_image") and media_health == MediaStatus.AVAILABLE.value
+        available_tools.append({
+            "name": "semantic_media_generation",
+            "action": "CREATE_MEDIA",
+            "cost": "dedicated_gpu",
+            "available": media_available,
+            "status": media_health if media_available else "UNAVAILABLE",
+            "description": "Generate one evidence-grounded image and optionally save it to the authorized current Project.",
+        })
         state = {
             "user_goal": question,
             "current_utc_date": datetime.now(timezone.utc).date().isoformat(),
@@ -855,7 +904,7 @@ class AgentRuntime:
         prompt = (
             "You are the Research Planner and Orchestrator. Choose the single best NEXT ACTION from the current state. "
             "The executor, not a keyword classifier, will run it and return the observation to you. Available actions are "
-            "SEARCH_WEB, FETCH_PAGE, SEARCH_ACADEMIC, LOOKUP_AUTHOR, SEARCH_DOCUMENT, COMPARE_EVIDENCE, ANALYZE, CALCULATE, and FINAL_ANSWER. "
+            "SEARCH_WEB, FETCH_PAGE, SEARCH_ACADEMIC, LOOKUP_AUTHOR, SEARCH_DOCUMENT, CREATE_MEDIA, COMPARE_EVIDENCE, ANALYZE, CALCULATE, and FINAL_ANSWER. "
             "For SEARCH_WEB choose web or news search and 1 to 4 focused queries. Use provider=auto unless a specific provider has a "
             "material advantage; the Search Router handles health, cost, and fallback. For FETCH_PAGE select 1 to 3 public HTTPS URLs "
             "from prior search observations and return them in urls. Use the least expensive tool likely "
@@ -865,6 +914,8 @@ class AgentRuntime:
             "Search snippets are discovery evidence, so FETCH_PAGE important primary or supporting pages before relying on factual claims. "
             "Ask: What important uncertainty still prevents a high-quality answer? Choose follow-up search, another source, page fetch, "
             "academic lookup, comparison, calculation, analysis, or finalization accordingly. Search budget is a maximum, not a quota. "
+            "Choose CREATE_MEDIA only when the user explicitly requests a visual deliverable and enough evidence has already been gathered; "
+            "put one concise evidence-grounded visual brief in queries and set save_to_project=true only when the user requested durable Project storage. "
             "Set complexity=COMPLEX and use_critic=true only when causal reasoning, consequential market/investment analysis, conflicting "
             "evidence, identity ambiguity, or multiple scenarios materially benefit from critique. Simple questions should avoid extra calls. "
             "Choose FINAL_ANSWER only when a substantive answer can be written now, there is no pending tool call or critical unresolved "
@@ -875,7 +926,7 @@ class AgentRuntime:
             '"unresolved_questions":[],"decision_summary":"brief observable rationale",'
             '"ready_to_answer":false,"complexity":"SIMPLE|MODERATE|COMPLEX","use_critic":false,'
             '"freshness_importance":"low|normal|high","primary_source_importance":"low|normal|high",'
-            '"scholarly_evidence_value":"low|normal|high"}.\n\n'
+            '"scholarly_evidence_value":"low|normal|high","save_to_project":false}.\n\n'
             f"Research state:\n{self._bounded_evidence_json(state)}"
         )
         try:
@@ -918,7 +969,7 @@ class AgentRuntime:
         action = value.get("next_action")
         allowed = {
             "SEARCH_WEB", "FETCH_PAGE", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR",
-            "SEARCH_DOCUMENT", "COMPARE_EVIDENCE", "ANALYZE", "CALCULATE", "FINAL_ANSWER",
+            "SEARCH_DOCUMENT", "CREATE_MEDIA", "COMPARE_EVIDENCE", "ANALYZE", "CALCULATE", "FINAL_ANSWER",
         }
         if action not in allowed:
             raise ValueError("model returned an unsupported research action")
@@ -932,7 +983,7 @@ class AgentRuntime:
         provider = value.get("provider")
         queries = strings("queries", 4)
         urls = strings("urls", 3)
-        if action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT"} and not queries:
+        if action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT", "CREATE_MEDIA"} and not queries:
             raise ValueError("tool action requires at least one query")
         if action == "SEARCH_WEB" and not provider:
             provider = "auto"
@@ -960,6 +1011,7 @@ class AgentRuntime:
             primary if primary in importance_values else "normal",
             scholarly if scholarly in importance_values else "low",
             urls,
+            value.get("save_to_project") is True,
         )
 
     def _resolve_researcher_identity_query(
