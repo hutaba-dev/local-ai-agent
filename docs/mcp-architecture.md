@@ -19,7 +19,7 @@ Phase 1 uses the official Python SDK and in-process transport. The same servers 
 | `ahnbys-search` | `search_web` | Conditional SearchRouter |
 | `ahnbys-search` | `search_news` | Conditional SearchRouter with news category |
 | `ahnbys-fetch` | `fetch_page` | Secure `fetch_sources()` extraction boundary |
-| `ahnbys-developer` | Time and local Git reads | Python timezone database and fixed AHNBYS repository |
+| `ahnbys-developer` | Time and local Git status/diff/log/show/blame/branch reads | Python timezone database and fixed AHNBYS repository |
 | `ahnbys-context7` | Documentation resolution and query | Official Context7 MCP through a two-tool facade |
 | `ahnbys-browser` | Public page browse and click | Official Playwright MCP through a two-tool facade |
 | `ahnbys-github` | Code search and repository reads | Official GitHub MCP in read-only mode |
@@ -34,7 +34,7 @@ Pinned external components:
 
 | Component | Version | License | Integrity source |
 | --- | --- | --- | --- |
-| Context7 MCP | 4.0.3 | MIT | npm lockfile integrity |
+| Context7 MCP | 4.0.4 | MIT | npm lockfile integrity |
 | Microsoft Playwright MCP | 0.0.79 | Apache-2.0 | npm lockfile integrity |
 | GitHub MCP Server | 1.11.0 (`822c87761f8587395b3e1a04b5386b2611252cd1`) | MIT | Official release SHA-256 `3b73bb7be0c8b043f861e90410df8ebdfc71b83128c54ced75fb32c4ff697fc5` |
 

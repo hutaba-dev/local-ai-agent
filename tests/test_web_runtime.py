@@ -344,8 +344,6 @@ class WebRuntimeTests(unittest.TestCase):
             "list_files",
             "search_files",
             "read_file",
-            "git_status",
-            "git_diff",
         })
         messages = self.fake_client.requests[-1]["json"]["messages"]
         self.assertTrue(any(message["content"] == "현재 repository 구조를 실제로 확인해서 설명해줘." for message in messages))

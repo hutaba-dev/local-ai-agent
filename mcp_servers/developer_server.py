@@ -145,7 +145,7 @@ def git_diff(relative_path: str | None = None, staged: bool = False, summary: bo
 
 @DEVELOPER_MCP.tool(description="Read one local commit, tag, or branch without changing repository state.", structured_output=True)
 def git_show(revision: str = "HEAD", relative_path: str | None = None) -> dict[str, object]:
-    arguments = ["show", "--stat", "--oneline", _revision(revision)]
+    arguments = ["show", "--format=fuller", "--no-ext-diff", _revision(revision)]
     path = _repo_path(relative_path)
     if path:
         arguments.extend(["--", path])
@@ -155,6 +155,11 @@ def git_show(revision: str = "HEAD", relative_path: str | None = None) -> dict[s
 @DEVELOPER_MCP.tool(description="Read line provenance for one repository-relative text file.", structured_output=True)
 def git_blame(relative_path: str, revision: str = "HEAD") -> dict[str, object]:
     return _git(["blame", "--line-porcelain", _revision(revision), "--", _repo_path(relative_path) or ""])
+
+
+@DEVELOPER_MCP.tool(description="Read local branches and upstream tracking without changing repository state.", structured_output=True)
+def git_branch_info() -> dict[str, object]:
+    return _git(["branch", "--verbose", "--verbose", "--no-abbrev", "--no-color"])
 
 
 if __name__ == "__main__":

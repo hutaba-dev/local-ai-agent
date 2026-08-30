@@ -134,6 +134,8 @@ def research_tool_catalog() -> list[dict[str, object]]:
         catalog.append({"name": name, "available": available, "status": status or ("AVAILABLE" if available else "UNAVAILABLE"), **description})
     if mcp_tool_enabled("search_web") or mcp_tool_enabled("fetch_page"):
         for tool in mcp_tool_catalog():
+            if tool["name"] not in {"search_web", "search_news", "fetch_page"}:
+                continue
             if not mcp_tool_enabled(str(tool["name"])):
                 continue
             catalog.append({
@@ -359,8 +361,6 @@ def _coding_tools(message: str, search_mode: str) -> list[ToolResult]:
         _command("list_files", ["find", ".", "-maxdepth", "2", "-type", "f", "-not", "-path", "./.git/*"], cwd=REPO_ROOT),
         _command("search_files", ["git", "grep", "-n", "Qwen3.8-27B", "--", "README.md", "docs"], cwd=REPO_ROOT),
         _command("read_file", ["sed", "-n", "1,220p", "README.md"], cwd=REPO_ROOT),
-        _command("git_status", ["git", "status", "--short", "--branch"], cwd=REPO_ROOT),
-        _command("git_diff", ["git", "diff", "--stat"], cwd=REPO_ROOT),
     ]
 
 

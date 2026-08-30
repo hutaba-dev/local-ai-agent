@@ -14,11 +14,16 @@ class CapabilityRegistryTests(unittest.TestCase):
             catalog = capability_catalog(project_available=False, image_available=False)
 
         self.assertEqual(len(catalog), 9)
-        self.assertLess(len(json.dumps(catalog)), 2_500)
+        self.assertLess(len(json.dumps(catalog)), 3_000)
         status = {item["name"]: item["status"] for item in catalog}
         self.assertEqual(status["project"], "UNCONFIGURED")
         self.assertEqual(status["image"], "UNCONFIGURED")
         self.assertEqual(status["github"], "UNCONFIGURED")
+        documentation = next(item for item in catalog if item["name"] == "documentation")
+        git = next(item for item in catalog if item["name"] == "git")
+        self.assertEqual((documentation["provider"], documentation["permission"]), ("context7", "READ"))
+        self.assertEqual((git["provider"], git["permission"]), ("local_git", "READ"))
+        self.assertEqual(documentation["health"], "AVAILABLE")
 
     def test_only_selected_detailed_tools_are_exposed_with_ten_tool_cap(self) -> None:
         tools = detailed_tools(("time", "git", "web", "academic"))

@@ -173,6 +173,7 @@ class MCPPhase1Tests(unittest.TestCase):
         names = {str(tool["name"]) for tool in catalog}
         self.assertTrue({"search_web", "search_news", "fetch_page"} <= names)
         self.assertTrue({"searxng", "serper", "brave", "secure_page_fetch"}.isdisjoint(names))
+        self.assertTrue({"git_status", "query_documentation", "resolve_library_id"}.isdisjoint(names))
 
     def test_disabled_mcp_does_not_start_discovery(self) -> None:
         with patch.dict(os.environ, {"MCP_ENABLED": "false"}, clear=False), patch(

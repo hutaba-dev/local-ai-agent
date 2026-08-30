@@ -15,6 +15,7 @@ MAX_CONTEXT7_OUTPUT_CHARS = 12_000
 SENSITIVE_PATTERN = re.compile(
     r"(?i)(?:api[_ -]?key|password|passwd|secret|access[_ -]?token|bearer)\s*[:=]\s*\S+"
 )
+RATE_LIMIT_PATTERN = re.compile(r"(?i)rate.?limit|too many requests|\b429\b")
 
 CONTEXT7_MCP = MCPServer(
     "ahnbys-context7",
@@ -41,6 +42,12 @@ def _text(result: Any) -> str:
     return "\n".join(values)[:MAX_CONTEXT7_OUTPUT_CHARS]
 
 
+def _upstream_status(is_error: bool, text: str) -> str:
+    if is_error:
+        return "RATE_LIMITED" if RATE_LIMIT_PATTERN.search(text) else "ERROR"
+    return "AVAILABLE" if text.strip() else "DEGRADED"
+
+
 async def _call(tool: str, arguments: dict[str, object]) -> dict[str, object]:
     headers = {}
     api_key = os.getenv("CONTEXT7_API_KEY")
@@ -55,7 +62,7 @@ async def _call(tool: str, arguments: dict[str, object]) -> dict[str, object]:
         result = await client.call_tool(tool, arguments, read_timeout_seconds=20)
     text = _text(result)
     return {
-        "status": "ERROR" if result.is_error else "AVAILABLE",
+        "status": _upstream_status(result.is_error, text),
         "source": "Context7",
         "text": text,
         "truncated": len(text) >= MAX_CONTEXT7_OUTPUT_CHARS,

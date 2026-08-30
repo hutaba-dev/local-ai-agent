@@ -64,8 +64,7 @@ ROLES = (
         description="Repository inspection, minimal edits, execution, tests, and change review.",
         instructions_path="agents/coding/instructions.md",
         preferred_capabilities=(
-            "workspace_read", "workspace_search", "workspace_edit", "execute",
-            "git", "documentation", "github", "web",
+            "workspace", "documentation", "git", "github", "web",
         ),
         default_capabilities=("workspace_read", "workspace_search", "workspace_edit", "execute"),
         permission_policy=(

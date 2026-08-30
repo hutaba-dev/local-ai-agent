@@ -329,7 +329,8 @@ class AgentRuntime:
                 "Select only capabilities materially required to answer the request. Return JSON only as "
                 '{"capabilities":["name"]}. Use an empty list when model knowledge is sufficient. '
                 "Never select unavailable capabilities. The active role is a primary expertise, not a restriction; "
-                "combine another capability when it materially improves the result."
+                "combine another capability when it materially improves the result. Workspace read/search/edit and safe execution "
+                "are already provided by the client host, so do not return them as optional capability selections."
             ),
         }, {
             "role": "user",
@@ -341,10 +342,7 @@ class AgentRuntime:
             }, ensure_ascii=False),
         }]
         selection, _ = self._complete(selector_messages, 200, latency, "capability_selection", temperature=0)
-        try:
-            selected_value = self._parse_json_object(selection).get("capabilities", [])
-        except ValueError:
-            selected_value = []
+        selected_value = self._parse_capability_selection(selection)
         available_names = {str(item["name"]) for item in available}
         selected = tuple(dict.fromkeys(
             str(name) for name in selected_value
@@ -431,6 +429,23 @@ class AgentRuntime:
         }]
         answer, payload = self._complete(final_messages, max_tokens, latency, "response")
         return answer, payload, activity
+
+    @staticmethod
+    def _parse_capability_selection(content: str) -> list[object]:
+        decoder = json.JSONDecoder()
+        for index, character in enumerate(content):
+            if character not in "[{":
+                continue
+            try:
+                value, _ = decoder.raw_decode(content[index:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, dict):
+                selected = value.get("capabilities", [])
+                return selected if isinstance(selected, list) else []
+            if isinstance(value, list):
+                return [item["name"] for item in value if isinstance(item, dict) and isinstance(item.get("name"), str)]
+        return []
 
     def _complete_tool_turn(
         self,

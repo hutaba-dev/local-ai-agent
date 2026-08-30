@@ -64,6 +64,77 @@ class MainToolLoopTests(unittest.TestCase):
         self.assertEqual(result.route.agent, "coding")
         self.assertEqual(result.tools[0]["capability"], "documentation")
         self.assertEqual(result.tools[0]["action"], "READ")
+        self.assertEqual(
+            {tool["function"]["name"] for tool in client.requests[1]["tools"]},
+            {"resolve_library_id", "query_documentation"},
+        )
+
+    def test_context7_unavailable_does_not_abort_coding_response(self) -> None:
+        client = SequencedClient([
+            {"role": "assistant", "content": '{"capabilities":["documentation"]}'},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_docs",
+                    "type": "function",
+                    "function": {
+                        "name": "resolve_library_id",
+                        "arguments": '{"library_name":"FastAPI","query":"lifespan"}',
+                    },
+                }],
+            },
+            {"role": "assistant", "content": "공식 문서 조회는 실패했지만 현재 코드 기준으로 검토했습니다."},
+        ])
+        outcome = MCPCallOutcome(
+            False, True, "resolve_library_id", "context7-mcp", "DEGRADED",
+            None, "MCP tool timed out", 21_000,
+        )
+        with patch.dict(os.environ, {"MCP_ENABLED": "true"}, clear=False), patch(
+            "runtime.agent_runtime.call_mcp_tool", return_value=outcome
+        ):
+            result = AgentRuntime(client=client).chat(
+                "FastAPI lifespan 사용을 검토해줘", "coding", allow_local_tools=False
+            )
+
+        self.assertIn("실패했지만", result.content)
+        self.assertFalse(result.tools[0]["success"])
+        self.assertEqual(result.tools[0]["details"]["status"], "DEGRADED")
+
+    def test_git_history_request_exposes_only_scoped_semantic_git_reads(self) -> None:
+        client = SequencedClient([
+            {"role": "assistant", "content": '{"capabilities":["git"]}'},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_git",
+                    "type": "function",
+                    "function": {
+                        "name": "git_log",
+                        "arguments": '{"limit":10,"relative_path":"runtime/search_providers.py"}',
+                    },
+                }],
+            },
+            {"role": "assistant", "content": "SearchRouter 변경 이력을 확인했습니다."},
+        ])
+        outcome = MCPCallOutcome(
+            True, True, "git_log", "developer-mcp", "AVAILABLE",
+            {"status": "AVAILABLE", "repository": "local-ai-agent", "output": "070310e refactor"}, None, 1,
+        )
+        with patch.dict(os.environ, {"MCP_ENABLED": "true"}, clear=False), patch(
+            "runtime.agent_runtime.call_mcp_tool", return_value=outcome
+        ) as call:
+            result = AgentRuntime(client=client).chat(
+                "SearchRouter.search() 함수가 최근 어떤 변경을 거쳤는지 Git history를 확인해서 설명해줘. 코드는 수정하지 마.",
+                "coding", allow_local_tools=False,
+            )
+
+        exposed = {tool["function"]["name"] for tool in client.requests[1]["tools"]}
+        self.assertEqual(exposed, {"git_status", "git_diff", "git_log", "git_show", "git_blame", "git_branch_info"})
+        self.assertNotIn("execute", exposed)
+        self.assertEqual(result.tools[0]["capability"], "git")
+        call.assert_called_once()
 
     def test_qwen_selects_capability_calls_tool_and_uses_observation(self) -> None:
         client = SequencedClient([
@@ -97,6 +168,14 @@ class MainToolLoopTests(unittest.TestCase):
         self.assertTrue(any(message.get("role") == "tool" and message.get("tool_call_id") == "call_1" for message in tool_messages))
         call.assert_called_once()
 
+    def test_selector_accepts_structured_name_list_and_ignores_host_workspace_tools(self) -> None:
+        selected = AgentRuntime._parse_capability_selection(
+            '[{"name":"workspace_search","reason":"locate code"},'
+            '{"name":"documentation","reason":"check current docs"}]'
+        )
+
+        self.assertEqual(selected, ["workspace_search", "documentation"])
+
     def test_zero_capability_selection_executes_no_tools(self) -> None:
         client = SequencedClient([
             {"role": "assistant", "content": '{"capabilities":[]}'},
@@ -109,6 +188,38 @@ class MainToolLoopTests(unittest.TestCase):
 
         self.assertEqual(result.tools, [])
         self.assertNotIn("tools", client.requests[1])
+        call.assert_not_called()
+
+    def test_python_dictionary_explanation_selects_no_capability(self) -> None:
+        client = SequencedClient([
+            {"role": "assistant", "content": '{"capabilities":[]}'},
+            {"role": "assistant", "content": "dictionary는 key-value이고 list는 순서형 sequence입니다."},
+        ])
+        with patch.dict(os.environ, {"MCP_ENABLED": "true"}, clear=False), patch(
+            "runtime.agent_runtime.call_mcp_tool"
+        ) as call:
+            result = AgentRuntime(client=client).chat(
+                "Python에서 dictionary와 list의 차이를 설명해줘.", "coding", allow_local_tools=False
+            )
+
+        self.assertEqual(result.tools, [])
+        self.assertNotIn("tools", client.requests[1])
+        call.assert_not_called()
+
+    def test_research_request_does_not_enter_main_capability_loop(self) -> None:
+        client = SequencedClient([
+            {"role": "assistant", "content": '{"search_mode":"NO_SEARCH","ready_to_answer":true}'},
+            {"role": "assistant", "content": "분석에는 최신 외부 근거가 필요합니다."},
+        ])
+        with patch.dict(os.environ, {"MCP_ENABLED": "true"}, clear=False), patch(
+            "runtime.agent_runtime.call_mcp_tool"
+        ) as call:
+            result = AgentRuntime(client=client).chat(
+                "NVIDIA 실적 분석", "research", allow_local_tools=False
+            )
+
+        self.assertEqual(result.tools, [])
+        self.assertTrue(all(request["messages"][0]["role"] == "system" for request in client.requests))
         call.assert_not_called()
 
     def test_multiple_tool_calls_in_one_turn_are_all_executed(self) -> None:

@@ -8,7 +8,7 @@ from unittest.mock import patch
 from mcp import Client
 
 from mcp_servers.browser_server import BROWSER_MCP
-from mcp_servers.context7_server import CONTEXT7_MCP
+from mcp_servers.context7_server import CONTEXT7_MCP, _upstream_status
 from mcp_servers.github_server import GITHUB_MCP
 from runtime.mcp_host import MCPHealth, MCPHost
 
@@ -61,6 +61,12 @@ class MCPExternalTests(unittest.TestCase):
 
         self.assertTrue(secret.is_error)
         self.assertTrue(invalid.is_error)
+
+    def test_context7_normalizes_rate_limit_error_and_empty_success(self) -> None:
+        self.assertEqual(_upstream_status(True, "HTTP 429 Too Many Requests"), "RATE_LIMITED")
+        self.assertEqual(_upstream_status(True, "malformed upstream response"), "ERROR")
+        self.assertEqual(_upstream_status(False, ""), "DEGRADED")
+        self.assertEqual(_upstream_status(False, "current documentation"), "AVAILABLE")
 
     def test_github_remains_unconfigured_without_starting_upstream(self) -> None:
         environment = dict(os.environ)

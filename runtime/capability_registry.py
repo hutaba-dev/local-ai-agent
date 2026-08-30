@@ -24,6 +24,8 @@ class CapabilitySpec:
     cost_class: str
     feature_flag: str
     tools: tuple[str, ...]
+    provider: str = "internal"
+    permission: str = PermissionClass.READ.value
 
 
 @dataclass(frozen=True)
@@ -51,9 +53,18 @@ CAPABILITIES = (
     CapabilitySpec("web", "Web Search", "Current public web and news discovery.", "very_low_to_paid", "MCP_SEARCH_ENABLED", ("search_web", "search_news", "fetch_page")),
     CapabilitySpec("browser", "Browser", "Read and interact with public JavaScript-rendered pages when fetch is insufficient.", "local_compute", "MCP_PLAYWRIGHT_ENABLED", ("browse_page", "browse_click")),
     CapabilitySpec("time", "Current Time", "Exact current dates, timezones, and time conversion.", "local_compute", "MCP_TIME_ENABLED", ("get_current_time", "convert_time")),
-    CapabilitySpec("documentation", "Software Documentation", "Current library and framework documentation with version-specific examples.", "external", "MCP_CONTEXT7_ENABLED", ("resolve_library_id", "query_documentation")),
+    CapabilitySpec(
+        "documentation", "Software Documentation",
+        "Use current, version-specific software and framework documentation when it materially improves implementation accuracy.",
+        "external", "MCP_CONTEXT7_ENABLED", ("resolve_library_id", "query_documentation"), "context7",
+    ),
     CapabilitySpec("github", "GitHub", "Read repository code, history, issues, pull requests, and branches from GitHub.", "external", "MCP_GITHUB_ENABLED", ("github_search_code", "github_read_repository")),
-    CapabilitySpec("git", "Local Git", "Read status, diffs, history, commits, and blame in the AHNBYS repository.", "local_compute", "MCP_GIT_ENABLED", ("git_status", "git_log", "git_diff", "git_show", "git_blame")),
+    CapabilitySpec(
+        "git", "Local Git",
+        "Read repository status, diffs, history, commits, blame, and branch tracking through scoped semantic operations; prefer these over generic command execution for Git reads.",
+        "local_compute", "MCP_GIT_ENABLED",
+        ("git_status", "git_diff", "git_log", "git_show", "git_blame", "git_branch_info"), "local_git",
+    ),
     CapabilitySpec("academic", "Academic Research", "Researcher identity, publications, citations, and source provenance.", "varies", "MCP_ACADEMIC_ENABLED", ("researcher_profile", "publication_search")),
     CapabilitySpec("project", "Project Knowledge", "Authorized project files, memories, conversations, and artifacts.", "local_compute", "MCP_PROJECT_ENABLED", ("project_search", "project_list_files", "project_read_file", "project_get_memories")),
     CapabilitySpec("image", "Image Work", "Generate or edit images through the existing AHN7 worker.", "gpu_compute", "MCP_IMAGE_ENABLED", ("generate_image", "edit_image", "adjust_face_pose")),
@@ -80,11 +91,12 @@ TOOL_SPECS = {
     "github_read_repository": AgentToolSpec("github_read_repository", "github", "Read a GitHub repository file, history, branches, issue, or pull request. No write operations are available.", "github-mcp", "external", "READ", _object({"owner": _string("Repository owner", 100), "repo": _string("Repository name", 100), "operation": {"type": "string", "enum": ["file", "history", "branches", "issue", "pull_request"]}, "path": _string("Optional repository path", 500), "number": {"type": "integer", "minimum": 1}, "ref": _string("Optional branch, tag, or commit reference", 200)}, ("owner", "repo", "operation"))),
     "get_current_time": AgentToolSpec("get_current_time", "time", "Get exact current time in up to five IANA timezones. Use this to resolve relative dates instead of guessing.", "developer-mcp", "local_compute", "READ", _object({"timezones": {"type": "array", "items": _string("IANA timezone", 100), "maxItems": 5}})),
     "convert_time": AgentToolSpec("convert_time", "time", "Convert an ISO date-time between IANA timezones.", "developer-mcp", "local_compute", "READ", _object({"value": _string("ISO 8601 date-time", 100), "from_timezone": _string("Source IANA timezone", 100), "to_timezone": _string("Target IANA timezone", 100)}, ("value", "from_timezone", "to_timezone"))),
-    "git_status": AgentToolSpec("git_status", "git", "Read concise local AHNBYS repository status.", "developer-mcp", "local_compute", "READ", _object({})),
+    "git_status": AgentToolSpec("git_status", "git", "Read concise repository status. Prefer this scoped semantic operation over generic command execution for Git status.", "developer-mcp", "local_compute", "READ", _object({})),
     "git_log": AgentToolSpec("git_log", "git", "Read bounded local commit history, optionally for one repository-relative path.", "developer-mcp", "local_compute", "READ", _object({"limit": {"type": "integer", "minimum": 1, "maximum": 50}, "relative_path": _string("Optional repository-relative path")})),
     "git_diff": AgentToolSpec("git_diff", "git", "Read local Git diff without modifying the worktree.", "developer-mcp", "local_compute", "READ", _object({"relative_path": _string("Optional repository-relative path"), "staged": {"type": "boolean"}, "summary": {"type": "boolean"}})),
     "git_show": AgentToolSpec("git_show", "git", "Read one local commit, tag, or branch.", "developer-mcp", "local_compute", "READ", _object({"revision": _string("Revision such as HEAD or a commit hash", 200), "relative_path": _string("Optional repository-relative path")})),
     "git_blame": AgentToolSpec("git_blame", "git", "Read line provenance for one repository-relative file.", "developer-mcp", "local_compute", "READ", _object({"relative_path": _string("Repository-relative file path"), "revision": _string("Revision", 200)}, ("relative_path",))),
+    "git_branch_info": AgentToolSpec("git_branch_info", "git", "Read local branches and upstream tracking information without changing branches.", "developer-mcp", "local_compute", "READ", _object({})),
     "researcher_profile": AgentToolSpec("researcher_profile", "academic", "Resolve a researcher identity and retrieve a normalized profile with provider-specific provenance.", "academic-mcp", "varies", "READ", _object({"query": _string("Researcher name or identity query")}, ("query",))),
     "publication_search": AgentToolSpec("publication_search", "academic", "Search normalized scholarly publication metadata when academic evidence materially improves the answer.", "academic-mcp", "varies", "READ", _object({"query": _string("Focused publication query"), "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, ("query",))),
     "project_search": AgentToolSpec("project_search", "project", "Search authorized current-project files, memories, and conversations.", "project-mcp", "local_compute", "READ", _object({"query": _string("Current-project search query")}, ("query",))),
@@ -116,10 +128,13 @@ def capability_catalog(*, project_available: bool = False, image_available: bool
         catalog.append({
             "name": capability.name,
             "label": capability.label,
+            "provider": capability.provider,
             "description": capability.description,
             "cost_class": capability.cost_class,
+            "permission": capability.permission,
             "available": enabled and configured,
             "status": "AVAILABLE" if enabled and configured else ("UNCONFIGURED" if enabled else "DISABLED"),
+            "health": "AVAILABLE" if enabled and configured else ("UNCONFIGURED" if enabled else "DISABLED"),
         })
     return catalog
 

@@ -29,7 +29,7 @@ class RoleRegistryTests(unittest.TestCase):
         self.assertEqual(coder.default_capabilities, (
             "workspace_read", "workspace_search", "workspace_edit", "execute",
         ))
-        self.assertTrue({"documentation", "git", "github", "web"} <= set(coder.preferred_capabilities))
+        self.assertTrue({"workspace", "documentation", "git", "github", "web"} <= set(coder.preferred_capabilities))
         self.assertEqual(set(coder.permission_policy), {
             PermissionClass.READ,
             PermissionClass.WRITE_WORKSPACE,

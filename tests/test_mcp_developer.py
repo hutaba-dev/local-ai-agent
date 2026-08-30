@@ -40,10 +40,16 @@ class MCPDeveloperTests(unittest.TestCase):
         names = {tool.name for tool in tools}
         self.assertEqual(names, {
             "get_current_time", "convert_time", "git_status", "git_log", "git_diff", "git_show", "git_blame",
+            "git_branch_info",
         })
         self.assertTrue(all(name not in names for name in {"shell", "git_commit", "git_push", "git_reset", "git_checkout"}))
         result = self.call("git_log", {"limit": 2})
+        branch = self.call("git_branch_info", {})
+        shown = self.call("git_show", {"revision": "HEAD", "relative_path": "runtime/agent_runtime.py"})
         self.assertFalse(result.is_error)
+        self.assertFalse(branch.is_error)
+        self.assertFalse(shown.is_error)
+        self.assertIn("commit ", shown.structured_content["output"])
         self.assertLessEqual(len(result.structured_content["output"]), 12_000)
 
     def test_git_rejects_path_escape_and_revision_option_injection(self) -> None:
