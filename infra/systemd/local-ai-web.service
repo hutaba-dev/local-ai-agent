@@ -11,6 +11,8 @@ Type=simple
 User=root
 WorkingDirectory=/root/local-ai-agent
 Environment=PYTHONUNBUFFERED=1
+Environment=MCP_PLAYWRIGHT_ENABLED=true
+Environment=MCP_PLAYWRIGHT_EGRESS_GUARD=true
 EnvironmentFile=/etc/local-ai-agent/image-worker.env
 ExecStart=/root/local-ai-agent/web/run.sh
 Restart=always

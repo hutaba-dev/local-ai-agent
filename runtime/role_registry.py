@@ -37,7 +37,7 @@ ROLES = (
         name="KIM / Secretary",
         description="Central coordinator for conversation, planning, memory, and specialist composition.",
         instructions_path="agents/main/instructions.md",
-        preferred_capabilities=("project", "time", "documentation", "web"),
+        preferred_capabilities=("project", "time", "documentation", "web", "browser"),
         default_capabilities=(),
         permission_policy=(PermissionClass.READ,),
         memory_policy="Relevant project memory only; durable writes require an explicit user action.",
@@ -64,7 +64,7 @@ ROLES = (
         description="Repository inspection, minimal edits, execution, tests, and change review.",
         instructions_path="agents/coding/instructions.md",
         preferred_capabilities=(
-            "workspace", "documentation", "git", "github", "web",
+            "workspace", "documentation", "git", "github", "web", "browser",
         ),
         default_capabilities=("workspace_read", "workspace_search", "workspace_edit", "execute"),
         permission_policy=(

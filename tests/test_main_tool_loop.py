@@ -136,6 +136,38 @@ class MainToolLoopTests(unittest.TestCase):
         self.assertEqual(result.tools[0]["capability"], "git")
         call.assert_called_once()
 
+    def test_github_selection_exposes_only_explicit_remote_read_tools(self) -> None:
+        client = SequencedClient([
+            {"role": "assistant", "content": '{"capabilities":["github"]}'},
+            {"role": "assistant", "content": "원격 GitHub 저장소를 읽을 준비가 됐습니다."},
+        ])
+        with patch.dict(os.environ, {
+            "MCP_ENABLED": "true", "MCP_GITHUB_ENABLED": "true", "GITHUB_PERSONAL_ACCESS_TOKEN": "test-token",
+        }, clear=False):
+            AgentRuntime(client=client).chat("GitHub의 원격 PR 42 변경 파일을 읽어줘", "coding", allow_local_tools=False)
+
+        exposed = {tool["function"]["name"] for tool in client.requests[1]["tools"]}
+        self.assertEqual(exposed, {
+            "github_search_code", "github_get_file", "github_read_commits",
+            "github_read_issues", "github_get_pull_request", "github_read_releases",
+        })
+        self.assertTrue(all(tool["function"]["name"].startswith("github_") for tool in client.requests[1]["tools"]))
+
+    def test_browser_selection_exposes_only_public_interaction_tools(self) -> None:
+        client = SequencedClient([
+            {"role": "assistant", "content": '{"capabilities":["browser"]}'},
+            {"role": "assistant", "content": "공개 페이지를 렌더링할 준비가 됐습니다."},
+        ])
+        with patch.dict(os.environ, {
+            "MCP_ENABLED": "true", "MCP_PLAYWRIGHT_ENABLED": "true", "MCP_PLAYWRIGHT_EGRESS_GUARD": "true",
+        }, clear=False):
+            AgentRuntime(client=client).chat("공개 JavaScript 페이지를 렌더링해서 폼 옵션을 확인해줘", "coding", allow_local_tools=False)
+
+        exposed = {tool["function"]["name"] for tool in client.requests[1]["tools"]}
+        self.assertEqual(exposed, {"browse_page", "browse_click", "browse_type", "browse_select"})
+        self.assertNotIn("browser_run_code_unsafe", exposed)
+        self.assertNotIn("browser_file_upload", exposed)
+
     def test_qwen_selects_capability_calls_tool_and_uses_observation(self) -> None:
         client = SequencedClient([
             {"role": "assistant", "content": '{"capabilities":["time"]}'},

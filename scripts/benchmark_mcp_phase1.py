@@ -17,7 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from runtime.agent_runtime import AgentRuntime, LatencyRecorder
+from runtime.agent_runtime import AgentRuntime, LatencyRecorder, ResearchPlan
 from runtime.mcp_host import MCPCallOutcome
 from runtime.tool_registry import ToolResult, execute_research_action, research_tool_catalog
 
@@ -125,7 +125,7 @@ def planner_benchmark() -> list[dict[str, object]]:
     }]
     cases = (
         ("A_current_news", "What are NVIDIA's most important announcements today?", (), {"SEARCH_WEB"}),
-        ("B_researcher", "안호선 교수의 연구 역량과 대표 논문을 평가해줘", (), {"SEARCH_WEB", "LOOKUP_AUTHOR"}),
+        ("B_researcher", "안호선 교수의 연구 역량과 대표 논문을 평가해줘", (), {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR"}),
         ("C_sufficient_evidence", "According to the supplied paper, what architecture does the Transformer use?", fetched_observation, {"FINAL_ANSWER"}),
         ("D_fetch_selected_source", "Verify the latest NVIDIA announcement from the primary source.", search_observation, {"FETCH_PAGE"}),
     )
@@ -137,7 +137,9 @@ def planner_benchmark() -> list[dict[str, object]]:
             for name, question, tools, expected in cases:
                 latency = LatencyRecorder()
                 decision = runtime._decide_research_action(
-                    question, (question,), list(tools), [], system_prompt, latency, 8, 8,
+                    question,
+                    ResearchPlan("DEEP_RESEARCH", depth="moderate", search_queries=(question,)),
+                    list(tools), [], system_prompt, latency, 8, 8,
                 )
                 call = latency.llm_calls[-1] if latency.llm_calls else {}
                 results.append({

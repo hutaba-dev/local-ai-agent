@@ -51,14 +51,14 @@ class AgentToolSpec:
 
 CAPABILITIES = (
     CapabilitySpec("web", "Web Search", "Current public web and news discovery.", "very_low_to_paid", "MCP_SEARCH_ENABLED", ("search_web", "search_news", "fetch_page")),
-    CapabilitySpec("browser", "Browser", "Read and interact with public JavaScript-rendered pages when fetch is insufficient.", "local_compute", "MCP_PLAYWRIGHT_ENABLED", ("browse_page", "browse_click")),
+    CapabilitySpec("browser", "Browser", "Read and interact with public JavaScript-rendered pages when fetch is insufficient.", "local_compute", "MCP_PLAYWRIGHT_ENABLED", ("browse_page", "browse_click", "browse_type", "browse_select")),
     CapabilitySpec("time", "Current Time", "Exact current dates, timezones, and time conversion.", "local_compute", "MCP_TIME_ENABLED", ("get_current_time", "convert_time")),
     CapabilitySpec(
         "documentation", "Software Documentation",
         "Use current, version-specific software and framework documentation when it materially improves implementation accuracy.",
         "external", "MCP_CONTEXT7_ENABLED", ("resolve_library_id", "query_documentation"), "context7",
     ),
-    CapabilitySpec("github", "GitHub", "Read repository code, history, issues, pull requests, and branches from GitHub.", "external", "MCP_GITHUB_ENABLED", ("github_search_code", "github_read_repository")),
+    CapabilitySpec("github", "GitHub", "Read remote repository code, commits, issues, pull requests, and releases through official GitHub APIs.", "external", "MCP_GITHUB_ENABLED", ("github_search_code", "github_get_file", "github_read_commits", "github_read_issues", "github_get_pull_request", "github_read_releases")),
     CapabilitySpec(
         "git", "Local Git",
         "Read repository status, diffs, history, commits, blame, and branch tracking through scoped semantic operations; prefer these over generic command execution for Git reads.",
@@ -85,10 +85,16 @@ TOOL_SPECS = {
     "fetch_page": AgentToolSpec("fetch_page", "web", "Fetch one selected public HTTPS page through the existing secure extraction boundary.", "web-mcp", "very_low", "READ", _object({"url": _string("Public HTTPS URL from a prior result", 2000)}, ("url",))),
     "browse_page": AgentToolSpec("browse_page", "browser", "Open one public HTTPS JavaScript-rendered page through Playwright and return a bounded relevant snapshot.", "browser-mcp", "local_compute", "READ", _object({"url": _string("Public HTTPS URL", 2000), "find_text": _string("Optional text to locate in the rendered page", 300)}, ("url",))),
     "browse_click": AgentToolSpec("browse_click", "browser", "Open a public page, click one exact snapshot reference or unique selector, and return the resulting bounded snapshot. Never bypass access controls or CAPTCHAs.", "browser-mcp", "local_compute", "READ", _object({"url": _string("Public HTTPS URL", 2000), "target": _string("Exact snapshot reference or unique selector", 500), "element": _string("Human-readable element description", 300)}, ("url", "target"))),
+    "browse_type": AgentToolSpec("browse_type", "browser", "Open a public page and type bounded non-secret text into one exact field, optionally submitting it. Never enter credentials or sensitive data.", "browser-mcp", "local_compute", "READ", _object({"url": _string("Public HTTPS URL", 2000), "target": _string("Exact snapshot reference or unique selector", 500), "text": _string("Non-secret text to type", 1000), "submit": {"type": "boolean"}, "element": _string("Human-readable field description", 300)}, ("url", "target", "text"))),
+    "browse_select": AgentToolSpec("browse_select", "browser", "Open a public page and select bounded values in one exact dropdown. Never use this to alter accounts or make purchases.", "browser-mcp", "local_compute", "READ", _object({"url": _string("Public HTTPS URL", 2000), "target": _string("Exact snapshot reference or unique selector", 500), "values": {"type": "array", "items": _string("Dropdown value", 200), "minItems": 1, "maxItems": 10}, "element": _string("Human-readable dropdown description", 300)}, ("url", "target", "values"))),
     "resolve_library_id": AgentToolSpec("resolve_library_id", "documentation", "Resolve an official library name before querying current Context7 documentation.", "context7-mcp", "external", "READ", _object({"library_name": _string("Official library name", 200), "query": _string("Version-specific documentation need", 1000)}, ("library_name", "query"))),
     "query_documentation": AgentToolSpec("query_documentation", "documentation", "Use this when current library/framework documentation or version-specific implementation details materially improve the answer.", "context7-mcp", "external", "READ", _object({"library_id": _string("Exact Context7 /org/project ID", 300), "query": _string("One specific documentation topic", 1000)}, ("library_id", "query"))),
     "github_search_code": AgentToolSpec("github_search_code", "github", "Search code through the official GitHub MCP server in read-only mode.", "github-mcp", "external", "READ", _object({"query": _string("GitHub code search query", 256)}, ("query",))),
-    "github_read_repository": AgentToolSpec("github_read_repository", "github", "Read a GitHub repository file, history, branches, issue, or pull request. No write operations are available.", "github-mcp", "external", "READ", _object({"owner": _string("Repository owner", 100), "repo": _string("Repository name", 100), "operation": {"type": "string", "enum": ["file", "history", "branches", "issue", "pull_request"]}, "path": _string("Optional repository path", 500), "number": {"type": "integer", "minimum": 1}, "ref": _string("Optional branch, tag, or commit reference", 200)}, ("owner", "repo", "operation"))),
+    "github_get_file": AgentToolSpec("github_get_file", "github", "Read one GitHub repository file or directory at an optional ref.", "github-mcp", "external", "READ", _object({"owner": _string("Repository owner", 100), "repo": _string("Repository name", 100), "path": _string("Repository path", 500), "ref": _string("Optional branch, tag, or commit ref", 200)}, ("owner", "repo"))),
+    "github_read_commits": AgentToolSpec("github_read_commits", "github", "List bounded remote GitHub commit history or read one commit with file statistics.", "github-mcp", "external", "READ", _object({"owner": _string("Repository owner", 100), "repo": _string("Repository name", 100), "operation": {"type": "string", "enum": ["list", "get"]}, "path": _string("Optional path", 500), "ref": _string("Optional list branch, tag, or commit ref", 200), "sha": _string("Required get SHA, branch, or tag", 200)}, ("owner", "repo", "operation"))),
+    "github_read_issues": AgentToolSpec("github_read_issues", "github", "Read one GitHub issue or search bounded issue and pull-request metadata.", "github-mcp", "external", "READ", _object({"operation": {"type": "string", "enum": ["get", "search"]}, "owner": _string("Repository owner for get or scoped search", 100), "repo": _string("Repository name for get or scoped search", 100), "number": {"type": "integer", "minimum": 1}, "query": _string("Issue search query", 256), "include_comments": {"type": "boolean"}}, ("operation",))),
+    "github_get_pull_request": AgentToolSpec("github_get_pull_request", "github", "Read one GitHub pull request view, including bounded metadata, files, reviews, checks, status, or diff.", "github-mcp", "external", "READ", _object({"owner": _string("Repository owner", 100), "repo": _string("Repository name", 100), "number": {"type": "integer", "minimum": 1}, "view": {"type": "string", "enum": ["details", "files", "commits", "reviews", "review_comments", "comments", "checks", "status", "diff"]}}, ("owner", "repo", "number"))),
+    "github_read_releases": AgentToolSpec("github_read_releases", "github", "List bounded GitHub releases, read the latest release, or read one release by tag.", "github-mcp", "external", "READ", _object({"owner": _string("Repository owner", 100), "repo": _string("Repository name", 100), "operation": {"type": "string", "enum": ["list", "latest", "tag"]}, "tag": _string("Required tag for tag operation", 200)}, ("owner", "repo"))),
     "get_current_time": AgentToolSpec("get_current_time", "time", "Get exact current time in up to five IANA timezones. Use this to resolve relative dates instead of guessing.", "developer-mcp", "local_compute", "READ", _object({"timezones": {"type": "array", "items": _string("IANA timezone", 100), "maxItems": 5}})),
     "convert_time": AgentToolSpec("convert_time", "time", "Convert an ISO date-time between IANA timezones.", "developer-mcp", "local_compute", "READ", _object({"value": _string("ISO 8601 date-time", 100), "from_timezone": _string("Source IANA timezone", 100), "to_timezone": _string("Target IANA timezone", 100)}, ("value", "from_timezone", "to_timezone"))),
     "git_status": AgentToolSpec("git_status", "git", "Read concise repository status. Prefer this scoped semantic operation over generic command execution for Git status.", "developer-mcp", "local_compute", "READ", _object({})),
@@ -140,13 +146,31 @@ def capability_catalog(*, project_available: bool = False, image_available: bool
 
 
 def detailed_tools(selected_capabilities: Iterable[str], limit: int = 10) -> tuple[AgentToolSpec, ...]:
-    selected = set(selected_capabilities)
-    ordered = [
-        spec for spec in TOOL_SPECS.values()
-        if spec.capability in selected
-        and (spec.name != "fetch_page" or _enabled("MCP_FETCH_ENABLED", True))
-    ]
-    return tuple(ordered[: max(1, min(limit, 10))])
+    selected = tuple(dict.fromkeys(selected_capabilities))
+    grouped = {
+        capability: [
+            spec for spec in TOOL_SPECS.values()
+            if spec.capability == capability
+            and (spec.name != "fetch_page" or _enabled("MCP_FETCH_ENABLED", True))
+        ]
+        for capability in selected
+    }
+    bounded_limit = max(1, min(limit, 10))
+    ordered: list[AgentToolSpec] = []
+    index = 0
+    while len(ordered) < bounded_limit:
+        added = False
+        for capability in selected:
+            tools = grouped[capability]
+            if index < len(tools):
+                ordered.append(tools[index])
+                added = True
+                if len(ordered) == bounded_limit:
+                    break
+        if not added:
+            break
+        index += 1
+    return tuple(ordered)
 
 
 def registry_snapshot() -> dict[str, object]:

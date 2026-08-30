@@ -7,9 +7,10 @@ from unittest.mock import patch
 
 from mcp import Client
 
-from mcp_servers.browser_server import BROWSER_MCP
+from mcp_servers.browser_server import BROWSER_MCP, _health
 from mcp_servers.context7_server import CONTEXT7_MCP, _upstream_status
-from mcp_servers.github_server import GITHUB_MCP
+from mcp_servers.github_server import GITHUB_MCP, UPSTREAM_TOOLS, _parameters as github_parameters
+from mcp_servers.public_web_proxy import public_addresses
 from runtime.mcp_host import MCPHealth, MCPHost
 
 
@@ -29,10 +30,38 @@ class MCPExternalTests(unittest.TestCase):
 
         browser = asyncio.run(discover(BROWSER_MCP))
         context7 = asyncio.run(discover(CONTEXT7_MCP))
-        self.assertEqual(browser, {"browse_page", "browse_click"})
+        github = asyncio.run(discover(GITHUB_MCP))
+        self.assertEqual(browser, {"browse_page", "browse_click", "browse_type", "browse_select"})
         self.assertEqual(context7, {"resolve_library_id", "query_documentation"})
+        self.assertEqual(github, {
+            "github_search_code", "github_get_file", "github_read_commits",
+            "github_read_issues", "github_get_pull_request", "github_read_releases",
+        })
         self.assertNotIn("browser_run_code_unsafe", browser)
         self.assertNotIn("browser_file_upload", browser)
+        self.assertNotIn("browser_evaluate", browser)
+
+    def test_browser_proxy_rejects_private_dns_and_non_https_ports(self) -> None:
+        private_answer = [(2, 1, 6, "", ("10.20.30.40", 443))]
+        with patch("mcp_servers.public_web_proxy.socket.getaddrinfo", return_value=private_answer):
+            with self.assertRaises(ValueError):
+                public_addresses("example.test", 443)
+        with self.assertRaises(ValueError):
+            public_addresses("localhost", 80)
+
+    def test_browser_proxy_accepts_only_resolved_public_addresses(self) -> None:
+        public_answer = [(2, 1, 6, "", ("93.184.216.34", 443))]
+        with patch("mcp_servers.public_web_proxy.socket.getaddrinfo", return_value=public_answer):
+            addresses = public_addresses("example.com", 443)
+
+        self.assertEqual(addresses, ((2, ("93.184.216.34", 443)),))
+
+    def test_browser_failures_use_host_health_statuses(self) -> None:
+        timed_out = type("Result", (), {"is_error": True})()
+        crashed = type("Result", (), {"is_error": True})()
+
+        self.assertEqual(_health(timed_out, "Navigation timeout exceeded"), ("DEGRADED", "TIMEOUT"))
+        self.assertEqual(_health(crashed, "Browser has closed unexpectedly"), ("ERROR", "BROWSER_CRASH"))
 
     def test_browser_blocks_private_targets_before_launch(self) -> None:
         for url in ("http://example.com", "https://127.0.0.1/private", "https://localhost/private"):
@@ -81,6 +110,16 @@ class MCPExternalTests(unittest.TestCase):
         self.assertEqual(outcome.status, MCPHealth.UNCONFIGURED.value)
         self.assertFalse(outcome.executed)
         upstream.assert_not_called()
+
+    def test_github_child_uses_exact_read_only_tool_allowlist(self) -> None:
+        with patch.dict(os.environ, {
+            "GITHUB_PERSONAL_ACCESS_TOKEN": "test-token", "GITHUB_TOOLSETS": "all",
+        }, clear=False):
+            parameters = github_parameters()
+
+        self.assertIn("--read-only", parameters.args)
+        self.assertIn(f"--tools={','.join(UPSTREAM_TOOLS)}", parameters.args)
+        self.assertNotIn("GITHUB_TOOLSETS", parameters.env)
 
     def test_playwright_reads_public_javascript_page(self) -> None:
         with patch.dict(os.environ, {"MCP_PLAYWRIGHT_EGRESS_GUARD": "true"}):

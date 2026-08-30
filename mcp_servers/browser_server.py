@@ -11,6 +11,7 @@ from mcp import Client
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.server import MCPServer
 
+from mcp_servers.public_web_proxy import PublicWebProxy
 from runtime.web_search import _safe_fetch, _validate_public_https_url
 
 
@@ -26,12 +27,20 @@ BROWSER_MCP = MCPServer(
 )
 
 
-def _parameters(allowed_origin: str) -> StdioServerParameters:
+def _parameters(allowed_origin: str, proxy_url: str) -> StdioServerParameters:
     if not PLAYWRIGHT_COMMAND.is_file():
         raise RuntimeError("Playwright MCP is not installed")
     return StdioServerParameters(
         command=str(PLAYWRIGHT_COMMAND),
-        args=["--config", str(PLAYWRIGHT_CONFIG), "--allowed-origins", allowed_origin],
+        args=[
+            "--config", str(PLAYWRIGHT_CONFIG),
+            "--allowed-origins", allowed_origin,
+            "--proxy-server", proxy_url,
+            "--proxy-bypass", "<-loopback>",
+            "--headless", "--isolated", "--block-service-workers",
+            "--image-responses", "omit", "--codegen", "none",
+            "--timeout-navigation", "15000", "--timeout-action", "5000",
+        ],
         env=dict(os.environ),
         cwd=str(REPO_ROOT),
     )
@@ -60,6 +69,32 @@ async def _navigate(client: Client, url: str) -> Any:
     return await client.call_tool("browser_navigate", {"url": url}, read_timeout_seconds=30)
 
 
+def _health(result: Any, text: str) -> tuple[str, str | None]:
+    if getattr(result, "is_error", False):
+        lowered = text.lower()
+        if "timeout" in lowered:
+            return "DEGRADED", "TIMEOUT"
+        if "browser" in lowered and ("closed" in lowered or "crash" in lowered):
+            return "ERROR", "BROWSER_CRASH"
+        return "ERROR", "NAVIGATION_FAILED"
+    return ("AVAILABLE", None) if text.strip() else ("DEGRADED", "EMPTY_RESULT")
+
+
+def _observation(result: Any, final_url: str) -> dict[str, object]:
+    text = _text(result)
+    status, failure_type = _health(result, text)
+    observation: dict[str, object] = {
+        "status": status,
+        "url": final_url,
+        "relevant_text": text,
+        "truncated": len(text) >= MAX_BROWSER_OUTPUT_CHARS,
+        "engine": "Playwright MCP",
+    }
+    if failure_type:
+        observation["failure_type"] = failure_type
+    return observation
+
+
 @BROWSER_MCP.tool(
     description="Open one public HTTPS JavaScript-rendered page and return a bounded relevant snapshot. Use when secure fetch is insufficient.",
     structured_output=True,
@@ -70,18 +105,12 @@ async def browse_page(url: str, find_text: str | None = None) -> dict[str, objec
     if find_text is not None and (not find_text.strip() or len(find_text) > 300):
         raise ValueError("find_text must contain between 1 and 300 characters")
     final_url, allowed_origin = _prepare_url(url)
-    async with Client(stdio_client(_parameters(allowed_origin)), read_timeout_seconds=35) as client:
-        result = await _navigate(client, final_url)
-        if not result.is_error and find_text:
-            result = await client.call_tool("browser_find", {"text": find_text.strip()}, read_timeout_seconds=10)
-    text = _text(result)
-    return {
-        "status": "ERROR" if result.is_error else "AVAILABLE",
-        "url": final_url,
-        "relevant_text": text,
-        "truncated": len(text) >= MAX_BROWSER_OUTPUT_CHARS,
-        "engine": "Playwright MCP",
-    }
+    with PublicWebProxy() as proxy:
+        async with Client(stdio_client(_parameters(allowed_origin, proxy.url)), read_timeout_seconds=35) as client:
+            result = await _navigate(client, final_url)
+            if not result.is_error and find_text:
+                result = await client.call_tool("browser_find", {"text": find_text.strip()}, read_timeout_seconds=10)
+    return _observation(result, final_url)
 
 
 @BROWSER_MCP.tool(
@@ -92,23 +121,47 @@ async def browse_click(url: str, target: str, element: str = "selected public pa
     if len(url) > 2_000 or not target.strip() or len(target) > 500 or len(element) > 300:
         raise ValueError("invalid browser interaction arguments")
     final_url, allowed_origin = _prepare_url(url)
-    async with Client(stdio_client(_parameters(allowed_origin)), read_timeout_seconds=35) as client:
-        navigated = await _navigate(client, final_url)
-        if navigated.is_error:
-            result = navigated
-        else:
-            result = await client.call_tool("browser_click", {
-                "target": target.strip(),
-                "element": element.strip(),
+    with PublicWebProxy() as proxy:
+        async with Client(stdio_client(_parameters(allowed_origin, proxy.url)), read_timeout_seconds=35) as client:
+            navigated = await _navigate(client, final_url)
+            result = navigated if navigated.is_error else await client.call_tool("browser_click", {
+                "target": target.strip(), "element": element.strip(),
             }, read_timeout_seconds=20)
-    text = _text(result)
-    return {
-        "status": "ERROR" if result.is_error else "AVAILABLE",
-        "url": final_url,
-        "relevant_text": text,
-        "truncated": len(text) >= MAX_BROWSER_OUTPUT_CHARS,
-        "engine": "Playwright MCP",
-    }
+    return _observation(result, final_url)
+
+
+@BROWSER_MCP.tool(
+    description="Open a public HTTPS page, type bounded non-secret text into one exact field, optionally submit, and return a compact snapshot.",
+    structured_output=True,
+)
+async def browse_type(url: str, target: str, text: str, submit: bool = False, element: str = "selected public form field") -> dict[str, object]:
+    if len(url) > 2_000 or not target.strip() or len(target) > 500 or not text or len(text) > 1_000 or len(element) > 300:
+        raise ValueError("invalid browser typing arguments")
+    final_url, allowed_origin = _prepare_url(url)
+    with PublicWebProxy() as proxy:
+        async with Client(stdio_client(_parameters(allowed_origin, proxy.url)), read_timeout_seconds=35) as client:
+            navigated = await _navigate(client, final_url)
+            result = navigated if navigated.is_error else await client.call_tool("browser_type", {
+                "target": target.strip(), "text": text, "submit": submit, "element": element.strip(),
+            }, read_timeout_seconds=20)
+    return _observation(result, final_url)
+
+
+@BROWSER_MCP.tool(
+    description="Open a public HTTPS page, select bounded values in one exact dropdown, and return a compact snapshot.",
+    structured_output=True,
+)
+async def browse_select(url: str, target: str, values: list[str], element: str = "selected public dropdown") -> dict[str, object]:
+    if len(url) > 2_000 or not target.strip() or len(target) > 500 or not 1 <= len(values) <= 10 or any(not value or len(value) > 200 for value in values) or len(element) > 300:
+        raise ValueError("invalid browser selection arguments")
+    final_url, allowed_origin = _prepare_url(url)
+    with PublicWebProxy() as proxy:
+        async with Client(stdio_client(_parameters(allowed_origin, proxy.url)), read_timeout_seconds=35) as client:
+            navigated = await _navigate(client, final_url)
+            result = navigated if navigated.is_error else await client.call_tool("browser_select_option", {
+                "target": target.strip(), "values": values, "element": element.strip(),
+            }, read_timeout_seconds=20)
+    return _observation(result, final_url)
 
 
 if __name__ == "__main__":

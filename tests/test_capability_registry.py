@@ -33,6 +33,19 @@ class CapabilityRegistryTests(unittest.TestCase):
         self.assertTrue({"get_current_time", "git_status", "search_web"} <= {tool.name for tool in tools})
         self.assertTrue(all(tool.permission == "READ" for tool in tools))
 
+    def test_tool_cap_represents_every_selected_phase_a_capability(self) -> None:
+        tools = detailed_tools(("documentation", "git", "github", "browser"))
+
+        self.assertEqual(len(tools), 10)
+        self.assertEqual({tool.capability for tool in tools}, {"documentation", "git", "github", "browser"})
+
+    def test_phase_a2_combination_exposes_all_ten_tools(self) -> None:
+        tools = detailed_tools(("github", "browser"))
+
+        self.assertEqual(len(tools), 10)
+        self.assertEqual(sum(tool.capability == "github" for tool in tools), 6)
+        self.assertEqual(sum(tool.capability == "browser" for tool in tools), 4)
+
     def test_global_flag_disables_every_capability(self) -> None:
         with patch.dict(os.environ, {"MCP_ENABLED": "false"}, clear=False):
             catalog = capability_catalog(project_available=True, image_available=True)
