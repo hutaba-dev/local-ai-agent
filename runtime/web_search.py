@@ -223,9 +223,16 @@ def academic_papers(
         started = perf_counter()
         record: dict[str, object] = {"query": query, "success": False}
         try:
+            normalized_query = query.strip()
+            normalized_doi = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", normalized_query, flags=re.IGNORECASE)
+            query_params = (
+                {"filter": f"doi:{normalized_doi}"}
+                if re.fullmatch(r"10\.\d{4,9}/\S+", normalized_doi, flags=re.IGNORECASE)
+                else {"search": normalized_query}
+            )
             response = httpx.get(
                 OPENALEX_WORKS_ENDPOINT,
-                params={"search": query, "per-page": limit_per_query, "select": "id,doi,title,publication_date,cited_by_count,authorships,primary_location"},
+                params={**query_params, "per-page": limit_per_query, "select": "id,doi,title,publication_date,cited_by_count,authorships,primary_location"},
                 headers={"User-Agent": USER_AGENT},
                 timeout=12,
             )

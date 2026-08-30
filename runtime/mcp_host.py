@@ -20,6 +20,7 @@ from mcp_servers.github_server import GITHUB_MCP
 from mcp_servers.project_server import ProjectScope, create_project_mcp
 from mcp_servers.search_server import search_mcp
 from runtime.capability_registry import CAPABILITIES, TOOL_SPECS
+from runtime.projects import ProjectStorageOfflineError
 
 
 class MCPHealth(str, Enum):
@@ -28,6 +29,7 @@ class MCPHealth(str, Enum):
 	UNCONFIGURED = "UNCONFIGURED"
 	DEGRADED = "DEGRADED"
 	RATE_LIMITED = "RATE_LIMITED"
+	PROJECT_STORAGE_OFFLINE = "PROJECT_STORAGE_OFFLINE"
 	ERROR = "ERROR"
 
 
@@ -148,6 +150,16 @@ class MCPHost:
 
 	def catalog(self, project_scope: ProjectScope | None = None) -> list[dict[str, object]]:
 		self.discover()
+		project_health = MCPHealth.UNCONFIGURED.value
+		if project_scope is not None:
+			try:
+				project_scope.tools.store.get_project(project_scope.owner_id, project_scope.project_id)
+				project_scope.tools.store.require_storage()
+				project_health = MCPHealth.AVAILABLE.value
+			except ProjectStorageOfflineError:
+				project_health = MCPHealth.PROJECT_STORAGE_OFFLINE.value
+			except Exception:
+				project_health = MCPHealth.UNAVAILABLE.value
 		catalog = []
 		for record in self._tools.values():
 			value = asdict(record)
@@ -156,7 +168,7 @@ class MCPHost:
 			elif not mcp_tool_enabled(record.name):
 				value["health"] = MCPHealth.UNCONFIGURED.value
 			elif record.server == "project-mcp":
-				value["health"] = MCPHealth.AVAILABLE.value
+				value["health"] = project_health
 			value["available"] = value["health"] == MCPHealth.AVAILABLE.value
 			catalog.append(value)
 		return catalog

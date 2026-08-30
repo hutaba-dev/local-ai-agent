@@ -10,6 +10,9 @@ from typing import Iterable
 
 class PermissionClass(str, Enum):
     READ = "READ"
+    READ_PROJECT = "READ_PROJECT"
+    WRITE_MEMORY = "WRITE_MEMORY"
+    WRITE_ARTIFACT = "WRITE_ARTIFACT"
     WRITE_WORKSPACE = "WRITE_WORKSPACE"
     EXECUTE_SAFE = "EXECUTE_SAFE"
     WRITE_REPOSITORY = "WRITE_REPOSITORY"
@@ -71,7 +74,12 @@ CAPABILITIES = (
         "varies", "MCP_ACADEMIC_ENABLED",
         ("academic_resolve_researcher", "academic_search_publications", "academic_get_researcher_evidence", "academic_compare_source_coverage"),
     ),
-    CapabilitySpec("project", "Project Knowledge", "Authorized project files, memories, conversations, and artifacts.", "local_compute", "MCP_PROJECT_ENABLED", ("project_search", "project_list_files", "project_read_file", "project_get_memories")),
+    CapabilitySpec(
+        "project", "Project Knowledge",
+        "Use authorized project memories, files, conversations, and artifacts when durable project context materially helps.",
+        "local_compute", "MCP_PROJECT_ENABLED",
+        ("project_get_context", "project_search", "project_list_files", "project_read_file", "project_get_memories", "project_save_memory", "project_list_artifacts", "project_save_artifact"),
+    ),
     CapabilitySpec("image", "Image Work", "Generate or edit images through the existing AHN7 worker.", "gpu_compute", "MCP_IMAGE_ENABLED", ("generate_image", "edit_image", "adjust_face_pose")),
 )
 
@@ -112,10 +120,14 @@ TOOL_SPECS = {
     "academic_search_publications": AgentToolSpec("academic_search_publications", "academic", "Search a bounded scholarly metadata subset when scholarly evidence materially improves the answer; use Web or Browser later for publisher and full-page verification.", "academic-mcp", "varies", "READ", _object({"query": _string("Focused scholarly publication query", 500), "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, ("query",))),
     "academic_get_researcher_evidence": AgentToolSpec("academic_get_researcher_evidence", "academic", "Get bounded multi-source identity, corpus, representative-paper, and source-specific citation evidence for a researcher evaluation.", "academic-mcp", "varies", "READ", _object({"query": _string("Resolved researcher query with identity hints", 500)}, ("query",))),
     "academic_compare_source_coverage": AgentToolSpec("academic_compare_source_coverage", "academic", "Compare source-specific publication and citation coverage without collapsing conflicts into one metric.", "academic-mcp", "varies", "READ", _object({"query": _string("Researcher query with identity hints", 500)}, ("query",))),
-    "project_search": AgentToolSpec("project_search", "project", "Search authorized current-project files, memories, and conversations.", "project-mcp", "local_compute", "READ", _object({"query": _string("Current-project search query")}, ("query",))),
-    "project_list_files": AgentToolSpec("project_list_files", "project", "List metadata for files in the authorized current project.", "project-mcp", "local_compute", "READ", _object({})),
-    "project_read_file": AgentToolSpec("project_read_file", "project", "Read one authorized current-project file by opaque file ID.", "project-mcp", "local_compute", "READ", _object({"file_id": _string("Opaque project file ID", 100)}, ("file_id",))),
-    "project_get_memories": AgentToolSpec("project_get_memories", "project", "Read active memories from the authorized current project.", "project-mcp", "local_compute", "READ", _object({"query": _string("Optional memory search query")})),
+    "project_get_context": AgentToolSpec("project_get_context", "project", "Load a compact relevant project bundle instead of injecting the whole project into context.", "project-mcp", "local_compute", "READ_PROJECT", _object({"query": _string("Current task or retrieval question"), "max_chars": {"type": "integer", "minimum": 1000, "maximum": 12000}}, ("query",))),
+    "project_search": AgentToolSpec("project_search", "project", "Search authorized current-project memories, files, conversations, and artifact metadata through the existing project index.", "project-mcp", "local_compute", "READ_PROJECT", _object({"query": _string("Current-project search query")}, ("query",))),
+    "project_list_files": AgentToolSpec("project_list_files", "project", "List bounded metadata for files in the authorized current project.", "project-mcp", "local_compute", "READ_PROJECT", _object({})),
+    "project_read_file": AgentToolSpec("project_read_file", "project", "Read one bounded chunk of an authorized project file by opaque file ID.", "project-mcp", "local_compute", "READ_PROJECT", _object({"file_id": _string("Opaque project file ID", 100), "offset": {"type": "integer", "minimum": 0}, "max_chars": {"type": "integer", "minimum": 1, "maximum": 12000}}, ("file_id",))),
+    "project_get_memories": AgentToolSpec("project_get_memories", "project", "Read active durable memories from the authorized current project; conversation history is not memory.", "project-mcp", "local_compute", "READ_PROJECT", _object({"query": _string("Optional memory search query")})),
+    "project_save_memory": AgentToolSpec("project_save_memory", "project", "Save only durable project knowledge that remains useful beyond this exchange, preserving supersession history.", "project-mcp", "local_compute", "WRITE_MEMORY", _object({"memory_type": {"type": "string", "enum": ["fact", "decision", "goal", "constraint", "preference", "todo", "research_result", "summary"]}, "content": _string("Durable non-ephemeral project knowledge", 12000), "confidence": {"type": "string", "enum": ["LOW", "MEDIUM", "HIGH"]}, "supersedes_ids": {"type": "array", "items": _string("Existing project memory ID", 100), "maxItems": 20}}, ("memory_type", "content"))),
+    "project_list_artifacts": AgentToolSpec("project_list_artifacts", "project", "List bounded artifact metadata and provenance for the authorized current project.", "project-mcp", "local_compute", "READ_PROJECT", _object({"limit": {"type": "integer", "minimum": 1, "maximum": 200}})),
+    "project_save_artifact": AgentToolSpec("project_save_artifact", "project", "Save a bounded text report, document, analysis export, or code output as a project artifact when requested.", "project-mcp", "local_compute", "WRITE_ARTIFACT", _object({"name": _string("Artifact filename only", 160), "content": _string("Artifact text content", 12000), "artifact_type": {"type": "string", "enum": ["report", "document", "analysis", "code", "text"]}, "description": _string("Artifact purpose or provenance", 500)}, ("name", "content"))),
 }
 
 

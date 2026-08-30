@@ -1364,6 +1364,51 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertIn("Do not confuse permission to reason", planner_prompt)
         self.assertIn("Current UTC date", planner_prompt)
 
+    def test_explicit_web_requirement_corrects_no_search_contradiction(self) -> None:
+        class ContradictingPlannerClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                content = (
+                    '{"search_mode":"NO_SEARCH","ready_to_answer":true}'
+                    if len(self.requests) == 1
+                    else '{"search_mode":"DEEP_RESEARCH","search_queries":["Python 3.14 official release status"],"ready_to_answer":false}'
+                )
+                response = FakeResponse()
+                response.json = lambda: {"choices": [{"message": {"content": content}}], "usage": {}}  # type: ignore[method-assign]
+                return response
+
+        client = ContradictingPlannerClient()
+        plan = AgentRuntime(client=client)._search_decision(
+            "Use current public Web evidence to verify the Python 3.14 release status.",
+            research_agent_selected=True,
+        )
+
+        self.assertEqual(plan.mode, "DEEP_RESEARCH")
+        self.assertEqual(plan.search_queries, ("Python 3.14 official release status",))
+        self.assertEqual(len(client.requests), 2)
+        self.assertIn("NO_SEARCH is invalid", client.requests[1]["json"]["messages"][0]["content"])
+
+    def test_research_evidence_package_includes_project_mcp_context(self) -> None:
+        package = AgentRuntime._evidence_package([
+            {
+                "name": "project_context",
+                "success": True,
+                "output": json.dumps({
+                    "status": "AVAILABLE",
+                    "context": {"file_excerpts": [{"filename": "plan.txt", "excerpt": "Risk code ORBIT-42"}]},
+                }),
+            },
+            {
+                "name": "project_context",
+                "success": True,
+                "output": json.dumps({"status": "AVAILABLE", "context": {"memories": ["Target 2031-06-30"]}}),
+            },
+        ])
+
+        excerpt = package["project_context"]["workspace_search"]["excerpt"]
+        self.assertIn("ORBIT-42", excerpt)
+        self.assertIn("2031-06-30", excerpt)
+
     def test_model_deep_research_decision_runs_search_with_model_query(self) -> None:
         class DeepResearchDecisionClient(FakeClient):
             def post(self, url: str, json: dict[str, object]) -> FakeResponse:
@@ -1922,6 +1967,15 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(papers[0]["title"], "Evidence Paper")
         self.assertEqual(papers[0]["cited_by_count"], 12)
         self.assertEqual(get.call_args.args[0], "https://api.openalex.org/works")
+        self.assertEqual(get.call_args.kwargs["params"]["search"], "liquid hydrogen storage")
+
+    def test_academic_search_uses_exact_doi_filter(self) -> None:
+        with patch("runtime.web_search.httpx.get", return_value=OpenAlexResponse()) as get:
+            academic_papers(("https://doi.org/10.1000/Example",))
+
+        params = get.call_args.kwargs["params"]
+        self.assertEqual(params["filter"], "doi:10.1000/Example")
+        self.assertNotIn("search", params)
 
     def test_semantic_scholar_adapters_normalize_author_and_paper_data(self) -> None:
         with patch("runtime.web_search.httpx.get", return_value=SemanticScholarResponse()):

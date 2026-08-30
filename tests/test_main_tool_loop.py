@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from runtime.agent_runtime import AgentRuntime
@@ -240,6 +241,37 @@ class MainToolLoopTests(unittest.TestCase):
         self.assertEqual(result.tools, [])
         self.assertNotIn("tools", client.requests[1])
         call.assert_not_called()
+
+    def test_project_capability_is_unavailable_without_project_scope(self) -> None:
+        client = SequencedClient([
+            {"role": "assistant", "content": '{"capabilities":["project"]}'},
+            {"role": "assistant", "content": "일반 대화에는 Project 도구를 노출하지 않습니다."},
+        ])
+        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_PROJECT_ENABLED": "true"}, clear=False), patch(
+            "runtime.agent_runtime.call_mcp_tool"
+        ) as call:
+            result = AgentRuntime(client=client).chat("일반 질문입니다", "main")
+
+        selector_catalog = client.requests[0]["messages"][1]["content"]
+        self.assertNotIn('"name": "project"', selector_catalog)
+        self.assertNotIn("tools", client.requests[1])
+        self.assertEqual(result.tools, [])
+        call.assert_not_called()
+
+    def test_project_scope_lazily_exposes_all_semantic_project_tools(self) -> None:
+        client = SequencedClient([
+            {"role": "assistant", "content": '{"capabilities":["project"]}'},
+            {"role": "assistant", "content": "Project 도구를 선택했습니다."},
+        ])
+        scope = SimpleNamespace(tools=object(), owner_id="owner", project_id="prj_test", conversation_id=None)
+        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_PROJECT_ENABLED": "true"}, clear=False):
+            AgentRuntime(client=client).chat("프로젝트 자료를 확인해줘", "main", project_scope=scope)
+
+        exposed = {tool["function"]["name"] for tool in client.requests[1]["tools"]}
+        self.assertEqual(exposed, {
+            "project_get_context", "project_search", "project_list_files", "project_read_file",
+            "project_get_memories", "project_save_memory", "project_list_artifacts", "project_save_artifact",
+        })
 
     def test_python_dictionary_explanation_selects_no_capability(self) -> None:
         client = SequencedClient([

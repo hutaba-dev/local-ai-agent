@@ -33,6 +33,7 @@ class ToolResult:
     error: str | None
     duration_ms: int
     details: dict[str, object] | None = None
+    capability: str | None = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class ProjectToolScope:
     tools: ProjectTools
     owner_id: str
     project_id: str
+    conversation_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -457,24 +459,19 @@ def run_agent_tools(
 def _project_search(message: str | tuple[str, ...], scope: ProjectToolScope) -> ToolResult:
     started = perf_counter()
     query = message[0] if isinstance(message, tuple) else message
-    try:
-        output = scope.tools.hybrid_search(scope.owner_id, scope.project_id, query)
-        return ToolResult(
-            "project_hybrid_search",
-            True,
-            json.dumps(output, ensure_ascii=False),
-            None,
-            round((perf_counter() - started) * 1000),
-            {"semantic_available": bool(output["semantic_available"])},
-        )
-    except (RuntimeError, ValueError) as error:
-        return ToolResult(
-            "project_hybrid_search",
-            False,
-            "",
-            str(error),
-            round((perf_counter() - started) * 1000),
-        )
+    outcome = call_mcp_tool("project_get_context", {"query": query, "max_chars": 10_000}, scope)
+    return ToolResult(
+        "project_context",
+        outcome.success,
+        json.dumps(outcome.output or {}, ensure_ascii=False),
+        outcome.error,
+        round((perf_counter() - started) * 1000),
+        {
+            "execution": "mcp", "server": outcome.server, "status": outcome.status,
+            "executed": outcome.executed,
+        },
+        "project",
+    )
 
 
 def _coding_tools(message: str, search_mode: str) -> list[ToolResult]:

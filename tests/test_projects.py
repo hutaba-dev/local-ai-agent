@@ -3,7 +3,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 import shutil
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 from runtime.projects import ProjectNotFoundError, ProjectPathError, ProjectStorageOfflineError, ProjectStore
 from runtime.project_tools import ProjectTools
@@ -98,6 +100,9 @@ class ProjectStoreTests(unittest.TestCase):
         metadata, content = self.store.read_file("owner", project["id"], artifact["id"])
         self.assertEqual(content, b"# Result\n12 bar")
         self.assertEqual(metadata["index_status"], "indexed")
+        listed_metadata = self.store.list_file_metadata("owner", project["id"])
+        self.assertEqual(listed_metadata[0]["original_name"], "report.md")
+        self.assertEqual(listed_metadata[0]["size"], len(content))
         self.assertTrue(self.store.list_files("owner", project["id"])[0]["artifact_id"])
         self.assertEqual(self.store.search("owner", project["id"], "Result")["files"][0]["file_id"], artifact["id"])
         tools = ProjectTools(self.store)
@@ -147,12 +152,14 @@ class ProjectStoreTests(unittest.TestCase):
         self.store.add_memory("owner", other["id"], "fact", "Pressure is 99 bar")
         scope = ProjectToolScope(ProjectTools(self.store), "owner", project["id"])
 
-        results = run_agent_tools("main", "pressure", allow_local_tools=False, project_scope=scope)
+        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_PROJECT_ENABLED": "true"}, clear=False):
+            results = run_agent_tools("main", "pressure", allow_local_tools=False, project_scope=scope)
 
-        self.assertEqual([result["name"] for result in results], ["project_hybrid_search"])
+        self.assertEqual([result["name"] for result in results], ["project_context"])
         output = __import__("json").loads(results[0]["output"])
-        memories = output["lexical"]["memories"]
+        memories = output["context"]["memories"]
         self.assertEqual([memory["content"] for memory in memories], ["Pressure is 12 bar"])
+        self.assertEqual(results[0]["details"]["execution"], "mcp")
 
 
 if __name__ == "__main__":

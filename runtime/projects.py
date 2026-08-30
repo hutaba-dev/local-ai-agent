@@ -14,6 +14,7 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Iterable
+from urllib.parse import unquote
 
 import httpx
 
@@ -211,7 +212,7 @@ class ProjectStore:
         return project_root
 
     def confined_path(self, project_id: str, relative_path: str) -> Path:
-        relative = PurePosixPath(relative_path)
+        relative = PurePosixPath(unquote(relative_path))
         if relative.is_absolute() or not relative.parts or any(part in {"", ".", ".."} for part in relative.parts):
             raise ProjectPathError("invalid project-relative path")
         root = self._project_root(project_id).resolve(strict=False)
@@ -390,24 +391,32 @@ class ProjectStore:
         self.require_storage()
         if not content:
             raise ValueError("file is empty")
-        file_id = self._id("fil")
         safe_name = re.sub(r"[^\w. -]", "_", Path(original_name).name, flags=re.UNICODE).strip(" .")[:160] or "file"
-        directory = "artifacts" if artifact else "files"
-        relative_path = f"{directory}/{file_id}/{safe_name}"
-        destination = self.confined_path(project_id, relative_path)
-        now = self._now()
+        digest = hashlib.sha256(content).hexdigest()
         with self._connect() as connection:
             self._project_row(connection, owner_id, project_id)
             if conversation_id is not None and connection.execute(
                 "SELECT 1 FROM conversations WHERE id = ? AND project_id = ?", (conversation_id, project_id)
             ).fetchone() is None:
                 raise ProjectNotFoundError("conversation not found")
+            if artifact:
+                duplicate = connection.execute(
+                    """SELECT files.id FROM files JOIN artifacts ON artifacts.file_id = files.id
+                       WHERE files.project_id = ? AND files.original_name = ? AND files.sha256 = ? LIMIT 1""",
+                    (project_id, safe_name, digest),
+                ).fetchone()
+                if duplicate is not None:
+                    return self.get_file(owner_id, project_id, str(duplicate["id"]))
+        file_id = self._id("fil")
+        directory = "artifacts" if artifact else "files"
+        relative_path = f"{directory}/{file_id}/{safe_name}"
+        destination = self.confined_path(project_id, relative_path)
+        now = self._now()
         destination.parent.mkdir(mode=0o750, parents=True)
         temporary = destination.with_suffix(destination.suffix + ".tmp")
         temporary.write_bytes(content)
         temporary.chmod(0o640)
         temporary.replace(destination)
-        digest = hashlib.sha256(content).hexdigest()
         index_status = "indexed" if extracted_text.strip() else "not_indexed"
         try:
             with self._connect() as connection:
@@ -461,7 +470,7 @@ class ProjectStore:
         with self._connect() as connection:
             self._project_row(connection, owner_id, project_id)
             rows = connection.execute(
-                """SELECT files.id, files.project_id, files.name, files.mime_type, files.size_bytes,
+                """SELECT files.id, files.project_id, files.original_name, files.mime_type, files.size,
                           files.created_at, artifacts.id AS artifact_id
                    FROM files LEFT JOIN artifacts ON artifacts.file_id = files.id
                    WHERE files.project_id = ? ORDER BY files.created_at DESC LIMIT ?""",
@@ -473,11 +482,30 @@ class ProjectStore:
         with self._connect() as connection:
             self._project_row(connection, owner_id, project_id)
             row = connection.execute(
-                "SELECT * FROM files WHERE id = ? AND project_id = ?", (file_id, project_id)
+                """SELECT files.*, artifacts.id AS artifact_id FROM files
+                   LEFT JOIN artifacts ON artifacts.file_id = files.id
+                   WHERE files.id = ? AND files.project_id = ?""",
+                (file_id, project_id),
             ).fetchone()
             if row is None:
                 raise ProjectNotFoundError("file not found")
         return dict(row)
+
+    def list_artifacts(self, owner_id: str, project_id: str, limit: int = 50) -> list[dict[str, object]]:
+        if not 1 <= limit <= 200:
+            raise ValueError("artifact limit must be between 1 and 200")
+        with self._connect() as connection:
+            self._project_row(connection, owner_id, project_id)
+            rows = connection.execute(
+                """SELECT artifacts.id AS artifact_id, artifacts.project_id, artifacts.conversation_id,
+                          artifacts.creator, artifacts.source_message_id, artifacts.description, artifacts.created_at,
+                          files.id AS file_id, files.original_name AS name, files.mime_type AS type,
+                          files.size, files.sha256, files.index_status
+                   FROM artifacts JOIN files ON files.id = artifacts.file_id
+                   WHERE artifacts.project_id = ? ORDER BY artifacts.created_at DESC LIMIT ?""",
+                (project_id, limit),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def read_file(self, owner_id: str, project_id: str, file_id: str) -> tuple[dict[str, object], bytes]:
         self.require_storage()
@@ -548,10 +576,19 @@ class ProjectStore:
             raise ValueError("invalid confidence")
         if not clean or SECRET_PATTERN.search(clean):
             raise ValueError("memory is empty or may contain a secret")
+        superseded_ids = tuple(dict.fromkeys(supersedes))
         now = self._now()
         memory_id = self._id("mem")
         with self._connect() as connection:
             self._project_row(connection, owner_id, project_id)
+            if superseded_ids:
+                placeholders = ",".join("?" for _ in superseded_ids)
+                matched = connection.execute(
+                    f"SELECT COUNT(*) FROM memories WHERE project_id = ? AND id IN ({placeholders}) AND active = 1",
+                    (project_id, *superseded_ids),
+                ).fetchone()[0]
+                if matched != len(superseded_ids):
+                    raise ProjectNotFoundError("superseded memory not found")
             duplicate = connection.execute(
                 "SELECT * FROM memories WHERE project_id = ? AND type = ? AND content = ? AND active = 1",
                 (project_id, memory_type, clean),
@@ -572,7 +609,7 @@ class ProjectStore:
                     "INSERT OR IGNORE INTO memory_sources(memory_id, source_type, source_id, created_at) VALUES (?, ?, ?, ?)",
                     (memory_id, source_type, source_id, now),
                 )
-            for old_id in supersedes:
+            for old_id in superseded_ids:
                 connection.execute(
                     "UPDATE memories SET active = 0, superseded_by = ?, updated_at = ? WHERE id = ? AND project_id = ? AND active = 1",
                     (memory_id, now, old_id, project_id),
@@ -694,6 +731,60 @@ class ProjectStore:
             "Recent conversation:\n" + "\n".join(f"{row['role']}: {row['content'][:2000]}" for row in recent),
         ]
         return "\n\n".join(sections)[:24_000]
+
+    def conversation_context(self, owner_id: str, project_id: str, conversation_id: str) -> str:
+        project = self.get_project(owner_id, project_id)
+        self.get_conversation(owner_id, project_id, conversation_id)
+        with self._connect() as connection:
+            recent = connection.execute(
+                "SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY created_at DESC LIMIT 8",
+                (conversation_id,),
+            ).fetchall()[::-1]
+        sections = [
+            f"Project: {project['name']}",
+            f"Description: {project['description']}",
+            f"Current project summary:\n{project['summary'] or 'No summary yet.'}",
+            "Recent conversation:\n" + "\n".join(f"{row['role']}: {row['content'][:1200]}" for row in recent),
+        ]
+        return "\n\n".join(sections)[:8_000]
+
+    def context_bundle(self, owner_id: str, project_id: str, query: str, max_chars: int = 10_000) -> dict[str, object]:
+        if not 1_000 <= max_chars <= 12_000:
+            raise ValueError("context budget must be between 1000 and 12000 characters")
+        self.require_storage()
+        project = self.get_project(owner_id, project_id)
+        results = self.search(owner_id, project_id, query)
+        memories = results["memories"] or self.list_memories(owner_id, project_id, active_only=True, limit=12)
+        artifacts = self.list_artifacts(owner_id, project_id, 8)
+        bundle: dict[str, object] = {
+            "project": {
+                "id": project["id"], "name": project["name"], "description": project["description"],
+                "summary": project["summary"], "updated_at": project["updated_at"],
+            },
+            "memories": memories[:12],
+            "file_excerpts": results["files"][:6],
+            "conversation_excerpts": results["conversations"][:6],
+            "artifacts": artifacts[:8],
+        }
+        encoded = json.dumps(bundle, ensure_ascii=False)
+        if len(encoded) <= max_chars:
+            return bundle | {"truncated": False, "characters": len(encoded)}
+        while len(json.dumps(bundle, ensure_ascii=False)) > max_chars:
+            largest = max(
+                (key for key in ("conversation_excerpts", "file_excerpts", "memories", "artifacts") if bundle[key]),
+                key=lambda key: len(json.dumps(bundle[key], ensure_ascii=False)),
+                default=None,
+            )
+            if largest is None:
+                project_bundle = bundle["project"]
+                if isinstance(project_bundle, dict):
+                    project_bundle["summary"] = str(project_bundle.get("summary", ""))[:1000]
+                break
+            values = bundle[largest]
+            if isinstance(values, list):
+                values.pop()
+        characters = len(json.dumps(bundle, ensure_ascii=False))
+        return bundle | {"truncated": True, "characters": characters}
 
     def process_durable_updates(
         self,

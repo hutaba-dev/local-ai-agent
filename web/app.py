@@ -650,8 +650,8 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         require_project_access(http_request)
         project_store.require_storage()
         project_store.get_conversation(user.username, request.project_id, request.conversation_id)
-        project_context = project_store.context(
-            user.username, request.project_id, request.conversation_id, request.message
+        project_context = project_store.conversation_context(
+            user.username, request.project_id, request.conversation_id
         )
     owner = chat_owner(http_request)
     uploaded_source = load_attachment(request.attachment_ids[0]) if len(request.attachment_ids) == 1 else None
@@ -1047,7 +1047,7 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         raise HTTPException(status_code=403, detail="chat session belongs to another user")
     try:
         project_scope = ProjectToolScope(
-            ProjectTools(project_store), user.username, request.project_id
+            ProjectTools(project_store), user.username, request.project_id, request.conversation_id
         ) if request.project_id else None
         result = await run_in_threadpool(
             runtime.chat,

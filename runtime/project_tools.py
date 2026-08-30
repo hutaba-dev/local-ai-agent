@@ -30,9 +30,26 @@ class ProjectTools:
     def project_file_search(self, owner_id: str, project_id: str, query: str) -> list[dict[str, object]]:
         return self.store.search(owner_id, project_id, query)["files"]
 
-    def project_file_read(self, owner_id: str, project_id: str, file_id: str) -> dict[str, object]:
+    def project_file_read(
+        self, owner_id: str, project_id: str, file_id: str, offset: int = 0, max_chars: int = 12_000
+    ) -> dict[str, object]:
+        if offset < 0 or not 1 <= max_chars <= 12_000:
+            raise ValueError("invalid file read range")
         metadata, content = self.store.read_file(owner_id, project_id, file_id)
-        return {"metadata": metadata, "content": content.decode("utf-8", errors="replace")[:40_000]}
+        text = content.decode("utf-8", errors="replace")
+        excerpt = text[offset:offset + max_chars]
+        return {
+            "metadata": metadata,
+            "content": excerpt,
+            "offset": offset,
+            "next_offset": offset + len(excerpt) if offset + len(excerpt) < len(text) else None,
+            "truncated": offset + len(excerpt) < len(text),
+        }
+
+    def project_get_context(
+        self, owner_id: str, project_id: str, query: str, max_chars: int = 10_000
+    ) -> dict[str, object]:
+        return self.store.context_bundle(owner_id, project_id, query, max_chars)
 
     def project_file_create(
         self,
@@ -80,7 +97,7 @@ class ProjectTools:
         filename: str,
         content: bytes,
         mime_type: str,
-        conversation_id: str,
+        conversation_id: str | None,
         description: str = "",
         source_message_id: str | None = None,
     ) -> dict[str, object]:
@@ -99,6 +116,9 @@ class ProjectTools:
             source_message_id=source_message_id,
         )
 
+    def project_artifact_list(self, owner_id: str, project_id: str, limit: int = 50) -> list[dict[str, object]]:
+        return self.store.list_artifacts(owner_id, project_id, limit)
+
     def project_memory_search(self, owner_id: str, project_id: str, query: str) -> list[dict[str, object]]:
         return self.store.search(owner_id, project_id, query)["memories"]
 
@@ -110,9 +130,10 @@ class ProjectTools:
         content: str,
         confidence: str = "HIGH",
         source_id: str | None = None,
+        supersedes: tuple[str, ...] = (),
     ) -> dict[str, object]:
         return self.store.add_memory(
-            owner_id, project_id, memory_type, content, confidence, "conversation", source_id
+            owner_id, project_id, memory_type, content, confidence, "conversation", source_id, supersedes
         )
 
     def project_memory_update(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -14,6 +15,7 @@ from mcp import Client
 from mcp_servers.academic_server import ACADEMIC_MCP
 from runtime.capability_registry import capability_catalog
 from mcp_servers.project_server import create_project_mcp
+from runtime.mcp_host import MCPHealth, MCPHost
 from runtime.project_tools import ProjectTools
 from runtime.projects import ProjectStore
 
@@ -131,6 +133,100 @@ class MCPPhaseBTests(unittest.TestCase):
             self.assertNotIn("owner_id", properties)
             self.assertNotIn("project_id", properties)
             self.assertNotIn("path", properties)
+
+    def test_project_discovers_only_bounded_semantic_tools(self) -> None:
+        scope = SimpleNamespace(tools=object(), owner_id="owner", project_id="prj_test", conversation_id=None)
+
+        async def discover():
+            async with Client(create_project_mcp(scope)) as client:
+                return {tool.name: tool.input_schema for tool in (await client.list_tools()).tools}
+
+        schemas = asyncio.run(discover())
+        self.assertEqual(set(schemas), {
+            "project_get_context", "project_search", "project_list_files", "project_read_file",
+            "project_get_memories", "project_save_memory", "project_list_artifacts", "project_save_artifact",
+        })
+        self.assertEqual(set(schemas["project_read_file"]["properties"]), {"file_id", "offset", "max_chars"})
+        self.assertNotIn("content", schemas["project_list_files"]["properties"])
+
+    def test_project_file_reads_are_chunked_and_observations_are_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_root = root / "data"
+            (data_root / "projects").mkdir(parents=True)
+            store = ProjectStore(root / "projects.db", data_root, require_mount=False)
+            project = store.create_project("owner", "Chunked")
+            saved = store.save_file("owner", project["id"], "large.txt", b"x" * 30_000, "text/plain", "x" * 30_000)
+            scope = SimpleNamespace(
+                tools=ProjectTools(store), owner_id="owner", project_id=project["id"], conversation_id=None,
+            )
+            result = self.call(create_project_mcp(scope), "project_read_file", {
+                "file_id": saved["id"], "offset": 0, "max_chars": 10_000,
+            })
+
+        self.assertEqual(len(result.structured_content["content"]), 10_000)
+        self.assertEqual(result.structured_content["next_offset"], 10_000)
+        self.assertTrue(result.structured_content["truncated"])
+        self.assertLessEqual(len(json.dumps(result.structured_content, ensure_ascii=False)), 12_000)
+
+    def test_project_rejects_encoded_paths_and_cross_project_supersession(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_root = root / "data"
+            (data_root / "projects").mkdir(parents=True)
+            store = ProjectStore(root / "projects.db", data_root, require_mount=False)
+            first = store.create_project("owner", "First")
+            second = store.create_project("owner", "Second")
+            memory = store.add_memory("owner", second["id"], "fact", "Other project", "HIGH", "manual")
+            scope = SimpleNamespace(
+                tools=ProjectTools(store), owner_id="owner", project_id=first["id"], conversation_id=None,
+            )
+            server = create_project_mcp(scope)
+            encoded_path = self.call(server, "project_save_artifact", {
+                "name": "%2e%2e%2fstolen.md", "content": "blocked",
+            })
+            cross_project = self.call(server, "project_save_memory", {
+                "memory_type": "fact", "content": "replacement", "supersedes_ids": [memory["id"]],
+            })
+
+        self.assertTrue(encoded_path.is_error)
+        self.assertTrue(cross_project.is_error)
+
+    def test_project_artifact_save_is_idempotent_for_same_name_and_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_root = root / "data"
+            (data_root / "projects").mkdir(parents=True)
+            store = ProjectStore(root / "projects.db", data_root, require_mount=False)
+            project = store.create_project("owner", "Artifacts")
+            scope = SimpleNamespace(
+                tools=ProjectTools(store), owner_id="owner", project_id=project["id"], conversation_id=None,
+            )
+            server = create_project_mcp(scope)
+            first = self.call(server, "project_save_artifact", {"name": "report.md", "content": "result"})
+            second = self.call(server, "project_save_artifact", {"name": "report.md", "content": "result"})
+            listed = self.call(server, "project_list_artifacts", {})
+
+        self.assertEqual(first.structured_content["artifact"]["id"], second.structured_content["artifact"]["id"])
+        self.assertEqual(len(listed.structured_content["artifacts"]), 1)
+
+    def test_project_storage_offline_is_not_reported_as_available(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_root = root / "data"
+            (data_root / "projects").mkdir(parents=True)
+            store = ProjectStore(root / "projects.db", data_root, require_mount=False)
+            project = store.create_project("owner", "Offline")
+            scope = SimpleNamespace(
+                tools=ProjectTools(store), owner_id="owner", project_id=project["id"], conversation_id=None,
+            )
+            shutil.rmtree(data_root)
+            with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_PROJECT_ENABLED": "true"}, clear=False):
+                outcome = MCPHost().call("project_get_context", {"query": "status"}, scope)
+
+        self.assertFalse(outcome.success)
+        self.assertTrue(outcome.executed)
+        self.assertEqual(outcome.status, MCPHealth.PROJECT_STORAGE_OFFLINE.value)
 
 
 if __name__ == "__main__":
