@@ -148,6 +148,8 @@ class ResearchDecision:
     scholarly_evidence_value: str = "low"
     urls: tuple[str, ...] = ()
     save_to_project: bool = False
+    github_owner: str = ""
+    github_repository: str = ""
 
 
 T = TypeVar("T")
@@ -647,7 +649,7 @@ class AgentRuntime:
                 activity["decision_summary"] = "Tool budget exhausted; planner must finalize with explicit limitations."
                 round_activity.append(activity)
                 continue
-            if decision.next_action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT"} and not action_queries:
+            if decision.next_action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT", "READ_GITHUB"} and not action_queries:
                 activity["decision_summary"] = "Search budget exhausted; planner must finalize with explicit limitations."
                 round_activity.append(activity)
                 continue
@@ -740,6 +742,16 @@ class AgentRuntime:
                     round_tools = latency.stage(
                         f"research_iteration_{iteration}_search_document", search_project,
                     )
+            elif decision.next_action == "READ_GITHUB":
+                round_tools = latency.stage(
+                    f"research_iteration_{iteration}_read_github",
+                    lambda: execute_research_action(
+                        decision.next_action,
+                        action_queries,
+                        github_owner=decision.github_owner,
+                        github_repository=decision.github_repository,
+                    ),
+                )
             else:
                 round_tools = latency.stage(
                     f"research_iteration_{iteration}_{decision.next_action.lower()}",
@@ -754,7 +766,7 @@ class AgentRuntime:
                     ),
                 )
             tool_calls += 1
-            if decision.next_action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT"}:
+            if decision.next_action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT", "READ_GITHUB"}:
                 search_calls += len(action_queries)
             all_tools.extend(round_tools)
             activity["tools"] = [str(tool.get("name", "")) for tool in round_tools]
@@ -943,7 +955,7 @@ class AgentRuntime:
         prompt = (
             "You are the Research Planner and Orchestrator. Choose the single best NEXT ACTION from the current state. "
             "The executor, not a keyword classifier, will run it and return the observation to you. Available actions are "
-            "SEARCH_WEB, FETCH_PAGE, SEARCH_ACADEMIC, LOOKUP_AUTHOR, SEARCH_DOCUMENT, CREATE_MEDIA, COMPARE_EVIDENCE, ANALYZE, CALCULATE, and FINAL_ANSWER. "
+            "SEARCH_WEB, FETCH_PAGE, SEARCH_ACADEMIC, LOOKUP_AUTHOR, READ_GITHUB, SEARCH_DOCUMENT, CREATE_MEDIA, COMPARE_EVIDENCE, ANALYZE, CALCULATE, and FINAL_ANSWER. "
             "For SEARCH_WEB choose web or news search and 1 to 4 focused queries. Use provider=auto unless a specific provider has a "
             "material advantage; the Search Router handles health, cost, and fallback. For FETCH_PAGE select 1 to 3 public HTTPS URLs "
             "from prior search observations and return them in urls. Use the least expensive tool likely "
@@ -953,6 +965,8 @@ class AgentRuntime:
             "Search snippets are discovery evidence, so FETCH_PAGE important primary or supporting pages before relying on factual claims. "
             "Ask: What important uncertainty still prevents a high-quality answer? Choose follow-up search, another source, page fetch, "
             "academic lookup, comparison, calculation, analysis, or finalization accordingly. Search budget is a maximum, not a quota. "
+            "For READ_GITHUB provide github_owner, github_repository, and 1 to 4 focused issue or pull-request search queries; use it when "
+            "authoritative upstream repository evidence materially improves the answer. "
             "Choose CREATE_MEDIA only when the user explicitly requests a visual deliverable and enough evidence has already been gathered; "
             "put one concise evidence-grounded visual brief in queries and set save_to_project=true only when the user requested durable Project storage. "
             "Set complexity=COMPLEX and use_critic=true only when causal reasoning, consequential market/investment analysis, conflicting "
@@ -965,7 +979,8 @@ class AgentRuntime:
             '"unresolved_questions":[],"decision_summary":"brief observable rationale",'
             '"ready_to_answer":false,"complexity":"SIMPLE|MODERATE|COMPLEX","use_critic":false,'
             '"freshness_importance":"low|normal|high","primary_source_importance":"low|normal|high",'
-            '"scholarly_evidence_value":"low|normal|high","save_to_project":false}.\n\n'
+            '"scholarly_evidence_value":"low|normal|high","save_to_project":false,'
+            '"github_owner":"","github_repository":""}.\n\n'
             f"Research state:\n{self._bounded_evidence_json(state)}"
         )
         try:
@@ -1007,7 +1022,7 @@ class AgentRuntime:
             )
         action = value.get("next_action")
         allowed = {
-            "SEARCH_WEB", "FETCH_PAGE", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR",
+            "SEARCH_WEB", "FETCH_PAGE", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "READ_GITHUB",
             "SEARCH_DOCUMENT", "CREATE_MEDIA", "COMPARE_EVIDENCE", "ANALYZE", "CALCULATE", "FINAL_ANSWER",
         }
         if action not in allowed:
@@ -1022,8 +1037,12 @@ class AgentRuntime:
         provider = value.get("provider")
         queries = strings("queries", 4)
         urls = strings("urls", 3)
-        if action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT", "CREATE_MEDIA"} and not queries:
+        if action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT", "CREATE_MEDIA", "READ_GITHUB"} and not queries:
             raise ValueError("tool action requires at least one query")
+        github_owner = value.get("github_owner") if isinstance(value.get("github_owner"), str) else ""
+        github_repository = value.get("github_repository") if isinstance(value.get("github_repository"), str) else ""
+        if action == "READ_GITHUB" and (not github_owner or not github_repository):
+            raise ValueError("GitHub action requires owner and repository")
         if action == "SEARCH_WEB" and not provider:
             provider = "auto"
         if action == "FETCH_PAGE" and not urls:
@@ -1051,6 +1070,8 @@ class AgentRuntime:
             scholarly if scholarly in importance_values else "low",
             urls,
             value.get("save_to_project") is True,
+            github_owner[:100],
+            github_repository[:100],
         )
 
     def _resolve_researcher_identity_query(
@@ -1419,6 +1440,12 @@ class AgentRuntime:
             "scholarly evidence are both relevant, keep their evidentiary roles distinct. Use scenarios, causal analysis, or bibliometrics "
             "only when they materially improve the answer. If figures differ across sources, state the discrepancy. "
         )
+        academic_instruction = (
+            "For this researcher evaluation, preserve bibliometric metrics by source, explain coverage differences, and do not sum database "
+            "counts. A split, incomplete, or misresolved author profile cannot define total output. Assess topic consistency, development, "
+            "originality, representative-work significance, recent activity, collaboration, and leadership only where evidence exists. "
+            if "academic_source_status" in evidence_package else ""
+        )
         analyst_prompt = (
             "You are not merely an evidence summarizer. You are an analytical research agent. "
             "Use the supplied Evidence Package as the sole authority for FACTS, then reason from those facts. "
@@ -1426,11 +1453,7 @@ class AgentRuntime:
             "is not explicitly written in a source. Absence of direct evidence does not prohibit analytical inference when each material premise "
             "and a credible causal chain are supported by established evidence. "
             "Project context is user workspace context, not independently verified evidence; never use it to prove an external claim. "
-            "For researcher evaluation, preserve bibliometric metrics by source, explain coverage differences, and do not sum database counts. "
-            "A split, incomplete, or misresolved author profile cannot define the researcher's total output. "
             "Do not merely summarize facts. Explain what each evidence item means for the requested evaluation. "
-            "Do not judge from publication or citation counts alone: assess topic consistency, development, originality, "
-            "representative-work significance, recent activity, collaboration, and leadership where evidence exists. "
             "Build a structured analytical result, not private chain-of-thought. Distinguish every material conclusion as FACT, INFERENCE, "
             "FORECAST, or UNKNOWN. FACT is directly sourced; INFERENCE follows from stated premises and causal structure; FORECAST is conditional "
             "and scenario-dependent; UNKNOWN lacks enough support. Never label an INFERENCE or FORECAST as NOT VERIFIED. "
@@ -1444,7 +1467,7 @@ class AgentRuntime:
             "product specifications, or company exposure. Omit a named-company comparison when company-specific evidence is absent. "
             "Separate Evidence from Interpretation, state uncertainty, and cite supplied URLs beside factual claims. "
             "More sources is not better. Use only evidence that materially answers the user's question. "
-            f"{contextual_instruction}\n\nIntent metadata (non-binding):\n{plan_json}\n\n"
+            f"{contextual_instruction}{academic_instruction}\n\nIntent metadata (non-binding):\n{plan_json}\n\n"
             f"Question:\n{question}\n\nEvidence Package:\n{package_json}"
         )
         if not use_critic:
@@ -1670,17 +1693,15 @@ class AgentRuntime:
         tools: list[dict[str, object]], persistent_context: str = ""
     ) -> dict[str, object]:
         package: dict[str, object] = {
-            "identity": {}, "career": {}, "metrics": {}, "research_topics": [],
-            "representative_works": [], "recent_activity": [], "leadership": [],
-            "collaboration": [], "limitations": [], "sources": [],
-            "metrics_by_source": {}, "publication_coverage": {}, "coverage_conflicts": [],
-            "academic_source_status": {}, "academic_pipeline": [],
-            "project_context": {
+            "sources": [], "claims": [], "observations": [], "metrics": {},
+            "entities": [], "gaps": [], "conflicts": [], "provenance": [], "limitations": [],
+        }
+        if persistent_context:
+            package["project_context"] = {
                 "provenance": "user_workspace_context_not_external_evidence",
                 "content": persistent_context[:6000],
                 "workspace_search": {},
-            },
-        }
+            }
         for tool in tools:
             if not tool.get("success"):
                 package["limitations"].append({"tool": tool.get("name"), "error": tool.get("error")})
@@ -1690,6 +1711,11 @@ class AgentRuntime:
             except json.JSONDecodeError:
                 continue
             if tool.get("name") == "academic_intelligence" and isinstance(output, dict):
+                package.update({
+                    "identity": {}, "representative_works": [], "metrics_by_source": {},
+                    "publication_coverage": {}, "coverage_conflicts": [],
+                    "academic_source_status": {}, "academic_pipeline": [],
+                })
                 researcher = output.get("researcher")
                 if isinstance(researcher, dict):
                     package["identity"] = {
@@ -1718,6 +1744,7 @@ class AgentRuntime:
                         AgentRuntime._compact_work(paper) for paper in papers if isinstance(paper, dict)
                     )
             elif tool.get("name") == "semantic_scholar" and isinstance(output, dict):
+                package.setdefault("representative_works", [])
                 author = output.get("author")
                 if isinstance(author, dict):
                     package["identity"] = {key: author.get(key) for key in ("name", "affiliations", "author_id")}
@@ -1730,6 +1757,7 @@ class AgentRuntime:
                 if output.get("identity_status") == "ambiguous":
                     package["limitations"].append({"identity_status": "ambiguous", "same_name_candidate_count": output.get("same_name_candidate_count")})
             elif tool.get("name") == "academic_papers" and isinstance(output, list):
+                package.setdefault("representative_works", [])
                 package["representative_works"].extend(
                     AgentRuntime._compact_work(paper) for paper in output if isinstance(paper, dict)
                 )
@@ -1748,7 +1776,10 @@ class AgentRuntime:
                     for item in output if isinstance(item, dict)
                 )
             elif tool.get("name") == "project_context" and isinstance(output, dict):
-                project_context = package["project_context"]
+                project_context = package.setdefault("project_context", {
+                    "provenance": "user_workspace_context_not_external_evidence",
+                    "content": "", "workspace_search": {},
+                })
                 if isinstance(project_context, dict):
                     previous = project_context.get("workspace_search")
                     previous_excerpt = str(previous.get("excerpt", "")) if isinstance(previous, dict) else ""
@@ -1756,13 +1787,21 @@ class AgentRuntime:
                     project_context["workspace_search"] = {
                         "excerpt": "\n".join(value for value in (previous_excerpt, current_excerpt) if value)[:6000]
                     }
-        package["representative_works"] = AgentRuntime._deduplicate_records(
-            package["representative_works"], ("doi", "url", "title"), 12
-        )
+            elif tool.get("name") == "github_research" and isinstance(output, dict):
+                package["observations"].extend(output.get("observations", []))
+                package["sources"].extend(output.get("sources", []))
+                package["provenance"].append({
+                    "provider": "GitHub MCP", "owner": output.get("owner"),
+                    "repository": output.get("repository"), "read_only": True,
+                })
+        if "representative_works" in package:
+            package["representative_works"] = AgentRuntime._deduplicate_records(
+                package["representative_works"], ("doi", "url", "title"), 12
+            )
         package["sources"] = AgentRuntime._select_evidence_sources(package["sources"], 6)
         for index, source in enumerate(package["sources"], 1):
             source["evidence_id"] = f"S{index}"
-        for index, work in enumerate(package["representative_works"], len(package["sources"]) + 1):
+        for index, work in enumerate(package.get("representative_works", []), len(package["sources"]) + 1):
             work["evidence_id"] = f"S{index}"
         return package
 

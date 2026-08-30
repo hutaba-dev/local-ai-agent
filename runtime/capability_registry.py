@@ -62,7 +62,7 @@ CAPABILITIES = (
         "Use current, version-specific software and framework documentation when it materially improves implementation accuracy.",
         "external", "MCP_CONTEXT7_ENABLED", ("resolve_library_id", "query_documentation"), "context7",
     ),
-    CapabilitySpec("github", "GitHub", "Read remote repository code, commits, issues, pull requests, and releases through official GitHub APIs.", "external", "MCP_GITHUB_ENABLED", ("github_search_code", "github_get_file", "github_read_commits", "github_read_issues", "github_get_pull_request", "github_read_releases")),
+    CapabilitySpec("github", "GitHub", "Inspect authoritative remote repositories, code, issues, pull requests, commits, and releases.", "external", "MCP_GITHUB_ENABLED", ("github_search_code", "github_get_file", "github_read_commits", "github_read_issues", "github_get_pull_request", "github_read_releases")),
     CapabilitySpec(
         "git", "Local Git",
         "Read repository status, diffs, history, commits, blame, and branch tracking through scoped semantic operations; prefer these over generic command execution for Git reads.",

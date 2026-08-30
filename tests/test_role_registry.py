@@ -39,6 +39,12 @@ class RoleRegistryTests(unittest.TestCase):
         self.assertNotIn(PermissionClass.WRITE_REPOSITORY, coder.permission_policy)
         self.assertNotIn(PermissionClass.DESTRUCTIVE, coder.permission_policy)
 
+    def test_researcher_can_prefer_authoritative_github_evidence(self) -> None:
+        researcher = get_role("researcher")
+
+        self.assertIn("github", researcher.preferred_capabilities)
+        self.assertIn(PermissionClass.READ, researcher.permission_policy)
+
     def test_vscode_defaults_to_coder_while_other_clients_keep_secretary(self) -> None:
         self.assertEqual(client_default_role("vscode").id, "coder")
         self.assertEqual(client_default_role("web").id, "secretary")

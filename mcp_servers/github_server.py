@@ -71,7 +71,14 @@ async def _call(tool: str, arguments: dict[str, object]) -> dict[str, object]:
     lowered = text.lower()
     status = "AVAILABLE"
     if result.is_error:
-        status = "RATE_LIMITED" if "rate limit" in lowered or "status 429" in lowered else "ERROR"
+        if "bad credentials" in lowered or "status 401" in lowered or "http 401" in lowered:
+            status = "AUTH_FAILED"
+        elif "status 403" in lowered or "http 403" in lowered or "forbidden" in lowered:
+            status = "FORBIDDEN"
+        elif "rate limit" in lowered or "status 429" in lowered:
+            status = "RATE_LIMITED"
+        else:
+            status = "ERROR"
     elif not text.strip():
         status = "DEGRADED"
     return {

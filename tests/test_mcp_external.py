@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from mcp import Client
 
@@ -120,6 +120,26 @@ class MCPExternalTests(unittest.TestCase):
         self.assertIn("--read-only", parameters.args)
         self.assertIn(f"--tools={','.join(UPSTREAM_TOOLS)}", parameters.args)
         self.assertNotIn("GITHUB_TOOLSETS", parameters.env)
+        self.assertEqual(parameters.env["GITHUB_PERSONAL_ACCESS_TOKEN"], "test-token")
+        self.assertFalse(any("test-token" in argument for argument in parameters.args))
+        self.assertFalse(any(term in UPSTREAM_TOOLS for term in (
+            "create_issue", "create_pull_request", "merge_pull_request", "push_files", "run_workflow",
+        )))
+
+    def test_github_normalizes_authentication_and_permission_failures(self) -> None:
+        from mcp_servers.github_server import _call
+
+        async def result_for(message: str) -> dict[str, object]:
+            result = Mock(is_error=True, content=[Mock(text=message)])
+            client = AsyncMock()
+            client.__aenter__.return_value.call_tool = AsyncMock(return_value=result)
+            with patch.dict(os.environ, {"GITHUB_PERSONAL_ACCESS_TOKEN": "test-token"}), patch(
+                "mcp_servers.github_server.Client", return_value=client
+            ):
+                return await _call("search_issues", {"query": "repo:vllm-project/vllm qwen"})
+
+        self.assertEqual(asyncio.run(result_for("HTTP status 401: Bad credentials"))["status"], "AUTH_FAILED")
+        self.assertEqual(asyncio.run(result_for("HTTP status 403: Forbidden"))["status"], "FORBIDDEN")
 
     def test_playwright_reads_public_javascript_page(self) -> None:
         with patch.dict(os.environ, {"MCP_PLAYWRIGHT_EGRESS_GUARD": "true"}):

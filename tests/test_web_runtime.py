@@ -29,6 +29,7 @@ from runtime.tool_registry import (
     _academic_evidence_gaps,
     _research_tools,
     _researcher_query,
+    execute_research_action,
     research_source_plan,
     run_agent_tools,
 )
@@ -1414,6 +1415,73 @@ class WebRuntimeTests(unittest.TestCase):
         excerpt = package["project_context"]["workspace_search"]["excerpt"]
         self.assertIn("ORBIT-42", excerpt)
         self.assertIn("2031-06-30", excerpt)
+
+    def test_technical_github_evidence_package_is_generic(self) -> None:
+        package = AgentRuntime._evidence_package([{
+            "name": "github_research",
+            "success": True,
+            "output": json.dumps({
+                "owner": "vllm-project", "repository": "vllm", "read_only": True,
+                "observations": [{"operation": "github_read_issues", "result": {"status": "AVAILABLE"}}],
+                "sources": [{"title": "Issue 1", "url": "https://github.com/vllm-project/vllm/issues/1"}],
+            }),
+        }])
+
+        self.assertEqual(package["provenance"][0]["provider"], "GitHub MCP")
+        self.assertEqual(len(package["observations"]), 1)
+        self.assertNotIn("identity", package)
+        self.assertNotIn("representative_works", package)
+        self.assertNotIn("recent_activity", package)
+        self.assertNotIn("academic_source_status", package)
+
+    def test_academic_evidence_package_adds_optional_researcher_fields(self) -> None:
+        package = AgentRuntime._evidence_package([{
+            "name": "academic_intelligence", "success": True,
+            "output": json.dumps({
+                "researcher": {"canonical_name": "Ada Researcher"},
+                "coverage": {}, "source_status": {"openalex": "AVAILABLE_FULL"},
+                "representative_papers": [],
+            }),
+        }])
+
+        self.assertEqual(package["identity"]["canonical_name"], "Ada Researcher")
+        self.assertIn("representative_works", package)
+        self.assertIn("academic_source_status", package)
+
+    def test_model_can_choose_read_github_with_structured_repository(self) -> None:
+        decision = AgentRuntime._parse_research_decision(json.dumps({
+            "next_action": "READ_GITHUB",
+            "queries": ["qwen tool calling", "qwen3_coder parser"],
+            "github_owner": "vllm-project", "github_repository": "vllm",
+            "ready_to_answer": False,
+        }))
+
+        self.assertEqual(decision.next_action, "READ_GITHUB")
+        self.assertEqual(decision.github_owner, "vllm-project")
+        self.assertEqual(decision.github_repository, "vllm")
+
+    def test_read_github_reuses_only_existing_read_tools(self) -> None:
+        from types import SimpleNamespace
+
+        def outcome(tool: str, arguments: dict[str, object]):
+            return SimpleNamespace(
+                success=True, tool=tool, server="github-mcp", status="AVAILABLE",
+                duration_ms=1, executed=True, error=None,
+                output={"status": "AVAILABLE", "output": "https://github.com/vllm-project/vllm/issues/1"},
+            )
+
+        with patch("runtime.tool_registry.call_mcp_tool", side_effect=outcome) as call:
+            results = execute_research_action(
+                "READ_GITHUB", ("qwen parser",),
+                github_owner="vllm-project", github_repository="vllm",
+            )
+
+        self.assertTrue(results[0]["success"])
+        self.assertEqual(results[0]["capability"], "github")
+        self.assertEqual(
+            [invocation.args[0] for invocation in call.call_args_list],
+            ["github_read_issues", "github_read_commits"],
+        )
 
     def test_model_deep_research_decision_runs_search_with_model_query(self) -> None:
         class DeepResearchDecisionClient(FakeClient):

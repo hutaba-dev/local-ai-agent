@@ -139,12 +139,12 @@ def research_tool_catalog() -> list[dict[str, object]]:
         if status is not None:
             available = status != "UNAVAILABLE"
         catalog.append({"name": name, "available": available, "status": status or ("AVAILABLE" if available else "UNAVAILABLE"), **description})
-    if mcp_tool_enabled("search_web") or mcp_tool_enabled("fetch_page") or mcp_tool_enabled("academic_search_publications"):
+    if mcp_tool_enabled("search_web") or mcp_tool_enabled("fetch_page") or mcp_tool_enabled("academic_search_publications") or mcp_tool_enabled("github_read_issues"):
         for tool in mcp_tool_catalog():
             if tool["name"] not in {
                 "search_web", "search_news", "fetch_page", "academic_resolve_researcher",
                 "academic_search_publications", "academic_get_researcher_evidence",
-                "academic_compare_source_coverage",
+                "academic_compare_source_coverage", "github_read_issues", "github_read_commits",
             }:
                 continue
             if not mcp_tool_enabled(str(tool["name"])):
@@ -159,12 +159,14 @@ def research_tool_catalog() -> list[dict[str, object]]:
                 "status": tool["health"],
                 "action": (
                     "FETCH_PAGE" if tool["name"] == "fetch_page"
+                    else "READ_GITHUB" if str(tool["name"]).startswith("github_")
                     else "SEARCH_ACADEMIC" if tool["name"] == "academic_search_publications"
                     else "LOOKUP_AUTHOR" if str(tool["name"]).startswith("academic_")
                     else "SEARCH_WEB"
                 ),
                 "freshness": (
                     "current public page" if tool["name"] == "fetch_page"
+                    else "authoritative current upstream repository metadata" if str(tool["name"]).startswith("github_")
                     else "provider-dependent scholarly metadata" if str(tool["name"]).startswith("academic_")
                     else "current web/news discovery"
                 ),
@@ -180,6 +182,8 @@ def execute_research_action(
     search_category: str = "web",
     freshness: str = "normal",
     urls: tuple[str, ...] = (),
+    github_owner: str = "",
+    github_repository: str = "",
 ) -> list[dict[str, object]]:
     if action == "SEARCH_WEB":
         if mcp_tool_enabled("search_web"):
@@ -208,7 +212,47 @@ def execute_research_action(
         if mcp_tool_enabled("academic_get_researcher_evidence"):
             return [_mcp_academic_researcher("\n".join(queries))]
         return [asdict(_academic_intelligence("\n".join(queries)))]
+    if action == "READ_GITHUB":
+        return [_mcp_github_research(github_owner, github_repository, queries)]
     raise ValueError(f"unsupported research action: {action}")
+
+
+def _mcp_github_research(owner: str, repository: str, queries: tuple[str, ...]) -> dict[str, object]:
+    started = perf_counter()
+    outcomes = [
+        call_mcp_tool("github_read_issues", {
+            "operation": "search", "owner": owner, "repo": repository, "query": query,
+        })
+        for query in queries[:3]
+    ]
+    outcomes.append(call_mcp_tool("github_read_commits", {
+        "owner": owner, "repo": repository, "operation": "list",
+    }))
+    observations: list[dict[str, object]] = []
+    sources: list[dict[str, object]] = []
+    calls = []
+    for outcome in outcomes:
+        calls.append(_mcp_call_details(outcome))
+        if not outcome.success or not isinstance(outcome.output, dict):
+            continue
+        observations.append({"operation": outcome.tool, "result": outcome.output})
+        for url in re.findall(r"https://github\.com/[^\s\"']+", str(outcome.output.get("output", ""))):
+            sources.append({
+                "title": f"GitHub {outcome.tool}", "url": url.rstrip(",.)]"),
+                "provider": "GitHub MCP", "evidence_role": "DIRECT", "relevance_score": 1.0,
+            })
+    success = bool(observations)
+    statuses = [str(call["status"]) for call in calls]
+    error = None if success else next((status for status in statuses if status != "AVAILABLE"), "UNAVAILABLE")
+    return asdict(ToolResult(
+        "github_research", success,
+        json.dumps({
+            "owner": owner, "repository": repository, "read_only": True,
+            "observations": observations, "sources": sources,
+        }, ensure_ascii=False),
+        error, round((perf_counter() - started) * 1000),
+        {"execution": "mcp", "calls": calls}, "github",
+    ))
 
 
 def _mcp_call_details(outcome: object) -> dict[str, object]:

@@ -56,7 +56,7 @@ ROLES = (
         name="KIM / Research",
         description="Evidence gathering, source evaluation, analysis, and cited synthesis.",
         instructions_path="agents/research/instructions.md",
-        preferred_capabilities=("web", "academic", "documentation", "project", "media"),
+        preferred_capabilities=("web", "academic", "github", "documentation", "project", "media"),
         default_capabilities=(),
         permission_policy=(
             PermissionClass.READ,
