@@ -125,6 +125,11 @@ def research_tool_catalog() -> list[dict[str, object]]:
             continue
         if name == "secure_page_fetch" and mcp_tool_enabled("fetch_page"):
             continue
+        if name in {
+            "academic_papers", "academic_intelligence", "scopus", "web_of_science",
+            "openalex", "semantic_scholar", "crossref", "orcid",
+        } and mcp_tool_enabled("academic_search_publications"):
+            continue
         available = True
         if name in router.providers:
             available = router.providers[name].configured()
@@ -132,9 +137,13 @@ def research_tool_catalog() -> list[dict[str, object]]:
         if status is not None:
             available = status != "UNAVAILABLE"
         catalog.append({"name": name, "available": available, "status": status or ("AVAILABLE" if available else "UNAVAILABLE"), **description})
-    if mcp_tool_enabled("search_web") or mcp_tool_enabled("fetch_page"):
+    if mcp_tool_enabled("search_web") or mcp_tool_enabled("fetch_page") or mcp_tool_enabled("academic_search_publications"):
         for tool in mcp_tool_catalog():
-            if tool["name"] not in {"search_web", "search_news", "fetch_page"}:
+            if tool["name"] not in {
+                "search_web", "search_news", "fetch_page", "academic_resolve_researcher",
+                "academic_search_publications", "academic_get_researcher_evidence",
+                "academic_compare_source_coverage",
+            }:
                 continue
             if not mcp_tool_enabled(str(tool["name"])):
                 continue
@@ -146,8 +155,17 @@ def research_tool_catalog() -> list[dict[str, object]]:
                 "permission": tool["permission"],
                 "available": tool["available"],
                 "status": tool["health"],
-                "action": "FETCH_PAGE" if tool["name"] == "fetch_page" else "SEARCH_WEB",
-                "freshness": "current public page" if tool["name"] == "fetch_page" else "current web/news discovery",
+                "action": (
+                    "FETCH_PAGE" if tool["name"] == "fetch_page"
+                    else "SEARCH_ACADEMIC" if tool["name"] == "academic_search_publications"
+                    else "LOOKUP_AUTHOR" if str(tool["name"]).startswith("academic_")
+                    else "SEARCH_WEB"
+                ),
+                "freshness": (
+                    "current public page" if tool["name"] == "fetch_page"
+                    else "provider-dependent scholarly metadata" if str(tool["name"]).startswith("academic_")
+                    else "current web/news discovery"
+                ),
             })
     return catalog
 
@@ -181,8 +199,12 @@ def execute_research_action(
             return [asdict(ToolResult("web_sources", False, "", "no successful web search results to fetch", 0))]
         return [asdict(_web_sources(str(search_tool.get("output", ""))))]
     if action == "SEARCH_ACADEMIC":
+        if mcp_tool_enabled("academic_search_publications"):
+            return [_mcp_academic_search(queries)]
         return [asdict(_academic_papers(queries))]
     if action == "LOOKUP_AUTHOR":
+        if mcp_tool_enabled("academic_get_researcher_evidence"):
+            return [_mcp_academic_researcher("\n".join(queries))]
         return [asdict(_academic_intelligence("\n".join(queries)))]
     raise ValueError(f"unsupported research action: {action}")
 
@@ -300,6 +322,105 @@ def _mcp_fetch_pages(urls: tuple[str, ...]) -> dict[str, object]:
         "web_sources", bool(sources), json.dumps(sources, ensure_ascii=False),
         None if sources else "MCP fetch returned no usable pages", duration_ms,
         {"execution": "mcp", "transport": "in_process", "mcp_calls": calls},
+    ))
+
+
+def _mcp_academic_search(queries: tuple[str, ...]) -> dict[str, object]:
+    started = perf_counter()
+    publications: list[dict[str, object]] = []
+    calls: list[dict[str, object]] = []
+    seen: set[str] = set()
+    for query in queries[:4]:
+        outcome = call_mcp_tool("academic_search_publications", {"query": query, "limit": 8})
+        calls.append(_mcp_call_details(outcome))
+        if not outcome.success:
+            if not outcome.executed and not publications and _direct_fallback_enabled():
+                fallback = _academic_papers(queries)
+                details = dict(fallback.details or {})
+                details.update({"mcp_fallback": "direct_adapter", "mcp_calls": calls})
+                return asdict(ToolResult(
+                    fallback.name, fallback.success, fallback.output, fallback.error,
+                    fallback.duration_ms, details,
+                ))
+            continue
+        output = outcome.output or {}
+        for publication in output.get("publications", []):
+            if not isinstance(publication, dict):
+                continue
+            key = str(publication.get("doi") or publication.get("title", "")).casefold()
+            if key and key not in seen:
+                seen.add(key)
+                publications.append(publication)
+    duration_ms = round((perf_counter() - started) * 1000)
+    return asdict(ToolResult(
+        "academic_papers", bool(publications), json.dumps(publications[:12], ensure_ascii=False),
+        None if publications else "Academic MCP returned no usable publications", duration_ms,
+        {"execution": "mcp", "transport": "in_process", "mcp_calls": calls},
+    ))
+
+
+def _mcp_academic_researcher(query: str) -> dict[str, object]:
+    started = perf_counter()
+    outcome = call_mcp_tool("academic_get_researcher_evidence", {"query": query})
+    call = _mcp_call_details(outcome)
+    if not outcome.success:
+        if not outcome.executed and _direct_fallback_enabled():
+            fallback = _academic_intelligence(query)
+            details = dict(fallback.details or {})
+            details.update({"mcp_fallback": "direct_adapter", "mcp_calls": [call]})
+            return asdict(ToolResult(
+                fallback.name, fallback.success, fallback.output, fallback.error,
+                fallback.duration_ms, details,
+            ))
+        return asdict(ToolResult(
+            "academic_intelligence", False, "", "Academic MCP returned no usable researcher evidence",
+            round((perf_counter() - started) * 1000),
+            {"execution": "mcp", "transport": "in_process", "mcp_calls": [call]},
+        ))
+    output = outcome.output or {}
+    source_coverage = output.get("source_coverage", {})
+    coverage = {
+        source: {
+            "status": values.get("status"),
+            "publication_count": values.get("retrieved_publications"),
+            "reported_document_count": values.get("reported_publications"),
+            "citation_count": values.get("citation_count"),
+            "h_index": values.get("h_index"),
+        }
+        for source, values in source_coverage.items()
+        if isinstance(values, dict)
+    } if isinstance(source_coverage, dict) else {}
+    normalized = {
+        "researcher": output.get("researcher", {}),
+        "coverage": coverage,
+        "source_status": output.get("provider_states", {}),
+        "conflicts": output.get("coverage_conflicts", []),
+        "representative_papers": output.get("representative_papers", []),
+        "merged_publication_count": output.get("corpus", {}).get("verified_count", 0) if isinstance(output.get("corpus"), dict) else 0,
+        "pipeline": [
+            "IDENTITY_RESOLUTION", "MULTI_SOURCE_PUBLICATION_DISCOVERY", "DEDUPLICATION",
+            "COVERAGE_CHECK", "CITATION_METRIC_CROSS_CHECK", "REPRESENTATIVE_PAPER_SELECTION",
+        ],
+    }
+    duration_ms = round((perf_counter() - started) * 1000)
+    return asdict(ToolResult(
+        "academic_intelligence", True, json.dumps(normalized, ensure_ascii=False), None, duration_ms,
+        {
+            "execution": "mcp", "transport": "in_process", "mcp_calls": [call],
+            "source_status": normalized["source_status"],
+            "identity_confidence": normalized["researcher"].get("identity_confidence", "UNKNOWN") if isinstance(normalized["researcher"], dict) else "UNKNOWN",
+            "publication_candidates": {
+                source: values.get("reported_document_count") or values.get("publication_count", 0)
+                for source, values in coverage.items()
+            },
+            "coverage_conflicts": len(normalized["conflicts"]),
+            "merged_verified_corpus": normalized["merged_publication_count"],
+            "representative_papers": len(normalized["representative_papers"]),
+            "actions": [
+                "resolved researcher identity", "compared source coverage",
+                "retrieved publications", "selected representative papers",
+            ],
+        },
     ))
 
 

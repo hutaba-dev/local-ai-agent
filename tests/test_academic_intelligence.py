@@ -9,11 +9,13 @@ from runtime.academic_intelligence import (
     SourceStatus,
     _aggregate_intelligence,
     _orcid_provider,
+    _name_from_query,
     _scopus_author_entries,
     _scopus_author_profile,
     _scopus_author_query,
     _scopus_provider,
     _semantic_scholar_provider,
+    _wos_provider,
     academic_intelligence,
     academic_source_status,
     scopus_get_abstract,
@@ -30,13 +32,18 @@ from runtime.academic_intelligence import (
 
 
 class AcademicIntelligenceTests(unittest.TestCase):
+    def test_researcher_name_parser_ignores_structured_identity_hints(self) -> None:
+        query = "Geoffrey Hinton researcher\nAcademic alias: Geoffrey E. Hinton\nAffiliation hint: University of Toronto"
+
+        self.assertEqual(_name_from_query(query), "Geoffrey Hinton")
+
     def test_missing_credentials_are_explicit_degraded_states(self) -> None:
         with patch.dict(os.environ, {}, clear=True):
             status = academic_source_status()
 
-        self.assertEqual(status["scopus"], "UNAVAILABLE")
-        self.assertEqual(status["web_of_science"], "UNAVAILABLE")
-        self.assertEqual(status["google_scholar"], "UNAVAILABLE")
+        self.assertEqual(status["scopus"], "UNCONFIGURED")
+        self.assertEqual(status["web_of_science"], "UNCONFIGURED")
+        self.assertEqual(status["google_scholar"], "UNCONFIGURED")
         self.assertEqual(status["openalex"], "AVAILABLE_FULL")
 
     def test_scopus_adapters_use_official_endpoints_and_credentials(self) -> None:
@@ -178,6 +185,21 @@ class AcademicIntelligenceTests(unittest.TestCase):
             ["researcher-key", "researcher-key", "starter-key", "starter-key"],
         )
 
+    def test_wos_researcher_only_entitlement_returns_limited_identity_evidence(self) -> None:
+        payload = {"researchers": [{
+            "displayName": "Ada Researcher", "researcherId": "A-1",
+            "affiliations": ["Example University"],
+        }]}
+        with patch.dict(os.environ, {"WOS_RESEARCHER_API_KEY": "researcher-key"}, clear=True), patch(
+            "runtime.academic_intelligence.wos_search_researchers", return_value=payload
+        ), patch("runtime.academic_intelligence.wos_search_documents") as documents:
+            result = _wos_provider("Ada Researcher")
+
+        self.assertEqual(result.status, SourceStatus.AVAILABLE_LIMITED)
+        self.assertEqual(result.identities[0]["identifiers"]["wos_researcher_id"], "A-1")
+        self.assertEqual(result.details["document_api"], "UNCONFIGURED")
+        documents.assert_not_called()
+
     def test_provider_http_states_distinguish_entitlement_and_rate_limit(self) -> None:
         from runtime.academic_intelligence import _provider_failure
 
@@ -283,6 +305,10 @@ class AcademicIntelligenceTests(unittest.TestCase):
 
         shared = next(paper for paper in intelligence["merged_verified_corpus"] if paper.get("doi"))
         self.assertEqual(shared["sources"], ["scopus", "web_of_science"])
+        self.assertEqual(
+            {record["source"]: record["source_record_ids"] for record in shared["source_records"]},
+            {"scopus": {"scopus_id": "S1"}, "web_of_science": {"wos_uid": "W1"}},
+        )
         self.assertEqual(shared["authorship_confidence"], "HIGH")
         self.assertEqual(intelligence["coverage"]["scopus"]["h_index"], 35)
         self.assertEqual(intelligence["coverage"]["web_of_science"]["h_index"], 32)
@@ -304,8 +330,8 @@ class AcademicIntelligenceTests(unittest.TestCase):
         ):
             result = academic_intelligence("Unique Missing Credential Researcher professor")
 
-        self.assertEqual(result["source_status"]["scopus"], "UNAVAILABLE")
-        self.assertEqual(result["source_status"]["web_of_science"], "UNAVAILABLE")
+        self.assertEqual(result["source_status"]["scopus"], "UNCONFIGURED")
+        self.assertEqual(result["source_status"]["web_of_science"], "UNCONFIGURED")
         self.assertIn("openalex", result["source_status"])
         self.assertIn("COVERAGE_CHECK", result["pipeline"])
 
@@ -400,6 +426,20 @@ class AcademicIntelligenceTests(unittest.TestCase):
         self.assertTrue(second["cache_hit"])
         openalex.assert_called_once()
 
+    def test_affiliation_hint_separates_namesake_cache_entries(self) -> None:
+        fallback = AcademicSourceResult("openalex", SourceStatus.AVAILABLE_FULL)
+        with patch.dict(os.environ, {}, clear=True), patch(
+            "runtime.academic_intelligence._openalex_provider", return_value=fallback
+        ) as openalex, patch(
+            "runtime.academic_intelligence._semantic_scholar_provider", return_value=fallback
+        ), patch("runtime.academic_intelligence._orcid_provider", return_value=fallback), patch(
+            "runtime.academic_intelligence._crossref_provider", return_value=fallback
+        ):
+            academic_intelligence("Unique Namesake Researcher\nAffiliation hint: A University")
+            academic_intelligence("Unique Namesake Researcher\nAffiliation hint: B University")
+
+        self.assertEqual(openalex.call_count, 2)
+
     def test_researcher_benchmark_fixtures_expose_identity_and_coverage_risks(self) -> None:
         def identity(source: str, name: str, affiliation: str) -> dict[str, object]:
             return {"name": name, "source": source, "affiliations": [affiliation], "identifiers": {}}
@@ -434,6 +474,9 @@ class AcademicIntelligenceTests(unittest.TestCase):
             with self.subTest(label=label):
                 intelligence = _aggregate_intelligence(name, results)
                 self.assertIn(expected_conflict, {item["type"] for item in intelligence["conflicts"]})
+                if label == "institution_change":
+                    self.assertEqual(intelligence["researcher"]["identity_confidence"], "MEDIUM")
+                    self.assertTrue(intelligence["researcher"]["possible_split_profile"])
 
         early_career = _aggregate_intelligence("Early Researcher", [
             AcademicSourceResult("scopus", SourceStatus.AVAILABLE_FULL, metrics={"document_count": 4}),
@@ -444,6 +487,42 @@ class AcademicIntelligenceTests(unittest.TestCase):
             AcademicSourceResult("orcid", SourceStatus.AVAILABLE_FULL, (identity("orcid", "김민수", "한국대학교"),)),
         ])
         self.assertEqual(korean["researcher"]["native_name"], "김민수")
+
+    def test_same_title_year_and_overlapping_authors_deduplicate_without_doi(self) -> None:
+        first = {
+            "title": "A Unified Research Method", "year": 2024,
+            "authors": ["Ada Researcher", "Ben Scholar"], "journal": "Example Journal",
+            "sources": ["openalex"], "source_ids": {"openalex_work_id": "W1"},
+        }
+        second = {
+            "title": "A unified research method", "year": 2024,
+            "authors": ["Ada Researcher", "B. Scholar"], "journal": "Example Journal",
+            "sources": ["semantic_scholar"], "source_ids": {"semantic_scholar_paper_id": "S1"},
+        }
+
+        result = _aggregate_intelligence("Ada Researcher professor", [
+            AcademicSourceResult("openalex", SourceStatus.AVAILABLE_FULL, publications=(first,)),
+            AcademicSourceResult("semantic_scholar", SourceStatus.AVAILABLE_FULL, publications=(second,)),
+        ])
+
+        self.assertEqual(result["publication_candidate_count"], 1)
+        self.assertEqual(result["publication_candidates"][0]["sources"], ["openalex", "semantic_scholar"])
+        self.assertEqual(len(result["publication_candidates"][0]["source_records"]), 2)
+
+    def test_same_source_namesakes_are_reported_as_possible_split_profile(self) -> None:
+        identities = (
+            {"name": "Alex Kim", "source": "openalex", "affiliations": ["A University"], "identifiers": {"openalex_author_id": "A1"}},
+            {"name": "Alex Kim", "source": "openalex", "affiliations": ["B University"], "identifiers": {"openalex_author_id": "A2"}},
+        )
+
+        result = _aggregate_intelligence(
+            "Alex Kim researcher",
+            [AcademicSourceResult("openalex", SourceStatus.AVAILABLE_FULL, identities)],
+        )
+
+        self.assertTrue(result["researcher"]["possible_split_profile"])
+        self.assertEqual(result["researcher"]["identity_confidence"], "AMBIGUOUS")
+        self.assertIn("possible_split_profile", {item["type"] for item in result["conflicts"]})
 
     def test_doi_work_with_matching_author_is_verified_only_after_identity_resolution(self) -> None:
         work = {

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +12,7 @@ from unittest.mock import patch
 from mcp import Client
 
 from mcp_servers.academic_server import ACADEMIC_MCP
+from runtime.capability_registry import capability_catalog
 from mcp_servers.project_server import create_project_mcp
 from runtime.project_tools import ProjectTools
 from runtime.projects import ProjectStore
@@ -29,13 +32,72 @@ class MCPPhaseBTests(unittest.TestCase):
             async with Client(ACADEMIC_MCP) as client:
                 return {tool.name for tool in (await client.list_tools()).tools}
 
-        self.assertEqual(asyncio.run(discover()), {"researcher_profile", "publication_search"})
+        self.assertEqual(asyncio.run(discover()), {
+            "academic_resolve_researcher", "academic_search_publications",
+            "academic_get_researcher_evidence", "academic_compare_source_coverage",
+        })
         with patch("mcp_servers.academic_server.academic_intelligence", return_value={
-            "researcher": {"canonical_name": "Ada Researcher"},
-            "metrics_by_source": {"scopus": {"citations": 10}, "openalex": {"citations": 8}},
+            "researcher": {"canonical_name": "Ada Researcher", "identity_confidence": "HIGH"},
+            "source_status": {"scopus": "AVAILABLE_FULL", "openalex": "AVAILABLE_FULL"},
+            "coverage": {
+                "scopus": {"status": "AVAILABLE_FULL", "reported_document_count": 10, "citation_count": 100},
+                "openalex": {"status": "AVAILABLE_FULL", "reported_document_count": 8, "citation_count": 80},
+            },
+            "conflicts": [{"type": "publication_count_discrepancy"}],
+            "representative_papers": [{"title": "Evidence", "doi": "10.1/test", "sources": ["scopus", "openalex"]}],
+            "publication_candidate_count": 10,
+            "merged_publication_count": 8,
         }):
-            result = self.call(ACADEMIC_MCP, "researcher_profile", {"query": "Ada Researcher"})
-        self.assertEqual(set(result.structured_content["entity"]["metrics_by_source"]), {"scopus", "openalex"})
+            result = self.call(ACADEMIC_MCP, "academic_get_researcher_evidence", {"query": "Ada Researcher"})
+        self.assertEqual(set(result.structured_content["citation_metrics_by_source"]), {"scopus", "openalex"})
+        self.assertEqual(result.structured_content["representative_papers"][0]["sources"], ["scopus", "openalex"])
+        self.assertNotIn("publication_candidates", result.structured_content)
+
+    def test_academic_facade_does_not_leak_provider_errors_or_credentials(self) -> None:
+        secret = "secret-provider-token"
+        intelligence = {
+            "researcher": {"canonical_name": "Ada Researcher", "identity_confidence": "LOW"},
+            "source_status": {"scopus": "NO_ENTITLEMENT", "openalex": "AVAILABLE_FULL"},
+            "source_details": {
+                "scopus": {"error": f"Authorization: Bearer {secret}", "identities": []},
+                "openalex": {"identities": []},
+            },
+            "coverage": {}, "conflicts": [],
+        }
+        with patch("mcp_servers.academic_server.academic_intelligence", return_value=intelligence):
+            result = self.call(ACADEMIC_MCP, "academic_resolve_researcher", {"query": "Ada Researcher"})
+
+        serialized = json.dumps(result.structured_content)
+        self.assertNotIn(secret, serialized)
+        self.assertNotIn("Authorization", serialized)
+        self.assertEqual(result.structured_content["status"], "DEGRADED")
+
+    def test_academic_catalog_reports_provider_states_without_requiring_paid_credentials(self) -> None:
+        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_ACADEMIC_ENABLED": "true"}, clear=False), patch(
+            "runtime.academic_intelligence.academic_source_status",
+            return_value={"scopus": "UNCONFIGURED", "openalex": "AVAILABLE_FULL"},
+        ):
+            academic = next(item for item in capability_catalog() if item["name"] == "academic")
+
+        self.assertTrue(academic["available"])
+        self.assertEqual(academic["health"], "DEGRADED")
+        self.assertEqual(academic["provider_states"]["scopus"], "UNCONFIGURED")
+
+    def test_academic_output_is_bounded_without_returning_full_corpus(self) -> None:
+        publications = [{
+            "title": f"Paper {index}", "abstract": "x" * 5_000,
+            "sources": ["openalex"], "source_records": [{"source": "openalex", "source_record_id": index}],
+        } for index in range(30)]
+        with patch("mcp_servers.academic_server.academic_papers", return_value=publications):
+            result = self.call(ACADEMIC_MCP, "academic_search_publications", {"query": "topic", "limit": 10})
+
+        serialized = json.dumps(result.structured_content, ensure_ascii=False)
+        self.assertLessEqual(len(serialized), 12_000)
+        self.assertLessEqual(len(result.structured_content["publications"]), 10)
+        self.assertTrue(all(
+            len(publication.get("abstract") or "") <= 800
+            for publication in result.structured_content["publications"]
+        ))
 
     def test_project_scope_hides_owner_and_blocks_cross_project_file_ids(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

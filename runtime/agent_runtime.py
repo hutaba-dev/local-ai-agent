@@ -621,6 +621,20 @@ class AgentRuntime:
                 activity["decision_summary"] = "Search budget exhausted; planner must finalize with explicit limitations."
                 round_activity.append(activity)
                 continue
+            if decision.next_action == "LOOKUP_AUTHOR":
+                prior_web_output = next((
+                    str(tool.get("output", "")) for tool in reversed(all_tools)
+                    if tool.get("name") == "web_search" and tool.get("success")
+                ), "")
+                resolved_query = latency.stage(
+                    f"research_iteration_{iteration}_identity_resolution",
+                    lambda: self._resolve_researcher_identity_query(
+                        question, action_queries, prior_web_output, system_prompt, latency,
+                    ),
+                )
+                action_queries = (resolved_query,)
+                activity["identity_resolution"] = "resolved researcher identity"
+                activity["queries"] = [resolved_query]
             action_key = json.dumps(
                 [decision.next_action, decision.provider, action_queries, decision.urls], ensure_ascii=False
             ).casefold()

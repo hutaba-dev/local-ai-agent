@@ -168,6 +168,25 @@ class MainToolLoopTests(unittest.TestCase):
         self.assertNotIn("browser_run_code_unsafe", exposed)
         self.assertNotIn("browser_file_upload", exposed)
 
+    def test_academic_selection_exposes_only_semantic_scholarly_tools(self) -> None:
+        client = SequencedClient([
+            {"role": "assistant", "content": '{"capabilities":["academic"]}'},
+            {"role": "assistant", "content": "연구자 근거를 조회할 준비가 됐습니다."},
+        ])
+        with patch.dict(os.environ, {
+            "MCP_ENABLED": "true", "MCP_ACADEMIC_ENABLED": "true",
+        }, clear=False):
+            AgentRuntime(client=client).chat(
+                "연구자의 identity와 source별 citation coverage를 평가해줘", "coding", allow_local_tools=False,
+            )
+
+        exposed = {tool["function"]["name"] for tool in client.requests[1]["tools"]}
+        self.assertEqual(exposed, {
+            "academic_resolve_researcher", "academic_search_publications",
+            "academic_get_researcher_evidence", "academic_compare_source_coverage",
+        })
+        self.assertTrue(all(not name.startswith(("scopus_", "wos_", "openalex_")) for name in exposed))
+
     def test_qwen_selects_capability_calls_tool_and_uses_observation(self) -> None:
         client = SequencedClient([
             {"role": "assistant", "content": '{"capabilities":["time"]}'},

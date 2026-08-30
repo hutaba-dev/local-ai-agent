@@ -65,7 +65,12 @@ CAPABILITIES = (
         "local_compute", "MCP_GIT_ENABLED",
         ("git_status", "git_diff", "git_log", "git_show", "git_blame", "git_branch_info"), "local_git",
     ),
-    CapabilitySpec("academic", "Academic Research", "Researcher identity, publications, citations, and source provenance.", "varies", "MCP_ACADEMIC_ENABLED", ("researcher_profile", "publication_search")),
+    CapabilitySpec(
+        "academic", "Academic Research",
+        "Use scholarly identity, publication, citation, DOI, and researcher metadata only when scholarly evidence materially improves the answer.",
+        "varies", "MCP_ACADEMIC_ENABLED",
+        ("academic_resolve_researcher", "academic_search_publications", "academic_get_researcher_evidence", "academic_compare_source_coverage"),
+    ),
     CapabilitySpec("project", "Project Knowledge", "Authorized project files, memories, conversations, and artifacts.", "local_compute", "MCP_PROJECT_ENABLED", ("project_search", "project_list_files", "project_read_file", "project_get_memories")),
     CapabilitySpec("image", "Image Work", "Generate or edit images through the existing AHN7 worker.", "gpu_compute", "MCP_IMAGE_ENABLED", ("generate_image", "edit_image", "adjust_face_pose")),
 )
@@ -103,8 +108,10 @@ TOOL_SPECS = {
     "git_show": AgentToolSpec("git_show", "git", "Read one local commit, tag, or branch.", "developer-mcp", "local_compute", "READ", _object({"revision": _string("Revision such as HEAD or a commit hash", 200), "relative_path": _string("Optional repository-relative path")})),
     "git_blame": AgentToolSpec("git_blame", "git", "Read line provenance for one repository-relative file.", "developer-mcp", "local_compute", "READ", _object({"relative_path": _string("Repository-relative file path"), "revision": _string("Revision", 200)}, ("relative_path",))),
     "git_branch_info": AgentToolSpec("git_branch_info", "git", "Read local branches and upstream tracking information without changing branches.", "developer-mcp", "local_compute", "READ", _object({})),
-    "researcher_profile": AgentToolSpec("researcher_profile", "academic", "Resolve a researcher identity and retrieve a normalized profile with provider-specific provenance.", "academic-mcp", "varies", "READ", _object({"query": _string("Researcher name or identity query")}, ("query",))),
-    "publication_search": AgentToolSpec("publication_search", "academic", "Search normalized scholarly publication metadata when academic evidence materially improves the answer.", "academic-mcp", "varies", "READ", _object({"query": _string("Focused publication query"), "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, ("query",))),
+    "academic_resolve_researcher": AgentToolSpec("academic_resolve_researcher", "academic", "Resolve who a researcher is from independent identity evidence before treating any provider profile as their corpus.", "academic-mcp", "varies", "READ", _object({"query": _string("Researcher name plus known affiliation, field, alias, or identifier", 500)}, ("query",))),
+    "academic_search_publications": AgentToolSpec("academic_search_publications", "academic", "Search a bounded scholarly metadata subset when scholarly evidence materially improves the answer; use Web or Browser later for publisher and full-page verification.", "academic-mcp", "varies", "READ", _object({"query": _string("Focused scholarly publication query", 500), "limit": {"type": "integer", "minimum": 1, "maximum": 10}}, ("query",))),
+    "academic_get_researcher_evidence": AgentToolSpec("academic_get_researcher_evidence", "academic", "Get bounded multi-source identity, corpus, representative-paper, and source-specific citation evidence for a researcher evaluation.", "academic-mcp", "varies", "READ", _object({"query": _string("Resolved researcher query with identity hints", 500)}, ("query",))),
+    "academic_compare_source_coverage": AgentToolSpec("academic_compare_source_coverage", "academic", "Compare source-specific publication and citation coverage without collapsing conflicts into one metric.", "academic-mcp", "varies", "READ", _object({"query": _string("Researcher query with identity hints", 500)}, ("query",))),
     "project_search": AgentToolSpec("project_search", "project", "Search authorized current-project files, memories, and conversations.", "project-mcp", "local_compute", "READ", _object({"query": _string("Current-project search query")}, ("query",))),
     "project_list_files": AgentToolSpec("project_list_files", "project", "List metadata for files in the authorized current project.", "project-mcp", "local_compute", "READ", _object({})),
     "project_read_file": AgentToolSpec("project_read_file", "project", "Read one authorized current-project file by opaque file ID.", "project-mcp", "local_compute", "READ", _object({"file_id": _string("Opaque project file ID", 100)}, ("file_id",))),
@@ -131,7 +138,19 @@ def capability_catalog(*, project_available: bool = False, image_available: bool
             configured = project_available
         elif capability.name == "image":
             configured = image_available
-        catalog.append({
+        provider_states: dict[str, str] | None = None
+        health = "AVAILABLE" if enabled and configured else ("UNCONFIGURED" if enabled else "DISABLED")
+        if capability.name == "academic" and enabled:
+            from runtime.academic_intelligence import academic_source_status
+
+            provider_states = academic_source_status()
+            usable = any(status in {"AVAILABLE_FULL", "AVAILABLE_LIMITED"} for status in provider_states.values())
+            configured = configured and usable
+            if configured and any(status not in {"AVAILABLE_FULL", "AVAILABLE_LIMITED"} for status in provider_states.values()):
+                health = "DEGRADED"
+            elif not configured:
+                health = "UNAVAILABLE"
+        entry: dict[str, object] = {
             "name": capability.name,
             "label": capability.label,
             "provider": capability.provider,
@@ -140,8 +159,11 @@ def capability_catalog(*, project_available: bool = False, image_available: bool
             "permission": capability.permission,
             "available": enabled and configured,
             "status": "AVAILABLE" if enabled and configured else ("UNCONFIGURED" if enabled else "DISABLED"),
-            "health": "AVAILABLE" if enabled and configured else ("UNCONFIGURED" if enabled else "DISABLED"),
-        })
+            "health": health,
+        }
+        if provider_states is not None:
+            entry["provider_states"] = provider_states
+        catalog.append(entry)
     return catalog
 
 

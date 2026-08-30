@@ -166,13 +166,78 @@ class MCPPhase1Tests(unittest.TestCase):
         self.assertFalse(failed[0]["success"])
         direct.assert_not_called()
 
+    def test_academic_executor_uses_mcp_without_duplicate_direct_calls(self) -> None:
+        search_outcome = MCPCallOutcome(
+            True, True, "academic_search_publications", "academic-mcp", "AVAILABLE",
+            {"status": "AVAILABLE", "publications": [{"title": "Evidence", "doi": "10.1/evidence"}]}, None, 3,
+        )
+        researcher_outcome = MCPCallOutcome(
+            True, True, "academic_get_researcher_evidence", "academic-mcp", "AVAILABLE",
+            {
+                "status": "AVAILABLE", "researcher": {"canonical_name": "Ada", "identity_confidence": "HIGH"},
+                "source_coverage": {"scopus": {"status": "AVAILABLE_FULL", "reported_publications": 10}},
+                "provider_states": {"scopus": "AVAILABLE_FULL"}, "coverage_conflicts": [],
+                "corpus": {"verified_count": 8}, "representative_papers": [],
+            }, None, 4,
+        )
+        flags = {"MCP_ENABLED": "true", "MCP_ACADEMIC_ENABLED": "true"}
+        with patch.dict(os.environ, flags, clear=False), patch(
+            "runtime.tool_registry.call_mcp_tool", side_effect=[search_outcome, researcher_outcome]
+        ) as mcp_call, patch("runtime.tool_registry._academic_papers") as direct_search, patch(
+            "runtime.tool_registry._academic_intelligence"
+        ) as direct_researcher:
+            search = execute_research_action("SEARCH_ACADEMIC", ("evidence topic",))
+            researcher = execute_research_action("LOOKUP_AUTHOR", ("Ada Researcher",))
+
+        self.assertTrue(search[0]["success"])
+        self.assertTrue(researcher[0]["success"])
+        self.assertEqual(mcp_call.call_count, 2)
+        direct_search.assert_not_called()
+        direct_researcher.assert_not_called()
+
+    def test_academic_executor_falls_back_only_before_mcp_execution(self) -> None:
+        fallback = ToolResult("academic_papers", True, "[]", None, 2)
+        unavailable = MCPCallOutcome(
+            False, False, "academic_search_publications", "academic-mcp", "UNAVAILABLE", None, "down", 1,
+        )
+        uncertain = MCPCallOutcome(
+            False, True, "academic_search_publications", "academic-mcp", "DEGRADED", None, "timeout", 21_000,
+        )
+        flags = {
+            "MCP_ENABLED": "true", "MCP_ACADEMIC_ENABLED": "true", "MCP_DIRECT_FALLBACK_ENABLED": "true",
+        }
+        with patch.dict(os.environ, flags, clear=False), patch(
+            "runtime.tool_registry.call_mcp_tool", return_value=unavailable
+        ), patch("runtime.tool_registry._academic_papers", return_value=fallback) as direct:
+            result = execute_research_action("SEARCH_ACADEMIC", ("topic",))
+        self.assertTrue(result[0]["success"])
+        direct.assert_called_once()
+
+        with patch.dict(os.environ, flags, clear=False), patch(
+            "runtime.tool_registry.call_mcp_tool", return_value=uncertain
+        ), patch("runtime.tool_registry._academic_papers", return_value=fallback) as direct:
+            result = execute_research_action("SEARCH_ACADEMIC", ("topic",))
+        self.assertFalse(result[0]["success"])
+        direct.assert_not_called()
+
     def test_feature_flag_catalog_replaces_provider_tools_with_mcp_capabilities(self) -> None:
-        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_SEARCH_ENABLED": "true", "MCP_FETCH_ENABLED": "true"}, clear=False):
+        with patch.dict(os.environ, {
+            "MCP_ENABLED": "true", "MCP_SEARCH_ENABLED": "true", "MCP_FETCH_ENABLED": "true",
+            "MCP_ACADEMIC_ENABLED": "true",
+        }, clear=False):
             catalog = research_tool_catalog()
 
         names = {str(tool["name"]) for tool in catalog}
         self.assertTrue({"search_web", "search_news", "fetch_page"} <= names)
         self.assertTrue({"searxng", "serper", "brave", "secure_page_fetch"}.isdisjoint(names))
+        self.assertTrue({
+            "academic_resolve_researcher", "academic_search_publications",
+            "academic_get_researcher_evidence", "academic_compare_source_coverage",
+        } <= names)
+        self.assertTrue({
+            "academic_papers", "academic_intelligence", "scopus", "web_of_science",
+            "openalex", "semantic_scholar", "crossref", "orcid",
+        }.isdisjoint(names))
         self.assertTrue({"git_status", "query_documentation", "resolve_library_id"}.isdisjoint(names))
 
     def test_disabled_mcp_does_not_start_discovery(self) -> None:

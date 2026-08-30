@@ -7,6 +7,7 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from time import monotonic
 from typing import Callable, Iterable
@@ -29,9 +30,11 @@ TRANSIENT_FAILURE_TTL_SECONDS = 60
 class SourceStatus(str, Enum):
     AVAILABLE_FULL = "AVAILABLE_FULL"
     AVAILABLE_LIMITED = "AVAILABLE_LIMITED"
+    UNCONFIGURED = "UNCONFIGURED"
     NO_ENTITLEMENT = "NO_ENTITLEMENT"
     RATE_LIMITED = "RATE_LIMITED"
     UNAVAILABLE = "UNAVAILABLE"
+    ERROR = "ERROR"
 
 
 @dataclass(frozen=True)
@@ -101,12 +104,17 @@ def _provider_failure(source: str, error: BaseException) -> AcademicSourceResult
             status = SourceStatus.RATE_LIMITED
         elif status_code in {401, 403}:
             status = SourceStatus.NO_ENTITLEMENT
+        elif 400 <= status_code < 500:
+            status = SourceStatus.ERROR
         else:
             status = SourceStatus.UNAVAILABLE
         reason = f"http_{status_code}"
     elif isinstance(error, httpx.TimeoutException):
         status = SourceStatus.UNAVAILABLE
         reason = "timeout"
+    elif isinstance(error, (ValueError, TypeError)):
+        status = SourceStatus.ERROR
+        reason = "invalid_provider_response"
     else:
         status = SourceStatus.UNAVAILABLE
         reason = "network_or_parse_error"
@@ -198,12 +206,12 @@ def scopus_get_citation_overview(scopus_ids: Iterable[str], date_range: str | No
 
 
 def _wos_headers() -> dict[str, str] | None:
-    api_key = os.getenv("WOS_API_KEY")
+    api_key = _ascii_credential(os.getenv("WOS_API_KEY"))
     return {"X-ApiKey": api_key} if api_key else None
 
 
 def _wos_researcher_headers() -> dict[str, str] | None:
-    api_key = os.getenv("WOS_RESEARCHER_API_KEY")
+    api_key = _ascii_credential(os.getenv("WOS_RESEARCHER_API_KEY"))
     return {"X-ApiKey": api_key} if api_key else None
 
 
@@ -249,16 +257,17 @@ def wos_get_citation_metrics(query: str, limit: int = 50) -> dict[str, object]:
 
 
 def _name_from_query(query: str) -> str:
-    quoted_korean = re.search(r'["“”]([가-힣]{2,5})["“”]', query)
+    primary_query = query.splitlines()[0].strip()
+    quoted_korean = re.search(r'["“”]([가-힣]{2,5})["“”]', primary_query)
     if quoted_korean:
         return quoted_korean.group(1)
-    korean = re.search(r"([가-힣]{2,5})\s*(?:교수|박사|연구자|학자)", query)
+    korean = re.search(r"([가-힣]{2,5})\s*(?:교수|박사|연구자|학자)", primary_query)
     if korean:
         return korean.group(1)
     cleaned = re.sub(
         r"\s+(?:professor|researcher|academic|scientist|ph\.?d\.?)\s*$",
         " ",
-        query,
+        primary_query,
         flags=re.IGNORECASE,
     )
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
@@ -338,7 +347,7 @@ def _scopus_documents(payload: dict[str, object]) -> list[dict[str, object]]:
 
 def _scopus_provider(query: str) -> AcademicSourceResult:
     if _scopus_headers() is None:
-        return AcademicSourceResult("scopus", SourceStatus.UNAVAILABLE, error="SCOPUS_API_KEY is not configured")
+        return AcademicSourceResult("scopus", SourceStatus.UNCONFIGURED, error="SCOPUS_API_KEY is not configured")
     names = _academic_aliases(query) or (_name_from_query(query),)
     try:
         identities: list[dict[str, object]] = []
@@ -412,21 +421,29 @@ def _scopus_affiliation_matches(identity: dict[str, object], affiliation_hint: s
 
 
 def _wos_provider(query: str) -> AcademicSourceResult:
-    if _wos_headers() is None:
-        return AcademicSourceResult("web_of_science", SourceStatus.UNAVAILABLE, error="WOS_API_KEY is not configured")
+    document_configured = _wos_headers() is not None
+    researcher_configured = _wos_researcher_headers() is not None
+    if not document_configured and not researcher_configured:
+        return AcademicSourceResult("web_of_science", SourceStatus.UNCONFIGURED, error="WoS credentials are not configured")
     name = _lookup_name(query)
-    researcher_error: str | None = None
+    researcher_error: str | None = None if researcher_configured else "UNCONFIGURED"
     identities: list[dict[str, object]] = []
-    try:
-        researcher_payload = wos_search_researchers(name)
-        identities = _wos_researcher_entries(researcher_payload)
-    except httpx.HTTPStatusError as error:
-        if error.response.status_code in {401, 403, 404}:
-            researcher_error = f"researcher_api_http_{error.response.status_code}"
-        else:
-            return _provider_failure("web_of_science", error)
-    except (httpx.HTTPError, RuntimeError, ValueError) as error:
-        researcher_error = type(error).__name__
+    if researcher_configured:
+        try:
+            researcher_payload = wos_search_researchers(name)
+            identities = _wos_researcher_entries(researcher_payload)
+        except httpx.HTTPStatusError as error:
+            if error.response.status_code in {401, 403, 404}:
+                researcher_error = f"researcher_api_http_{error.response.status_code}"
+            else:
+                return _provider_failure("web_of_science", error)
+        except (httpx.HTTPError, RuntimeError, ValueError) as error:
+            researcher_error = type(error).__name__
+    if not document_configured:
+        return AcademicSourceResult(
+            "web_of_science", SourceStatus.AVAILABLE_LIMITED if identities else SourceStatus.NO_ENTITLEMENT,
+            tuple(identities), details={"researcher_api": researcher_error or "available", "document_api": "UNCONFIGURED"},
+        )
     try:
         documents_payload = wos_search_documents(f'AU=("{name}")')
         publications = _wos_documents(documents_payload)
@@ -624,9 +641,9 @@ def _google_scholar_provider(query: str) -> AcademicSourceResult:
 
 def academic_source_status() -> dict[str, str]:
     return {
-        "scopus": SourceStatus.AVAILABLE_LIMITED.value if _scopus_headers() else SourceStatus.UNAVAILABLE.value,
-        "web_of_science": SourceStatus.AVAILABLE_LIMITED.value if _wos_headers() else SourceStatus.UNAVAILABLE.value,
-        "google_scholar": SourceStatus.AVAILABLE_LIMITED.value if os.getenv("BRAVE_SEARCH_API_KEY") else SourceStatus.UNAVAILABLE.value,
+        "scopus": SourceStatus.AVAILABLE_LIMITED.value if _scopus_headers() else SourceStatus.UNCONFIGURED.value,
+        "web_of_science": SourceStatus.AVAILABLE_LIMITED.value if (_wos_headers() or _wos_researcher_headers()) else SourceStatus.UNCONFIGURED.value,
+        "google_scholar": SourceStatus.AVAILABLE_LIMITED.value if os.getenv("BRAVE_SEARCH_API_KEY") else SourceStatus.UNCONFIGURED.value,
         "openalex": SourceStatus.AVAILABLE_FULL.value,
         "semantic_scholar": SourceStatus.AVAILABLE_LIMITED.value,
         "orcid": SourceStatus.AVAILABLE_FULL.value,
@@ -636,7 +653,8 @@ def academic_source_status() -> dict[str, str]:
 
 def academic_intelligence(query: str) -> dict[str, object]:
     identity_names = (_name_from_query(query), *_academic_aliases(query))
-    cache_key = f"academic-intelligence:{'|'.join(_normalize_name(name) for name in identity_names)}"
+    affiliation = _affiliation_hint(query) or ""
+    cache_key = f"academic-intelligence:{'|'.join(_normalize_name(name) for name in identity_names)}:{_normalize_name(affiliation)}"
     cached = _CACHE.get(cache_key)
     if isinstance(cached, dict):
         return cached | {"cache_hit": True}
@@ -645,15 +663,15 @@ def academic_intelligence(query: str) -> dict[str, object]:
     if _scopus_headers():
         curated["scopus"] = _scopus_provider
     else:
-        results.append(AcademicSourceResult("scopus", SourceStatus.UNAVAILABLE, error="SCOPUS_API_KEY is not configured"))
-    if _wos_headers():
+        results.append(AcademicSourceResult("scopus", SourceStatus.UNCONFIGURED, error="SCOPUS_API_KEY is not configured"))
+    if _wos_headers() or _wos_researcher_headers():
         curated["web_of_science"] = _wos_provider
     else:
-        results.append(AcademicSourceResult("web_of_science", SourceStatus.UNAVAILABLE, error="WOS_API_KEY is not configured"))
+        results.append(AcademicSourceResult("web_of_science", SourceStatus.UNCONFIGURED, error="WOS_API_KEY is not configured"))
     if os.getenv("BRAVE_SEARCH_API_KEY"):
         curated["google_scholar"] = _google_scholar_provider
     else:
-        results.append(AcademicSourceResult("google_scholar", SourceStatus.UNAVAILABLE, error="BRAVE_SEARCH_API_KEY is not configured"))
+        results.append(AcademicSourceResult("google_scholar", SourceStatus.UNCONFIGURED, error="BRAVE_SEARCH_API_KEY is not configured"))
     if curated:
         results.extend(_run_providers(query, curated))
     fallback: dict[str, Callable[[str], AcademicSourceResult]] = {
@@ -711,6 +729,7 @@ def _curated_sources_agree(results: list[AcademicSourceResult]) -> bool:
 
 
 def _aggregate_intelligence(query: str, results: list[AcademicSourceResult]) -> dict[str, object]:
+    retrieved_at = datetime.now(timezone.utc).isoformat()
     target_name = _name_from_query(query)
     aliases = _academic_aliases(query)
     identity = _resolve_identity(target_name, aliases, results)
@@ -742,6 +761,7 @@ def _aggregate_intelligence(query: str, results: list[AcademicSourceResult]) -> 
                 "metrics": result.metrics,
                 "error": result.error,
                 "details": result.details,
+                "retrieved_at": retrieved_at,
             }
             for result in results
         },
@@ -752,6 +772,7 @@ def _aggregate_intelligence(query: str, results: list[AcademicSourceResult]) -> 
         "merged_verified_corpus": verified_corpus,
         "merged_publication_count": len(verified_corpus),
         "representative_papers": _representative_papers(verified_corpus),
+        "retrieved_at": retrieved_at,
         "pipeline": [
             "IDENTITY_RESOLUTION", "AUTHOR_IDENTIFIER_RESOLUTION", "MULTI_SOURCE_PUBLICATION_DISCOVERY",
             "DEDUPLICATION", "AUTHORSHIP_VERIFICATION", "COVERAGE_CHECK", "CITATION_METRIC_CROSS_CHECK",
@@ -799,7 +820,31 @@ def _resolve_identity(
         if isinstance(affiliation, str) and affiliation
     })
     exact_names = {_normalize_name(str(identity.get("name", ""))) for identity in matching}
-    if len(sources) >= 2 and len(exact_names) == 1 and affiliations and any(identifiers.values()):
+    source_candidate_counts = {
+        source: sum(1 for identity in matching if identity.get("source") == source)
+        for source in sources
+    }
+    split_profile_sources = sorted(source for source, count in source_candidate_counts.items() if count > 1)
+    affiliations_by_source = {
+        source: {
+            _normalize_name(affiliation)
+            for identity in matching if identity.get("source") == source
+            for affiliation in identity.get("affiliations", [])
+            if isinstance(affiliation, str) and affiliation
+        }
+        for source in sources
+    }
+    nonempty_source_affiliations = [values for values in affiliations_by_source.values() if values]
+    cross_source_affiliation_conflict = (
+        len(nonempty_source_affiliations) >= 2
+        and not set.intersection(*nonempty_source_affiliations)
+    )
+    possible_split_profile = bool(split_profile_sources) or cross_source_affiliation_conflict
+    if split_profile_sources:
+        confidence = "AMBIGUOUS"
+    elif cross_source_affiliation_conflict:
+        confidence = "MEDIUM"
+    elif len(sources) >= 2 and len(exact_names) == 1 and affiliations and any(identifiers.values()):
         confidence = "HIGH"
     elif len(sources) >= 2 and len(exact_names) <= 2:
         confidence = "MEDIUM"
@@ -826,6 +871,9 @@ def _resolve_identity(
         "confidence": confidence,
         "identity_sources": sources,
         "candidate_count": len(matching),
+        "possible_split_profile": possible_split_profile,
+        "split_profile_sources": split_profile_sources or (sources if cross_source_affiliation_conflict else []),
+        "official_profile": None,
     }
 
 
@@ -833,17 +881,23 @@ def _merge_publications(
     results: list[AcademicSourceResult], identity_confidence: object, target_names: tuple[str, ...]
 ) -> list[dict[str, object]]:
     merged: dict[str, dict[str, object]] = {}
+    retrieved_at_by_source = {result.source: datetime.now(timezone.utc).isoformat() for result in results}
     for result in results:
         for publication in result.publications:
             title = str(publication.get("title", "")).strip()
             if not title:
                 continue
-            key = _publication_key(publication)
+            key = _matching_publication_key(merged, publication)
             existing = merged.get(key)
             if existing is None:
                 existing = dict(publication)
                 existing["sources"] = sorted(set(publication.get("sources", [])) | {result.source})
                 existing["source_ids"] = dict(publication.get("source_ids", {}))
+                existing["source_records"] = [{
+                    "source": result.source,
+                    "source_record_ids": dict(publication.get("source_ids", {})),
+                    "retrieved_at": retrieved_at_by_source[result.source],
+                }]
                 existing["verified_author_profile_source"] = (
                     result.source in {"scopus", "web_of_science"} and len(result.identities) == 1
                 )
@@ -851,6 +905,11 @@ def _merge_publications(
             else:
                 existing["sources"] = sorted(set(existing.get("sources", [])) | set(publication.get("sources", [])) | {result.source})
                 existing.setdefault("source_ids", {}).update(publication.get("source_ids", {}))
+                existing.setdefault("source_records", []).append({
+                    "source": result.source,
+                    "source_record_ids": dict(publication.get("source_ids", {})),
+                    "retrieved_at": retrieved_at_by_source[result.source],
+                })
                 existing["verified_author_profile_source"] = bool(
                     existing.get("verified_author_profile_source")
                     or result.source in {"scopus", "web_of_science"} and len(result.identities) == 1
@@ -895,6 +954,35 @@ def _publication_key(publication: dict[str, object]) -> str:
     authors = publication.get("authors")
     author_key = "|".join(sorted(_normalize_name(str(author)) for author in authors)) if isinstance(authors, list) else ""
     return f"title:{title}:{year or ''}:{author_key[:200]}"
+
+
+def _matching_publication_key(
+    merged: dict[str, dict[str, object]], publication: dict[str, object]
+) -> str:
+    key = _publication_key(publication)
+    if key.startswith("doi:") or key in merged:
+        return key
+    title = _normalize_title(str(publication.get("title", "")))
+    year = _to_int(publication.get("year"))
+    authors = {
+        _normalize_name(str(author)) for author in publication.get("authors", [])
+        if isinstance(author, str)
+    }
+    venue = _normalize_title(str(publication.get("journal", "")))
+    for candidate_key, candidate in merged.items():
+        if candidate.get("doi") or _normalize_title(str(candidate.get("title", ""))) != title:
+            continue
+        if _to_int(candidate.get("year")) != year:
+            continue
+        candidate_authors = {
+            _normalize_name(str(author)) for author in candidate.get("authors", [])
+            if isinstance(author, str)
+        }
+        overlap = len(authors & candidate_authors) / max(1, len(authors | candidate_authors))
+        candidate_venue = _normalize_title(str(candidate.get("journal", "")))
+        if overlap >= 0.5 or bool(venue and venue == candidate_venue):
+            return candidate_key
+    return key
 
 
 def _coverage_conflicts(
@@ -946,6 +1034,12 @@ def _coverage_conflicts(
         conflicts.append({"type": "affiliation_mismatch", "assessment": "identity_verification_required"})
     if identity.get("identity_confidence") in {"LOW", "AMBIGUOUS", "UNRESOLVED"}:
         conflicts.append({"type": "identity_unresolved", "assessment": "additional_identifier_verification_required"})
+    if identity.get("possible_split_profile"):
+        conflicts.append({
+            "type": "possible_split_profile",
+            "sources": identity.get("split_profile_sources", []),
+            "assessment": "merge_candidate_requires_affiliation_or_identifier_verification",
+        })
     return conflicts
 
 
@@ -956,11 +1050,20 @@ def _representative_papers(corpus: list[dict[str, object]]) -> list[dict[str, ob
     recent = sorted(corpus, key=lambda item: _to_int(item.get("year")) or 0, reverse=True)[:3]
     selected: list[dict[str, object]] = []
     seen: set[str] = set()
+    highly_cited = {_publication_key(paper) for paper in by_citations}
+    recent_keys = {_publication_key(paper) for paper in recent}
     for paper in (*by_citations, *recent):
         key = _publication_key(paper)
         if key not in seen:
             seen.add(key)
-            selected.append(paper)
+            reasons = []
+            if key in highly_cited:
+                reasons.append("highly_cited")
+            if key in recent_keys:
+                reasons.append("recent")
+            if len(paper.get("sources", [])) >= 2:
+                reasons.append("multi_source_verified")
+            selected.append({**paper, "selection_reasons": reasons})
     return selected[:8]
 
 

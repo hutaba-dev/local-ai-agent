@@ -43,7 +43,7 @@ Web of Science endpoints used:
 
 Use `WOS_API_KEY` for Starter and `WOS_RESEARCHER_API_KEY` for Researcher. WoS Researcher API requires a paid license in addition to a Web of Science subscription. Starter API has separate plans; the free trial omits times-cited and is limited to 50 requests per day, while institutional plans can include citation counts and higher quotas.
 
-On this server, no Scopus or WoS credentials were configured during implementation. Unauthenticated probes returned HTTP 401. The runtime therefore reports these sources as unavailable and continues with public sources.
+On this server, no Scopus or WoS credentials were configured during implementation. The runtime reports these sources as `UNCONFIGURED` and continues with public sources without sending unauthenticated probes.
 
 ## Source State
 
@@ -51,9 +51,11 @@ Each attempted source reports one of:
 
 - `AVAILABLE_FULL`: requested profile/document fields were returned
 - `AVAILABLE_LIMITED`: search or public metadata is available but profile, citation, or entitlement-dependent fields are incomplete
+- `UNCONFIGURED`: the required provider credential is absent
 - `NO_ENTITLEMENT`: the provider returned HTTP 401 or 403
 - `RATE_LIMITED`: the provider returned HTTP 429
-- `UNAVAILABLE`: credential missing, network/parse failure, or no accessible public profile
+- `UNAVAILABLE`: provider/network failure or no accessible public profile
+- `ERROR`: a non-authentication provider request or response error
 
 Missing credentials and subscription limits never fail the entire Research request.
 
