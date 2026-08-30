@@ -412,6 +412,8 @@ function activityElement(activity) {
     `<div>${escapeHtml(stage.name)}: ${formatMs(stage.duration_ms)}</div>`
   )).join("") || "No timed stages";
   const rows = [
+    ["Brain", activity.brain || "KIM"], ["Role", activity.role?.name || activity.routed_agent],
+    ["Capabilities used", (activity.capabilities_used || []).join(", ") || "None"],
     ["Selected", activity.selected_agent], ["Route", activity.direct ? `Direct ${activity.routed_agent}` : `Main → ${activity.routed_agent}`],
     ["Summary", activity.route_summary], ["Time", `${(activity.duration_ms / 1000).toFixed(1)} sec`],
     ["End-to-end rate", activity.end_to_end_tokens_per_second ? `${activity.end_to_end_tokens_per_second} tok/s` : "N/A"],

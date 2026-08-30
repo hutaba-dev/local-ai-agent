@@ -464,7 +464,10 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(admin.get("/api/me").json()["session_idle_timeout_seconds"], 86_400)
         self.assertEqual(manager.get("/api/me").json()["session_idle_timeout_seconds"], 1_800)
         self.assertEqual(guest.get("/api/me").json()["session_idle_timeout_seconds"], 900)
-        self.assertEqual(admin.get("/api/agents").json(), manager.get("/api/agents").json())
+        admin_agents = {agent["id"] for agent in admin.get("/api/agents").json()["agents"]}
+        manager_agents = {agent["id"] for agent in manager.get("/api/agents").json()["agents"]}
+        self.assertEqual(admin_agents, {"auto", "main", "coding", "research"})
+        self.assertEqual(manager_agents, {"auto", "main", "research"})
 
     def test_existing_user_database_is_migrated_for_manager_role(self) -> None:
         database_path = Path(self.temporary_directory.name) / "legacy-users.sqlite3"
@@ -1206,7 +1209,7 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(coding.status_code, 403)
         self.assertFalse(self.fake_client.requests)
 
-    def test_admin_browser_blocks_direct_server_and_falls_back_for_auto_server_route(self) -> None:
+    def test_admin_browser_exposes_coding_but_blocks_direct_server(self) -> None:
         previous_runtime = web_app.runtime
         web_app.runtime = self.runtime
         try:
@@ -1219,9 +1222,12 @@ class WebRuntimeTests(unittest.TestCase):
         finally:
             web_app.runtime = previous_runtime
 
-        self.assertEqual({agent["id"] for agent in agents}, {"auto", "main", "research"})
+        self.assertEqual({agent["id"] for agent in agents}, {"auto", "main", "coding", "research"})
+        self.assertEqual(next(agent["label"] for agent in agents if agent["id"] == "coding"), "KIM / Coding")
         self.assertEqual(direct.status_code, 403)
-        self.assertEqual(coding.status_code, 403)
+        self.assertEqual(coding.status_code, 200)
+        self.assertEqual(coding.json()["activity"]["brain"], "KIM")
+        self.assertEqual(coding.json()["activity"]["role"], {"id": "coder", "name": "KIM / Coding"})
         self.assertEqual(automatic.status_code, 200)
         self.assertEqual(automatic.json()["activity"]["routed_agent"], "main")
         run_tools.assert_not_called()
@@ -1240,19 +1246,20 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(response.json()["activity"]["routed_agent"], "main")
         run_tools.assert_not_called()
 
-    def test_admin_auto_coding_route_falls_back_to_main(self) -> None:
+    def test_admin_auto_coding_route_uses_coding_role(self) -> None:
         previous_runtime = web_app.runtime
         web_app.runtime = self.runtime
         try:
             admin = self.authenticated_client()
-            with patch("runtime.agent_runtime.run_agent_tools") as run_tools:
+            with patch("runtime.agent_runtime.run_agent_tools", return_value=[]) as run_tools:
                 response = admin.post("/api/chat", json={"message": "이 코드 파일의 오류를 설명해줘"})
         finally:
             web_app.runtime = previous_runtime
 
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["activity"]["routed_agent"], "main")
-        run_tools.assert_not_called()
+        self.assertEqual(response.json()["activity"]["routed_agent"], "coding")
+        self.assertEqual(response.json()["activity"]["role"]["id"], "coder")
+        run_tools.assert_called_once()
 
     def test_guest_research_has_no_local_project_tools(self) -> None:
         previous_runtime = web_app.runtime

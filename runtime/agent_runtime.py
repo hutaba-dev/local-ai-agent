@@ -21,6 +21,7 @@ from hangul_romanize.rule import academic as academic_romanization
 
 from runtime.capability_registry import capability_catalog, detailed_tools
 from runtime.mcp_host import call_mcp_tool
+from runtime.role_registry import get_role
 from runtime.router import Route, route_request
 from runtime.sessions import SessionStore
 from runtime.tool_registry import (
@@ -264,9 +265,9 @@ class AgentRuntime:
             ]
             if public_context:
                 messages.append({"role": "user", "content": public_context})
-            if route.agent == "main":
+            if route.agent in {"main", "coding"}:
                 answer, payload, dynamic_tools = self._run_main_tool_loop(
-                    message, messages, self._max_tokens(route), latency, project_scope,
+                    message, messages, self._max_tokens(route), latency, project_scope, route.agent,
                 )
                 tools.extend(dynamic_tools)
             else:
@@ -298,7 +299,9 @@ class AgentRuntime:
         max_tokens: int,
         latency: LatencyRecorder,
         project_scope: ProjectToolScope | None,
+        agent: str = "main",
     ) -> tuple[str, dict[str, object], list[dict[str, object]]]:
+        role = get_role(agent)
         catalog = capability_catalog(project_available=project_scope is not None, image_available=False)
         available = [item for item in catalog if item["available"]]
         if not available:
@@ -309,11 +312,17 @@ class AgentRuntime:
             "content": (
                 "Select only capabilities materially required to answer the request. Return JSON only as "
                 '{"capabilities":["name"]}. Use an empty list when model knowledge is sufficient. '
-                "Never select unavailable capabilities."
+                "Never select unavailable capabilities. The active role is a primary expertise, not a restriction; "
+                "combine another capability when it materially improves the result."
             ),
         }, {
             "role": "user",
-            "content": json.dumps({"request": message, "catalog": available}, ensure_ascii=False),
+            "content": json.dumps({
+                "request": message,
+                "role": role.id,
+                "preferred_capabilities": role.preferred_capabilities,
+                "catalog": available,
+            }, ensure_ascii=False),
         }]
         selection, _ = self._complete(selector_messages, 200, latency, "capability_selection", temperature=0)
         try:
@@ -1146,10 +1155,11 @@ class AgentRuntime:
         return RESEARCH_MAX_TOKENS if route.agent == "research" else DEFAULT_MAX_TOKENS
 
     def _load_prompt(self, agent: str) -> str:
+        role = get_role(agent)
         files = [AGENT_DIR / "common" / "constitution.md"]
         if agent in {"main", "research"}:
             files.append(AGENT_DIR / "common" / "memory-policy.md")
-        files.append(AGENT_DIR / agent / "instructions.md")
+        files.append(REPO_ROOT / role.instructions_path)
         content = "\n\n".join(path.read_text(encoding="utf-8") for path in files)
         return (
             "Follow the loaded agent policy. Answer in the user's language. "

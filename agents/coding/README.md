@@ -1,8 +1,8 @@
 # Coding Agent
 
-This is the first reusable workspace agent role. It uses Qwen through the local
-OpenAI-compatible endpoint while keeping model configuration separate from the
-role instructions.
+Coding is a reusable specialist role used by the shared KIM/Qwen brain. It is
+not a separate model or server. VS Code is one client and defaults to this role;
+the Web runtime can select it while retaining the same central model.
 
 | Concern | Location |
 | --- | --- |
@@ -10,7 +10,7 @@ role instructions.
 | Coding workflow | [instructions.md](instructions.md) |
 | Non-secret endpoint template | [qwen-openai.env.example](qwen-openai.env.example) |
 
-The required tool set is file listing/search/read, file edit/write, terminal,
-Python, Git status/diff, and a test runner. Web and MCP access remain opt-in
-permissions. Research, Server, and Secretary roles should reuse the common
-constitution and add only their role-specific workflow.
+The stable default set is workspace read/search/edit and safe execution.
+Documentation, read-only Git/GitHub, Project Knowledge, and Web Research are
+discovered on demand under host policy. Research, Server, and Secretary roles
+reuse the common constitution and the same model.

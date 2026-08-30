@@ -7,6 +7,10 @@ conversation and secretary-style coordination, then delegates specialist work
 only when appropriate. Qwen remains a separate local OpenAI-compatible model
 backend; agent roles are client-side instruction and workflow bundles.
 
+`runtime/role_registry.py` is the canonical role metadata registry. KIM is the
+brain identity; Secretary, Coding, Research, Image Director, Server, Analyst,
+and Critic are roles using the same Qwen backend.
+
 ```mermaid
 flowchart LR
     User --> Main[Main Agent]
@@ -16,6 +20,9 @@ flowchart LR
     Main -->|Chat Completions| Qwen[Qwen vLLM API]
     Coding -->|Chat Completions| Qwen
 ```
+
+  See [coding-role-architecture.md](coding-role-architecture.md) for capability,
+  permission, VS Code client, Project Memory, and observability details.
 
 Main, Coding, Research, and Server are active roles. They are instruction and
 workflow bundles, not background processes. No additional role is created until

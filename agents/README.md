@@ -4,6 +4,10 @@ Agent orchestration profiles and non-secret client configuration belong here.
 They communicate with the vLLM OpenAI-compatible endpoint and do not own the
 serving process.
 
+KIM/Qwen is the shared central brain. Roles are registered in
+`runtime/role_registry.py` and vary instructions, capabilities, permissions,
+memory policy, and output preferences without creating role-specific models.
+
 All agent roles inherit [common/constitution.md](common/constitution.md). The
 first implementation is documented in [coding/README.md](coding/README.md).
 The Main Agent is the default user-facing coordinator; see

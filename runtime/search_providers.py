@@ -487,17 +487,17 @@ def normalize_query(query: str) -> str:
 def canonicalize_url(url: str) -> str:
     try:
         parsed = urlsplit(url.strip())
+        host = (parsed.hostname or "").lower().removeprefix("www.")
+        port = f":{parsed.port}" if parsed.port and parsed.port not in {80, 443} else ""
+        path = re.sub(r"/{2,}", "/", parsed.path or "/")
+        if path != "/":
+            path = path.rstrip("/")
+        query = urlencode(sorted(
+            (key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if not key.lower().startswith("utm_") and key.lower() not in TRACKING_PARAMETERS
+        ))
     except ValueError:
         return url.strip()
-    host = (parsed.hostname or "").lower().removeprefix("www.")
-    port = f":{parsed.port}" if parsed.port and parsed.port not in {80, 443} else ""
-    path = re.sub(r"/{2,}", "/", parsed.path or "/")
-    if path != "/":
-        path = path.rstrip("/")
-    query = urlencode(sorted(
-        (key, value) for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-        if not key.lower().startswith("utm_") and key.lower() not in TRACKING_PARAMETERS
-    ))
     return urlunsplit((parsed.scheme.lower(), host + port, path, query, ""))
 
 

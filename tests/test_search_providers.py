@@ -183,6 +183,27 @@ class SearchProviderTests(unittest.TestCase):
         self.assertEqual(len(matches), 1)
         self.assertEqual(matches[0]["providers_seen"], ["searxng", "serper"])
 
+    def test_canonicalize_url_tolerates_invalid_port(self):
+        self.assertEqual(canonicalize_url("http://example.com:abc/path"), "http://example.com:abc/path")
+        self.assertEqual(canonicalize_url("  http://example.com:abc/path  "), "http://example.com:abc/path")
+
+    def test_canonicalize_url_preserves_normalization(self):
+        self.assertEqual(
+            canonicalize_url("https://www.example.com:8080//a//b?utm_source=x&b=2&a=1"),
+            "https://example.com:8080/a/b?a=1&b=2",
+        )
+        self.assertEqual(canonicalize_url("https://example.com:80/x"), "https://example.com/x")
+
+    def test_merge_results_tolerates_invalid_url(self):
+        from runtime.search_providers import _merge_results
+
+        merged = _merge_results(
+            [search_result("searxng", 1, "http://example.com:abc/path")],
+            [search_result("serper", 1, "http://example.com:abc/path")],
+        )
+        self.assertEqual(len(merged), 1)
+        self.assertEqual(merged[0].providers_seen, ("searxng", "serper"))
+
     def test_adapters_normalize_provider_specific_responses(self):
         searx = JsonResponse({"results": [{"title": "SearX", "url": "https://example.com/a", "content": "Snippet", "engine": "duckduckgo", "score": 1.5}]})
         serper = JsonResponse({"organic": [{"title": "Serper", "link": "https://example.com/b", "snippet": "Snippet"}]})

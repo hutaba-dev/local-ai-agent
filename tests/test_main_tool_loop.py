@@ -31,6 +31,40 @@ class SequencedClient:
 
 
 class MainToolLoopTests(unittest.TestCase):
+    def test_coding_role_can_select_current_documentation_without_becoming_a_separate_model(self) -> None:
+        client = SequencedClient([
+            {"role": "assistant", "content": '{"capabilities":["documentation"]}'},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "call_docs",
+                    "type": "function",
+                    "function": {
+                        "name": "resolve_library_id",
+                        "arguments": '{"library_name":"FastAPI","query":"deprecated APIs"}',
+                    },
+                }],
+            },
+            {"role": "assistant", "content": "현재 문서를 확인한 결과입니다."},
+        ])
+        outcome = MCPCallOutcome(
+            True, True, "resolve_library_id", "context7-mcp", "AVAILABLE",
+            {"status": "AVAILABLE", "source": "Context7", "text": "/fastapi/fastapi"}, None, 1,
+        )
+        with patch.dict(os.environ, {"MCP_ENABLED": "true"}, clear=False), patch(
+            "runtime.agent_runtime.call_mcp_tool", return_value=outcome
+        ):
+            result = AgentRuntime(client=client).chat(
+                "FastAPI API가 deprecated인지 확인해줘", "coding", allow_local_tools=False
+            )
+
+        selector_input = client.requests[0]["messages"][1]["content"]
+        self.assertIn('"role": "coder"', selector_input)
+        self.assertEqual(result.route.agent, "coding")
+        self.assertEqual(result.tools[0]["capability"], "documentation")
+        self.assertEqual(result.tools[0]["action"], "READ")
+
     def test_qwen_selects_capability_calls_tool_and_uses_observation(self) -> None:
         client = SequencedClient([
             {"role": "assistant", "content": '{"capabilities":["time"]}'},

@@ -10,9 +10,10 @@ from typing import Iterable
 
 class PermissionClass(str, Enum):
     READ = "READ"
-    WRITE_SAFE = "WRITE_SAFE"
-    WRITE_SENSITIVE = "WRITE_SENSITIVE"
-    ADMIN = "ADMIN"
+    WRITE_WORKSPACE = "WRITE_WORKSPACE"
+    EXECUTE_SAFE = "EXECUTE_SAFE"
+    WRITE_REPOSITORY = "WRITE_REPOSITORY"
+    DESTRUCTIVE = "DESTRUCTIVE"
 
 
 @dataclass(frozen=True)

@@ -38,6 +38,7 @@ from runtime.image_client import (
 )
 from runtime.projects import ProjectNotFoundError, ProjectPathError, ProjectStorageOfflineError, ProjectStore
 from runtime.project_tools import ProjectTools
+from runtime.role_registry import get_role, selectable_roles
 from runtime.router import AGENT_CHOICES
 from runtime.tool_registry import ProjectToolScope
 from runtime.web_search import fetch_visual_thumbnails, search, visual_search
@@ -71,7 +72,7 @@ ATTACHMENT_DIRECTORY = Path(os.getenv("WEB_ATTACHMENT_DIRECTORY", "/var/lib/loca
 ATTACHMENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{20,64}$")
 GENERATED_IMAGE_TEXT = "Generated image retained for follow-up editing."
 ROLE_ALLOWED_AGENTS = {
-    "admin": frozenset({"auto", "main", "research"}),
+    "admin": frozenset({"auto", "main", "coding", "research"}),
     "manager": frozenset({"auto", "main", "research"}),
     "guest": frozenset({"auto", "main", "research"}),
 }
@@ -395,12 +396,10 @@ def health() -> dict[str, object]:
 @app.get("/api/agents")
 def agents(request: Request) -> dict[str, object]:
     permitted_agents = allowed_agents(current_user(request))
-    available_agents = [
-        {"id": "auto", "label": "AUTO / Main"},
-        {"id": "main", "label": "Main / Secretary"},
-        {"id": "coding", "label": "Coding"},
-        {"id": "research", "label": "Research"},
-    ]
+    available_agents = [{"id": "auto", "label": "KIM / Auto"}, *[
+        {"id": role.runtime_agent, "label": role.name, "role": role.id}
+        for role in selectable_roles()
+    ]]
     return {
         "agents": [agent for agent in available_agents if agent["id"] in permitted_agents],
     }
@@ -1103,6 +1102,12 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         call["output_tokens"] for call in result.llm_calls if isinstance(call.get("output_tokens"), int)
     )
     final_call = result.llm_calls[-1] if result.llm_calls else None
+    active_role = get_role(result.route.agent)
+    capabilities_used = list(dict.fromkeys(
+        str(tool.get("capability"))
+        for tool in result.tools
+        if isinstance(tool, dict) and tool.get("capability")
+    ))
     return {
         "session_id": result.session_id,
         "project_id": request.project_id,
@@ -1110,6 +1115,9 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         "content": result.content,
         "research_result": result.research.get("result"),
         "activity": {
+            "brain": "KIM",
+            "role": {"id": active_role.id, "name": active_role.name},
+            "capabilities_used": capabilities_used,
             "selected_agent": result.selected_agent,
             "routed_agent": result.route.agent,
             "direct": result.selected_agent != "auto",

@@ -26,7 +26,7 @@ Phase 1 uses the official Python SDK and in-process transport. The same servers 
 | `ahnbys-academic` | Researcher and publication reads | Existing Academic Intelligence |
 | `ahnbys-project` | Project search, files, and memories | Authenticated request-scoped ProjectTools |
 
-Main Qwen first receives a compact capability catalog. It may select no capability. Only the selected detailed schemas are sent on a tool turn, with a hard maximum of ten schemas. Main execution is limited to three rounds and four read calls. Research keeps its existing evidence-oriented state machine and SearchRouter policy.
+Main or Coding Qwen first receives a compact capability catalog plus active role metadata. It may select no capability or combine a materially useful capability outside the primary role. Only the selected detailed schemas are sent on a tool turn, with a hard maximum of ten schemas. Execution is limited to three rounds and four read calls. Research keeps its existing evidence-oriented state machine and SearchRouter policy.
 
 External servers are never exposed directly to Qwen. Context7 exposes two documentation operations. Playwright exposes only page and click operations, but remains disabled unless both `MCP_PLAYWRIGHT_ENABLED=true` and `MCP_PLAYWRIGHT_EGRESS_GUARD=true` certify an independently enforced network egress sandbox; application-level URL and redirect validation alone is not an SSRF boundary. GitHub starts with `--read-only --toolsets=repos,issues,pull_requests`; without `GITHUB_PERSONAL_ACCESS_TOKEN`, it remains `UNCONFIGURED` and no child process starts.
 
