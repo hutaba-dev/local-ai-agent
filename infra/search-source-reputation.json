@@ -1,0 +1,24 @@
+{
+  "authority_domains": {
+    "apnews.com": 0.9,
+    "bloomberg.com": 0.85,
+    "ft.com": 0.85,
+    "reuters.com": 0.9,
+    "wsj.com": 0.85
+  },
+  "primary_url_markers": [
+    "investor.",
+    "/investor",
+    "sec.gov",
+    "newsroom",
+    "docs.",
+    "developer."
+  ],
+  "spam_block_markers": [
+    "betting",
+    "casino",
+    "coupon",
+    "essay-writing",
+    "press-release-distribution"
+  ]
+}

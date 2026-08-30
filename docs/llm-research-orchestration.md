@@ -4,6 +4,8 @@
 
 Qwen is the Research Planner and Orchestrator. Python executes validated actions and enforces safety and resource limits. Keyword-derived intent labels are observability metadata only; they do not grant, deny, or select tools.
 
+The initial `ResearchPlan` is the single semantic decision object. It records search mode and depth, external-information need, freshness, evidence needs, primary/scholarly/market value, entities, unresolved questions, model-generated queries, preferred capabilities, source preferences, and answer readiness. The same plan is passed into every continuation iteration. Selecting the Research role changes expertise, not depth.
+
 Each iteration supplies Qwen with the user goal, evidence and observations so far, unresolved work, live tool availability, cost and freshness characteristics, prior decisions, and remaining budgets. Qwen returns one structured next action:
 
 - `SEARCH_WEB`
@@ -42,6 +44,16 @@ The executor enforces:
 
 Budgets are upper bounds, not quotas.
 
+Provider health, fallback, circuit breakers, quotas, rate limits, duplicate suppression, MCP availability, URL validation, secure page fetch, SSRF protection, timeouts, and execution budgets remain deterministic. These controls constrain how an action runs; they do not infer what the user means.
+
+## Search Quality
+
+Search quality reports relevance, authority, freshness, and spam risk separately. Relevance comes from query overlap and provider scores. Authority is a low-weight configurable prior from `infra/search-source-reputation.json`, not a source allowlist. Freshness requires dated results for current requests. Spam blocking remains deterministic. Result ranking preserves provider relevance and hostname diversity without company, topic, or domain-specific semantic rules.
+
+## Failure Behavior
+
+Invalid initial planner output does not invoke a second keyword classifier. Automatic routing falls back to `NO_SEARCH`; an explicitly selected Research role gets one generic `QUICK_SEARCH` query. Invalid continuation output gets one provider-neutral `auto` discovery search while budget remains, then finalizes with the available evidence.
+
 ## Finalization
 
 `FINAL_ANSWER` is accepted only when `ready_to_answer=true` and no critical unresolved question remains. If final synthesis says that more searching or checking is needed, the executor records a failed finalization observation and returns control to Qwen for another next action. This fixes the generic failure where a correct decision to search more was previously returned to the user as the final response.
@@ -52,16 +64,20 @@ Simple and moderate work can use one direct synthesis call. Qwen requests the An
 
 Agent Activity displays observable decision summaries, actions, selected providers, queries, contextual evidence priorities, complexity, actual tools, and budget usage. It does not display private chain-of-thought.
 
-## Live Planner Benchmark
+## Regression Benchmark
 
-Run on 2026-08-27 with the deployed Qwen model. The benchmark invokes planning only and does not spend paid search quota.
+Planning-only benchmark run on 2026-08-30 with deployed Qwen. It made seven model calls and zero search-provider calls. Mean planner latency was 7.5 seconds.
 
-| Case | Search decision | First next action | Contextual assessment |
-| --- | --- | --- | --- |
-| Nvidia recent issues | Quick research | SearXNG web search | freshness high; scholarly value low |
-| Professor Ahn Ho-seon's research capability | Deep research | SearXNG identity/official-profile discovery | primary and scholarly value high; resolve identity before lookup |
-| NVIDIA earnings impact on HBM vendors | Deep research | SearXNG web search across earnings, supply chain, and HBM fundamentals | freshness and primary importance high; scholarly value low; complex with critic |
-| Why Transformers use attention | No search | None | stable conceptual explanation |
-| Important AI papers announced today | Quick research | SearXNG current paper discovery | freshness and primary importance high; scholarly value normal, allowing later academic verification |
+| Case | Before: deterministic semantic routing | After: Qwen plan |
+| --- | --- | --- |
+| NVIDIA recent issues | Company label; no reliable freshness match for “recent” | Deep, high freshness, web/news/market evidence |
+| NVIDIA earnings impact on HBM vendors | Fixed NVIDIA IR/SEC/Reuters query bundle | Deep, high freshness, financial/news/supply-chain evidence |
+| Professor Ahn Ho-seon's research capability | Professor regex enabled academic pipeline | Deep, identity disambiguation plus scholarly evidence |
+| Latest vLLM Qwen tool parser usage | “latest” forced current-news expansion | Quick, official docs and GitHub preferred |
+| Transformer attention principle | Generic/technical label if research ran | No search; ready to explain |
+| Important AI papers announced today | Current plus academic regex gates | Quick current paper discovery, scholarly value normal |
+| Unknown company and HBM impact | Uppercase `HBM` could be mistaken for the company entity | Deep, unknown company retained as entity and verification target |
 
-Automated regression tests additionally verify that an unready `FINAL_ANSWER` and a synthesis progress message both continue through the executor instead of reaching the user.
+Static semantic-routing symbol occurrences across the three runtime modules fell from 22 to 0. Hard-coded company domains and forced query expansions fell to 0. All seven after cases selected an appropriate depth; no provider or academic capability was executed during this planning benchmark. Unsupported-claim rate cannot be measured without executing search and synthesis, so it is covered separately by evidence-only synthesis tests.
+
+Automated regression tests verify structured-plan parsing, invalid-output fallback, role/depth separation, provider-neutral fallback, explicit specialized-tool selection, and rejection of premature finalization.

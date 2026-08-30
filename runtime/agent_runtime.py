@@ -27,7 +27,6 @@ from runtime.sessions import SessionStore
 from runtime.tool_registry import (
     ProjectToolScope,
     execute_research_action,
-    research_source_plan,
     research_tool_catalog,
     run_agent_tools,
 )
@@ -77,9 +76,28 @@ class ChatResult:
 
 
 @dataclass(frozen=True)
-class SearchDecision:
+class ResearchPlan:
     mode: str
-    queries: tuple[str, ...] = ()
+    needs_external_information: bool = False
+    depth: str = "none"
+    freshness_importance: str = "normal"
+    evidence_needs: tuple[str, ...] = ()
+    primary_source_importance: str = "normal"
+    scholarly_evidence_value: str = "low"
+    market_data_value: str = "low"
+    entities: tuple[str, ...] = ()
+    unresolved_questions: tuple[str, ...] = ()
+    search_queries: tuple[str, ...] = ()
+    preferred_capabilities: tuple[str, ...] = ()
+    source_preferences: tuple[str, ...] = ()
+    ready_to_answer: bool = False
+
+    @property
+    def queries(self) -> tuple[str, ...]:
+        return self.search_queries
+
+
+SearchDecision = ResearchPlan
 
 
 class ResearchState(str, Enum):
@@ -193,7 +211,7 @@ class AgentRuntime:
         started = perf_counter()
         latency = LatencyRecorder()
         session = self.sessions.get_or_create(session_id)
-        decision = SearchDecision("NO_SEARCH") if images else latency.stage(
+        decision = ResearchPlan("NO_SEARCH", ready_to_answer=True) if images else latency.stage(
             "research_mode_decision",
             lambda: self._search_decision(
                 message,
@@ -202,8 +220,6 @@ class AgentRuntime:
                 research_agent_selected=selected_agent == "research",
             ),
         ) if selected_agent in {"auto", "research"} else SearchDecision("NO_SEARCH")
-        if selected_agent == "research" and decision.mode != "DEEP_RESEARCH":
-            decision = SearchDecision("DEEP_RESEARCH", decision.queries or (message,))
         search_mode = decision.mode
         route = route_request(message, selected_agent, search_mode)
         if allowed_agents is not None and route.agent not in allowed_agents:
@@ -225,7 +241,7 @@ class AgentRuntime:
         if route.agent == "research" and route.search_mode != "NO_SEARCH":
             tools, answer, payload, research = self._run_deep_research(
                 message,
-                decision.queries,
+                decision,
                 system_prompt,
                 latency,
                 allow_local_tools,
@@ -497,7 +513,7 @@ class AgentRuntime:
     def _run_deep_research(
         self,
         question: str,
-        planned_queries: tuple[str, ...],
+        research_plan: ResearchPlan,
         system_prompt: str,
         latency: LatencyRecorder,
         allow_local_tools: bool,
@@ -507,7 +523,6 @@ class AgentRuntime:
         all_tools: list[dict[str, object]] = []
         round_activity: list[dict[str, object]] = []
         state_history = [ResearchState.PLANNING.value]
-        source_plan = research_source_plan(question)
         executed_actions: set[str] = set()
         tool_calls = 0
         search_calls = 0
@@ -520,7 +535,7 @@ class AgentRuntime:
             decision = latency.stage(
                 f"research_iteration_{iteration}_decision",
                 lambda: self._decide_research_action(
-                    question, planned_queries, all_tools, round_activity, system_prompt, latency,
+                    question, research_plan, all_tools, round_activity, system_prompt, latency,
                     MAX_RESEARCH_TOOL_CALLS - tool_calls,
                     MAX_RESEARCH_SEARCH_CALLS - search_calls,
                     persistent_context,
@@ -557,7 +572,7 @@ class AgentRuntime:
                 candidate_answer, candidate_payload = latency.stage(
                     "final_synthesis",
                     lambda: self._synthesize_research(
-                        question, all_tools, system_prompt, latency, persistent_context, source_plan,
+                        question, all_tools, system_prompt, latency, persistent_context, research_plan,
                         use_critic=decision.use_critic or decision.complexity == "COMPLEX",
                     ),
                 )
@@ -651,7 +666,7 @@ class AgentRuntime:
             answer, payload = latency.stage(
                 "final_synthesis",
                 lambda: self._synthesize_research(
-                    question, all_tools, system_prompt, latency, persistent_context, source_plan,
+                    question, all_tools, system_prompt, latency, persistent_context, research_plan,
                     use_critic=True,
                 ),
             )
@@ -669,13 +684,20 @@ class AgentRuntime:
             "final_synthesis_executed": True,
             "termination_reason": termination_reason,
             "source_plan": {
-                "intents": list(source_plan.intents),
-                "freshness_priority": source_plan.freshness_priority,
-                "required_evidence": list(source_plan.required_evidence),
-                "selected_sources": list(source_plan.selected_sources),
-                "skipped_sources": list(source_plan.skipped_sources),
-                "academic_enabled": source_plan.academic_enabled,
-                "role": "metadata_hint_only",
+                "needs_external_information": research_plan.needs_external_information,
+                "depth": research_plan.depth,
+                "freshness_importance": research_plan.freshness_importance,
+                "evidence_needs": list(research_plan.evidence_needs),
+                "primary_source_importance": research_plan.primary_source_importance,
+                "scholarly_evidence_value": research_plan.scholarly_evidence_value,
+                "market_data_value": research_plan.market_data_value,
+                "entities": list(research_plan.entities),
+                "unresolved_questions": list(research_plan.unresolved_questions),
+                "search_queries": list(research_plan.search_queries),
+                "preferred_capabilities": list(research_plan.preferred_capabilities),
+                "source_preferences": list(research_plan.source_preferences),
+                "ready_to_answer": research_plan.ready_to_answer,
+                "authority": "llm",
             },
             "tool_catalog": research_tool_catalog(),
             "tool_calls": tool_calls,
@@ -732,7 +754,7 @@ class AgentRuntime:
     def _decide_research_action(
         self,
         question: str,
-        planned_queries: tuple[str, ...],
+        research_plan: ResearchPlan,
         tools: list[dict[str, object]],
         activity: list[dict[str, object]],
         system_prompt: str,
@@ -755,7 +777,19 @@ class AgentRuntime:
         state = {
             "user_goal": question,
             "current_utc_date": datetime.now(timezone.utc).date().isoformat(),
-            "initial_query_suggestions": list(planned_queries),
+            "initial_plan": {
+                "depth": research_plan.depth,
+                "freshness_importance": research_plan.freshness_importance,
+                "evidence_needs": list(research_plan.evidence_needs),
+                "primary_source_importance": research_plan.primary_source_importance,
+                "scholarly_evidence_value": research_plan.scholarly_evidence_value,
+                "market_data_value": research_plan.market_data_value,
+                "entities": list(research_plan.entities),
+                "unresolved_questions": list(research_plan.unresolved_questions),
+                "search_queries": list(research_plan.search_queries),
+                "preferred_capabilities": list(research_plan.preferred_capabilities),
+                "source_preferences": list(research_plan.source_preferences),
+            },
             "evidence_so_far": self._evidence_package(tools, persistent_context),
             "observations": tools[-4:],
             "previous_decisions": activity[-4:],
@@ -802,7 +836,7 @@ class AgentRuntime:
         except (httpx.HTTPError, ValueError):
             if remaining_tool_calls > 0:
                 return ResearchDecision(
-                    "SEARCH_WEB", (question,), "searxng", ("planner output invalid",),
+                    "SEARCH_WEB", (question,), "auto", ("planner output invalid",),
                     "Planner output was invalid; execute one low-cost discovery search.",
                 )
             return ResearchDecision(
@@ -842,7 +876,6 @@ class AgentRuntime:
             return tuple(item.strip()[:500] for item in raw[:limit] if isinstance(item, str) and item.strip())
 
         provider = value.get("provider")
-        provider = provider if isinstance(provider, str) and provider in {"auto", "searxng", "serper", "brave"} else ""
         queries = strings("queries", 4)
         urls = strings("urls", 3)
         if action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT"} and not queries:
@@ -1189,7 +1222,10 @@ class AgentRuntime:
         use_critic: bool = True,
     ) -> tuple[str, dict[str, object]]:
         evidence_package = self._evidence_package(tools, persistent_context)
-        source_plan = source_plan or research_source_plan(question)
+        source_plan = source_plan or ResearchPlan(
+            "DEEP_RESEARCH", True, "deep", search_queries=(question[:500],),
+            unresolved_questions=("Initial planner metadata unavailable.",),
+        )
         evidence_package["analysis_contract"] = self._analysis_contract(question, source_plan)
         now = datetime.now(timezone.utc)
         evidence_package["research_as_of"] = {
@@ -1198,10 +1234,18 @@ class AgentRuntime:
         }
         package_json = self._bounded_evidence_json(evidence_package)
         plan_json = json.dumps({
-            "intents": list(source_plan.intents),
-            "freshness_priority": source_plan.freshness_priority,
-            "academic_enabled": source_plan.academic_enabled,
-            "required_evidence": list(source_plan.required_evidence),
+            "needs_external_information": source_plan.needs_external_information,
+            "depth": source_plan.depth,
+            "freshness_importance": source_plan.freshness_importance,
+            "evidence_needs": list(source_plan.evidence_needs),
+            "primary_source_importance": source_plan.primary_source_importance,
+            "scholarly_evidence_value": source_plan.scholarly_evidence_value,
+            "market_data_value": source_plan.market_data_value,
+            "entities": list(source_plan.entities),
+            "unresolved_questions": list(source_plan.unresolved_questions),
+            "preferred_capabilities": list(source_plan.preferred_capabilities),
+            "source_preferences": list(source_plan.source_preferences),
+            "authority": "llm",
         }, ensure_ascii=False)
         contextual_instruction = (
             "Adapt the answer to the actual question and evidence rather than an intent label. For time-sensitive claims, state the "
@@ -1627,36 +1671,29 @@ class AgentRuntime:
         *,
         persistent_context: str = "",
         research_agent_selected: bool = False,
-    ) -> SearchDecision:
+    ) -> ResearchPlan:
         decision_prompt = (
-            "Decide whether this request needs external web evidence before answering. "
+            "You are the canonical Research Planner. Decide what evidence and capabilities this request needs before answering. "
             f"Current UTC date: {datetime.now(timezone.utc).date().isoformat()}. "
             "Return exactly one JSON object and no other text in this form: "
-            '{"search_mode":"NO_SEARCH|QUICK_SEARCH|DEEP_RESEARCH","queries":["search query"],"focus":["research question"]}. '
+            '{"search_mode":"NO_SEARCH|QUICK_SEARCH|DEEP_RESEARCH","needs_external_information":false,'
+            '"depth":"none|quick|deep","freshness_importance":"low|normal|high","evidence_needs":[],'
+            '"primary_source_importance":"low|normal|high","scholarly_evidence_value":"low|normal|high",'
+            '"market_data_value":"low|normal|high","entities":[],"unresolved_questions":[],"search_queries":[],'
+            '"preferred_capabilities":[],"source_preferences":[],"ready_to_answer":false}. '
             "Use NO_SEARCH for writing, translation, supplied-text work, stable concepts, or local server/repository questions whose answer "
             "does not materially depend on external facts. A real company, market, industry, policy, person, publication, or current-event "
             "analysis requires external evidence when its premises were not supplied by the user, even if the requested output is framed as "
             "an inference or impact analysis. Do not confuse permission to reason with permission to invent current premises. "
             "Use QUICK_SEARCH for a current fact, recent event, price, availability, schedule, policy, or fact check. "
-            "Use DEEP_RESEARCH for a multi-source comparison, report, recommendation, academic or technical source search, "
-            "medical/legal/financial guidance, contested claim, or an evidence-based evaluation of why a person is notable, "
-            "capable, famous, or highly regarded. Requests to evaluate a researcher, analyze achievements, find supporting grounds, "
-            "or investigate deeply are DEEP_RESEARCH even when phrased conversationally or referring to a person from prior context as "
-            "'this researcher'. Korean examples such as '왜 뛰어난지', '근거를 찾아봐', '연구자로서 평가', '실적 분석', "
-            "'능력을 판단', and '왜 유명한지' require DEEP_RESEARCH when they ask for evidence or evaluation. "
-            "A direct Research agent selection is a strong signal for DEEP_RESEARCH when the request asks to find, verify, evaluate, or analyze evidence. "
+            "Use DEEP_RESEARCH only when multiple evidence gaps or iterative source verification materially improve the answer. "
+            "Research role selection changes expertise, not depth: it may still use NO_SEARCH, QUICK_SEARCH, or DEEP_RESEARCH. "
             "For QUICK_SEARCH provide exactly one concise query. "
-            "For DEEP_RESEARCH provide 2 to 4 complementary queries covering the question's major evidence needs; include a query for "
-            "primary or official sources and include academic papers only when the user explicitly asks for scholarly evidence. "
-            "When the user asks how company A affects industry B, decompose queries across: A's current performance drivers; the A-to-B supply-chain "
-            "or value-chain relationship; B's current fundamentals and pricing/volume/mix/margin transmission; exposed beneficiaries and losers; "
-            "market expectations; and risks or counterarguments. Search for evidence supporting each causal premise rather than only articles that "
-            "state the final conclusion. Fit the most material nodes into the 2 to 4 query budget. "
+            "For DEEP_RESEARCH provide 1 to 4 complementary queries that target the actual unresolved evidence needs. "
             "More sources is not better. Use only sources that can materially answer the user's question. Academic sources are specialized "
             "tools, not general research tools. For current news and market questions, prioritize freshness, primary sources, financial data, "
             "and current reporting. Do not request scholarly search merely because the subject is AI, technology, a company, or adjacent to research. "
-            "Preserve a Korean person's original name exactly "
-            "in at least one query; romanizations may only be additional queries. Treat praise in the request as a hypothesis to test. "
+            "Describe source preferences and capabilities rather than relying on rigid topic labels. Treat praise in the request as a hypothesis to test. "
             "Do not answer the request yet."
         )
         try:
@@ -1673,44 +1710,63 @@ class AgentRuntime:
                     {"role": "system", "content": decision_prompt},
                     {"role": "user", "content": classifier_input},
                 ],
-                256,
+                700,
                 latency,
                 "research_mode_decision",
                 temperature=0,
             )
-            return self._parse_search_decision(content)
+            return self._parse_research_plan(content)
         except (httpx.HTTPError, ValueError):
-            pass
-        return SearchDecision("NO_SEARCH")
+            if research_agent_selected:
+                return ResearchPlan(
+                    "QUICK_SEARCH", True, "quick", search_queries=(message[:500],),
+                    unresolved_questions=("Planner unavailable; perform minimal discovery.",),
+                    preferred_capabilities=("SEARCH_WEB",),
+                )
+            return ResearchPlan("NO_SEARCH", ready_to_answer=True)
 
     @staticmethod
-    def _parse_search_decision(content: str) -> SearchDecision:
-        decoder = json.JSONDecoder()
-        for index, character in enumerate(content):
-            if character != "{":
-                continue
-            try:
-                value, _ = decoder.raw_decode(content[index:])
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(value, dict):
-                continue
-            mode = value.get("search_mode")
-            queries = value.get("queries")
-            if mode not in SEARCH_MODES:
-                break
-            if mode == "NO_SEARCH":
-                return SearchDecision(mode)
-            if isinstance(queries, list):
-                cleaned = tuple(
-                    query.strip()[:500]
-                    for query in queries[:4]
-                    if isinstance(query, str) and query.strip()
-                )
-                if cleaned and (mode == "DEEP_RESEARCH" or len(cleaned) == 1):
-                    return SearchDecision(mode, cleaned)
-            break
-        raise ValueError("model did not return a valid search decision")
+    def _parse_research_plan(content: str) -> ResearchPlan:
+        value = AgentRuntime._parse_json_object(content)
+        mode = value.get("search_mode")
+        if mode not in SEARCH_MODES:
+            raise ValueError("model did not return a valid search mode")
+
+        def strings(key: str, limit: int) -> tuple[str, ...]:
+            raw = value.get(key)
+            if not isinstance(raw, list):
+                return ()
+            return tuple(item.strip()[:500] for item in raw[:limit] if isinstance(item, str) and item.strip())
+
+        queries = strings("search_queries", 4) or strings("queries", 4)
+        if mode != "NO_SEARCH" and not queries:
+            raise ValueError("search plan requires at least one query")
+
+        def priority(key: str, default: str) -> str:
+            raw = value.get(key)
+            return raw if isinstance(raw, str) and raw in {"low", "normal", "high"} else default
+
+        depth = value.get("depth") if value.get("depth") in {"none", "quick", "deep"} else {
+            "NO_SEARCH": "none", "QUICK_SEARCH": "quick", "DEEP_RESEARCH": "deep",
+        }[mode]
+        return ResearchPlan(
+            mode=mode,
+            needs_external_information=value.get("needs_external_information") is True or mode != "NO_SEARCH",
+            depth=str(depth),
+            freshness_importance=priority("freshness_importance", "normal"),
+            evidence_needs=strings("evidence_needs", 8),
+            primary_source_importance=priority("primary_source_importance", "normal"),
+            scholarly_evidence_value=priority("scholarly_evidence_value", "low"),
+            market_data_value=priority("market_data_value", "low"),
+            entities=strings("entities", 8),
+            unresolved_questions=strings("unresolved_questions", 8),
+            search_queries=queries,
+            preferred_capabilities=strings("preferred_capabilities", 8),
+            source_preferences=strings("source_preferences", 8),
+            ready_to_answer=value.get("ready_to_answer") is True or mode == "NO_SEARCH",
+        )
+
+    _parse_search_decision = _parse_research_plan
 
     @staticmethod
     def _tool_context(tools: list[dict[str, object]]) -> str:

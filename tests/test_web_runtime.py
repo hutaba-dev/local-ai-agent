@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from runtime.agent_runtime import AgentRuntime, LatencyRecorder
+from runtime.agent_runtime import AgentRuntime, LatencyRecorder, ResearchPlan
 from runtime.image_client import (
     GeneratedImage,
     ImageEditCompletion,
@@ -185,36 +185,18 @@ class UnpaywallResponse:
 
 
 class WebRuntimeTests(unittest.TestCase):
-    def test_research_source_router_covers_market_academic_and_mixed_intents(self) -> None:
-        cases = {
-            "NVIDIA 오늘 실적 발표 몇 시고 시장 예상은 어때?": (
-                {"CURRENT_NEWS", "MARKET_FINANCE", "COMPANY_RESEARCH"}, False,
-            ),
-            "안호선 교수 연구자로서의 역량을 논문 기반으로 평가해줘": (
-                {"ACADEMIC_RESEARCH"}, True,
-            ),
-            "오늘 비트코인 시장 뉴스 정리해줘": (
-                {"CURRENT_NEWS", "MARKET_FINANCE"}, False,
-            ),
-            "AI가 주식시장에 미치는 영향에 대한 학술 논문을 조사해줘": (
-                {"ACADEMIC_RESEARCH"}, True,
-            ),
-            "TSMC 최신 실적과 향후 반도체 수요 전망": (
-                {"CURRENT_NEWS", "MARKET_FINANCE", "COMPANY_RESEARCH"}, False,
-            ),
-            "NVIDIA 실적과 AI bubble에 대한 학계 연구를 함께 비교해줘": (
-                {"MARKET_FINANCE", "COMPANY_RESEARCH", "ACADEMIC_RESEARCH", "MIXED"}, True,
-            ),
-        }
-        for query, (expected, academic_enabled) in cases.items():
+    def test_legacy_source_plan_does_not_make_semantic_decisions(self) -> None:
+        for query in (
+            "NVIDIA 오늘 실적 발표 몇 시고 시장 예상은 어때?",
+            "안호선 교수 연구자로서의 역량을 논문 기반으로 평가해줘",
+            "오늘 비트코인 시장 뉴스 정리해줘",
+        ):
             with self.subTest(query=query):
                 plan = research_source_plan(query)
-                self.assertTrue(expected <= set(plan.intents))
-                self.assertEqual(plan.academic_enabled, academic_enabled)
-                if "CURRENT_NEWS" in expected:
-                    self.assertEqual(plan.freshness_priority, "VERY_HIGH")
-                if not academic_enabled:
-                    self.assertIn("Academic Intelligence — not relevant", plan.skipped_sources)
+                self.assertEqual(plan.intents, ("FALLBACK",))
+                self.assertFalse(plan.academic_enabled)
+                self.assertEqual(plan.required_evidence, ())
+                self.assertIn("LLM decision", plan.skipped_sources[0])
 
     def test_current_market_research_forbids_academic_tools_and_fetches_pages(self) -> None:
         queries = (
@@ -248,11 +230,7 @@ class WebRuntimeTests(unittest.TestCase):
         intelligence.assert_not_called()
         semantic.assert_not_called()
         routed_queries = web.call_args.args[0]
-        self.assertTrue(any("site:investor.nvidia.com" in query for query in routed_queries))
-        self.assertTrue(any("site:nvidianews.nvidia.com" in query for query in routed_queries))
-        self.assertTrue(any("site:sec.gov NVIDIA 8-K" in query for query in routed_queries))
-        self.assertTrue(any("site:reuters.com NVIDIA earnings" in query for query in routed_queries))
-        self.assertTrue(any("EPS revenue consensus guidance implied move" in query for query in routed_queries))
+        self.assertEqual(routed_queries, queries)
 
     def test_market_followup_searches_only_gap_queries_under_original_intent_gate(self) -> None:
         original = "NVIDIA 오늘 실적 발표와 시장 전망을 조사해줘"
@@ -263,7 +241,7 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(routed, ("NVIDIA revenue consensus August 2026",))
         self.assertFalse(plan.academic_enabled)
 
-    def test_academic_and_mixed_research_enable_academic_tools_only_when_requested(self) -> None:
+    def test_legacy_research_tools_do_not_infer_academic_capabilities(self) -> None:
         web = ToolResult("web_search", True, "[]", None, 1)
         sources = ToolResult("web_sources", True, "[]", None, 1)
         academic = ToolResult("academic_papers", True, "[]", None, 1)
@@ -279,31 +257,28 @@ class WebRuntimeTests(unittest.TestCase):
                 ("NVIDIA 실적과 AI bubble에 대한 학계 연구를 함께 비교해줘",), "DEEP_RESEARCH", False
             )
 
-        self.assertEqual(papers.call_count, 2)
-        self.assertIn("academic_papers", [result.name for result in academic_results])
-        self.assertIn("academic_papers", [result.name for result in mixed_results])
-        mixed_plan = json.loads(mixed_results[0].output)
-        self.assertIn("MIXED", mixed_plan["intents"])
+        papers.assert_not_called()
+        self.assertNotIn("academic_papers", [result.name for result in academic_results])
+        self.assertNotIn("academic_papers", [result.name for result in mixed_results])
 
-    def test_current_market_relevance_excludes_academic_results_and_prioritizes_primary_sources(self) -> None:
+    def test_result_ranking_uses_provider_relevance_without_domain_semantics(self) -> None:
         plan = research_source_plan("NVIDIA 오늘 실적 발표와 시장 전망을 조사해줘")
         ranked = _rank_relevant_web_results([
             {
                 "provider": "brave", "title": "AI stock indices using 10-K filings",
-                "url": "https://www.sciencedirect.com/science/article/example", "description": "NVIDIA AI paper",
+                "url": "https://www.sciencedirect.com/science/article/example", "description": "NVIDIA AI paper", "score": 0.2,
             },
             {
                 "provider": "brave", "title": "NVIDIA earnings call",
-                "url": "https://investor.nvidia.com/events-and-presentations/", "description": "official event",
+                "url": "https://investor.nvidia.com/events-and-presentations/", "description": "official event", "score": 0.9,
             },
             {
                 "provider": "brave", "title": "NVIDIA earnings preview",
-                "url": "https://www.reuters.com/technology/nvidia-preview", "description": "current consensus",
+                "url": "https://www.reuters.com/technology/nvidia-preview", "description": "current consensus", "score": 0.8,
             },
         ], plan)
 
-        self.assertEqual([item["relevance_score"] for item in ranked], [1.0, 0.95])
-        self.assertFalse(any("sciencedirect" in str(item["url"]) for item in ranked))
+        self.assertEqual([item["relevance_score"] for item in ranked], [0.9, 0.8, 0.2])
 
     def test_current_market_relevance_limits_one_domain_from_crowding_out_other_tiers(self) -> None:
         plan = research_source_plan("NVIDIA 오늘 실적 발표와 시장 전망을 조사해줘")
@@ -1273,7 +1248,7 @@ class WebRuntimeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(run_tools.call_count, 1)
-        self.assertEqual(run_tools.call_args.args[:3], ("SEARCH_WEB", ("수소 연구를 요약해줘",), "searxng"))
+        self.assertEqual(run_tools.call_args.args[:3], ("SEARCH_WEB", ("수소 연구를 요약해줘",), "auto"))
         self.assertEqual(run_agent_tools("research", "수소 연구를 요약해줘", allow_local_tools=False), [])
 
     def test_admin_browser_research_has_no_local_project_tools(self) -> None:
@@ -1288,7 +1263,7 @@ class WebRuntimeTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(run_tools.call_count, 1)
-        self.assertEqual(run_tools.call_args.args[:3], ("SEARCH_WEB", ("수소 연구를 요약해줘",), "searxng"))
+        self.assertEqual(run_tools.call_args.args[:3], ("SEARCH_WEB", ("수소 연구를 요약해줘",), "auto"))
 
     def test_guest_legacy_session_is_replaced_before_history_is_used(self) -> None:
         old_session = self.runtime.new_session()
@@ -1318,8 +1293,8 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(result.route.search_mode, "QUICK_SEARCH")
         self.assertEqual(result.tools[-1]["name"], "web_search")
         self.assertFalse(result.tools[-1]["success"])
-        self.assertIn("search provider unavailable: searxng", result.tools[-1]["error"])
-        self.assertEqual(result.research["rounds"][0]["provider"], "searxng")
+        self.assertIn("web search is required but unavailable", result.tools[-1]["error"])
+        self.assertEqual(result.research["rounds"][0]["provider"], "auto")
 
     def test_model_search_decision_controls_search_mode(self) -> None:
         client = SearchDecisionClient()
@@ -1327,15 +1302,57 @@ class WebRuntimeTests(unittest.TestCase):
 
         self.assertEqual(runtime._search_mode("현재 repository 구조를 실제로 확인해줘"), "QUICK_SEARCH")
         decision_request = client.requests[0]["json"]
-        self.assertEqual(decision_request["max_tokens"], 256)
+        self.assertEqual(decision_request["max_tokens"], 700)
         planner_prompt = decision_request["messages"][0]["content"]
-        self.assertIn("supply-chain or value-chain relationship", planner_prompt)
-        self.assertIn("pricing/volume/mix/margin transmission", planner_prompt)
-        self.assertIn("evidence supporting each causal premise", planner_prompt)
+        self.assertIn('"evidence_needs":[]', planner_prompt)
+        self.assertIn('"preferred_capabilities":[]', planner_prompt)
+        self.assertIn("Research role selection changes expertise, not depth", planner_prompt)
         self.assertEqual(
             decision_request["messages"][1],
             {"role": "user", "content": "현재 repository 구조를 실제로 확인해줘"},
         )
+
+    def test_structured_research_plan_preserves_model_decision_axes(self) -> None:
+        plan = AgentRuntime._parse_research_plan(json.dumps({
+            "search_mode": "DEEP_RESEARCH",
+            "needs_external_information": True,
+            "depth": "deep",
+            "freshness_importance": "high",
+            "evidence_needs": ["official release", "independent verification"],
+            "primary_source_importance": "high",
+            "scholarly_evidence_value": "low",
+            "market_data_value": "high",
+            "entities": ["Example Corp"],
+            "unresolved_questions": ["Is the entity real?"],
+            "search_queries": ["Example Corp official results"],
+            "preferred_capabilities": ["SEARCH_WEB", "FETCH_PAGE"],
+            "source_preferences": ["official company site"],
+            "ready_to_answer": False,
+        }))
+
+        self.assertEqual(plan.depth, "deep")
+        self.assertEqual(plan.evidence_needs, ("official release", "independent verification"))
+        self.assertEqual(plan.entities, ("Example Corp",))
+        self.assertEqual(plan.preferred_capabilities, ("SEARCH_WEB", "FETCH_PAGE"))
+        self.assertEqual(plan.queries, ("Example Corp official results",))
+
+    def test_invalid_research_plan_uses_role_aware_non_semantic_fallback(self) -> None:
+        class InvalidPlanClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                response = FakeResponse()
+                response.json = lambda: {"choices": [{"message": {"content": "invalid"}}], "usage": {}}  # type: ignore[method-assign]
+                return response
+
+        runtime = AgentRuntime(client=InvalidPlanClient())
+
+        automatic = runtime._search_decision("Explain a stable concept")
+        research = runtime._search_decision("Investigate this", research_agent_selected=True)
+
+        self.assertEqual(automatic.mode, "NO_SEARCH")
+        self.assertEqual(research.mode, "QUICK_SEARCH")
+        self.assertEqual(research.search_queries, ("Investigate this",))
+        self.assertEqual(research.preferred_capabilities, ("SEARCH_WEB",))
 
     def test_search_mode_prompt_requires_external_premises_for_real_world_impact_analysis(self) -> None:
         client = SearchDecisionClient()
@@ -1549,7 +1566,10 @@ class WebRuntimeTests(unittest.TestCase):
         question = "NVIDIA 오늘 실적 발표와 시장 전망을 조사해줘"
 
         runtime._synthesize_research(
-            question, [], "system", LatencyRecorder(), source_plan=research_source_plan(question)
+            question, [], "system", LatencyRecorder(), source_plan=ResearchPlan(
+                "DEEP_RESEARCH", True, "deep", freshness_importance="high",
+                evidence_needs=("current earnings evidence",), search_queries=(question,),
+            )
         )
 
         analyst_input = client.requests[0]["json"]["messages"][1]["content"]
@@ -1558,14 +1578,13 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertIn('"kst"', analyst_input)
         self.assertIn("+09:00", analyst_input)
 
-    def test_direct_research_selection_still_classifies_deep_research(self) -> None:
+    def test_direct_research_selection_preserves_model_selected_depth(self) -> None:
         class DirectResearchClient(FakeClient):
             def post(self, url: str, json: dict[str, object]) -> FakeResponse:
                 self.requests.append({"url": url, "json": json})
                 responses = (
                     '{"search_mode":"NO_SEARCH","queries":[]}',
-                    '{"missing":[],"uncertain":[],"next_queries":[],"next_tools":[],"ready_to_answer":true,"entity_confidence":"HIGH"}',
-                    "analyst", "critic", "완료된 최종 답변",
+                    "완료된 최종 답변",
                 )
                 response = FakeResponse()
                 response.json = lambda: {"choices": [{"message": {"content": responses[len(self.requests) - 1]}}], "usage": {}}  # type: ignore[method-assign]
@@ -1575,8 +1594,9 @@ class WebRuntimeTests(unittest.TestCase):
         with patch("runtime.agent_runtime.run_agent_tools", return_value=[]):
             result = runtime.chat("연구자로서의 역량을 근거로 평가해줘", "research")
 
-        self.assertEqual(result.route.search_mode, "DEEP_RESEARCH")
+        self.assertEqual(result.route.search_mode, "NO_SEARCH")
         self.assertEqual(result.content, "완료된 최종 답변")
+        self.assertEqual(result.tools, [])
         self.assertEqual(result.llm_calls[0]["purpose"], "research_mode_decision")
 
     def test_research_classifier_receives_project_context_for_reference_resolution(self) -> None:
@@ -2034,7 +2054,7 @@ class WebRuntimeTests(unittest.TestCase):
         semantic.assert_called_once()
         unpaywall.assert_not_called()
 
-    def test_deep_research_researcher_query_uses_multi_source_orchestrator(self) -> None:
+    def test_legacy_researcher_query_does_not_infer_multi_source_orchestrator(self) -> None:
         intelligence = {
             "researcher": {"identity_confidence": "MEDIUM", "identity_sources": ["openalex", "semantic_scholar"]},
             "source_status": {"scopus": "UNAVAILABLE", "web_of_science": "UNAVAILABLE", "openalex": "AVAILABLE_FULL"},
@@ -2049,11 +2069,8 @@ class WebRuntimeTests(unittest.TestCase):
         ) as orchestrator:
             results = _research_tools(("안호선교수 연구 역량을 평가해줘",), "DEEP_RESEARCH", False)
 
-        self.assertEqual(results[-1].name, "academic_intelligence")
-        self.assertTrue(results[-1].success)
-        self.assertEqual(results[-1].details["execution"], "parallel")
-        self.assertIn("orcid", results[-1].details["providers_called"])
-        orchestrator.assert_called_once()
+        self.assertEqual(results[-1].name, "web_sources")
+        orchestrator.assert_not_called()
 
     def test_gap_selection_uses_unpaywall_when_public_source_evidence_is_sparse(self) -> None:
         papers = json.dumps([{"title": "Paper", "doi": "10.1000/example", "cited_by_count": 10}] * 3)

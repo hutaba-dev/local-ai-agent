@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from pathlib import Path
 from threading import Lock
 from time import monotonic, perf_counter
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -22,9 +24,18 @@ USER_AGENT = "local-ai-agent-research/0.2"
 TRACKING_PARAMETERS = {
     "fbclid", "gclid", "mc_cid", "mc_eid", "ref", "ref_src", "source",
 }
-PRIMARY_MARKERS = ("investor.", "/investor", "sec.gov", "newsroom", "nvidianews.", "docs.", "developer.")
-TRUSTED_NEWS_DOMAINS = ("reuters.com", "apnews.com", "bloomberg.com", "cnbc.com", "ft.com", "wsj.com")
-SPAM_MARKERS = ("coupon", "casino", "betting", "essay-writing", "press-release-distribution")
+REPUTATION_METADATA_PATH = Path(__file__).resolve().parents[1] / "infra" / "search-source-reputation.json"
+
+
+def _load_reputation_metadata() -> dict[str, object]:
+    try:
+        value = json.loads(REPUTATION_METADATA_PATH.read_text(encoding="utf-8"))
+        return value if isinstance(value, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+SOURCE_REPUTATION = _load_reputation_metadata()
 
 
 class ProviderStatus(str, Enum):
@@ -80,6 +91,10 @@ class SearchQuality:
     sufficient: bool
     score: float
     reasons: tuple[str, ...]
+    relevance_score: float = 0
+    authority_score: float = 0
+    freshness_score: float = 0
+    spam_risk: float = 0
 
 
 @dataclass(frozen=True)
@@ -436,28 +451,35 @@ def evaluate_quality(
     query_terms = set(re.findall(r"[\w가-힣]{3,}", normalize_query(request.query)))
     relevant = 0
     domains: set[str] = set()
-    trusted = 0
+    authority = 0.0
     primary = 0
     dated = 0
     spam = 0
+    authority_domains = SOURCE_REPUTATION.get("authority_domains", {})
+    authority_domains = authority_domains if isinstance(authority_domains, dict) else {}
+    primary_markers = tuple(str(item) for item in SOURCE_REPUTATION.get("primary_url_markers", []) if isinstance(item, str))
+    spam_markers = tuple(str(item) for item in SOURCE_REPUTATION.get("spam_block_markers", []) if isinstance(item, str))
     for result in results:
         text = f"{result.title} {result.snippet}".lower()
         overlap = len(query_terms & set(re.findall(r"[\w가-힣]{3,}", text)))
         relevant += int(not query_terms or overlap >= min(2, len(query_terms)))
         host = _host(result.url)
         domains.add(host)
-        trusted += int(any(domain in host for domain in TRUSTED_NEWS_DOMAINS))
-        primary += int(any(marker in result.url.lower() for marker in PRIMARY_MARKERS))
+        authority += max(
+            (float(prior) for domain, prior in authority_domains.items() if str(domain) in host and isinstance(prior, (int, float))),
+            default=0.0,
+        )
+        primary += int(any(marker in result.url.lower() for marker in primary_markers))
         dated += int(bool(result.published_at))
-        spam += int(any(marker in f"{host} {text}" for marker in SPAM_MARKERS))
+        spam += int(any(marker in f"{host} {text}" for marker in spam_markers))
     count_score = min(len(results) / 5, 1)
     relevance_score = relevant / len(results)
     diversity_score = min(len(domains) / 3, 1)
-    trust_score = min((trusted + primary) / 2, 1)
+    authority_score = min((authority + primary) / len(results), 1)
     spam_ratio = spam / len(results)
     current = context.get("freshness") == "VERY_HIGH" or request.category == "news"
-    freshness_score = min((dated + trusted + primary) / 3, 1) if current else 1
-    score = max(0, 0.25 * count_score + 0.3 * relevance_score + 0.2 * diversity_score + 0.15 * trust_score + 0.1 * freshness_score - 0.3 * spam_ratio)
+    freshness_score = dated / len(results) if current else 1
+    score = max(0, 0.25 * count_score + 0.4 * relevance_score + 0.2 * diversity_score + 0.05 * authority_score + 0.1 * freshness_score - 0.3 * spam_ratio)
     reasons: list[str] = []
     if len(results) < 4:
         reasons.append("too few results")
@@ -465,19 +487,15 @@ def evaluate_quality(
         reasons.append("low query relevance")
     if len(domains) < min(3, len(results)):
         reasons.append("insufficient domain diversity")
-    if current and not (dated or trusted or primary):
-        reasons.append("no recent or trusted current source")
-    requires_primary = bool(context.get("requires_primary")) or "site:" in request.query.lower()
-    if requires_primary and primary == 0:
-        reasons.append("official or primary source missing")
+    if current and not dated:
+        reasons.append("no dated current result")
     if spam_ratio >= 0.5:
         reasons.append("spam-heavy result set")
-    official_query_satisfied = (
-        ("site:" in request.query.lower() and primary > 0 and relevant > 0)
-        or (requires_primary and primary >= 2 and relevant >= 2 and spam_ratio < 0.5)
+    sufficient = score >= 0.62 and not reasons
+    return SearchQuality(
+        sufficient, round(score, 3), tuple(reasons), round(relevance_score, 3),
+        round(authority_score, 3), round(freshness_score, 3), round(spam_ratio, 3),
     )
-    sufficient = official_query_satisfied or (score >= 0.62 and not reasons)
-    return SearchQuality(sufficient, round(score, 3), tuple(reasons))
 
 
 def normalize_query(query: str) -> str:
@@ -596,8 +614,8 @@ def _provider_order() -> tuple[str, ...]:
 def _category_for(query: str, context: dict[str, object]) -> str:
     if "site:" in query.lower():
         return "web"
-    intents = set(context.get("intents", []))
-    return "news" if "CURRENT_NEWS" in intents else "web"
+    category = context.get("search_category")
+    return category if category in {"web", "news"} else "web"
 
 
 def _cache_key(provider: str, request: SearchRequest) -> tuple[str, str, str, str]:
