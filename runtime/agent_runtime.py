@@ -19,7 +19,7 @@ import httpx
 from hangul_romanize import Transliter
 from hangul_romanize.rule import academic as academic_romanization
 
-from runtime.capability_registry import capability_catalog, detailed_tools
+from runtime.capability_registry import CAPABILITIES, capability_catalog, detailed_tools
 from runtime.mcp_host import call_mcp_tool
 from runtime.role_registry import get_role
 from runtime.router import Route, route_request
@@ -39,6 +39,7 @@ BASE_URL = os.getenv("OPENAI_BASE_URL", "http://127.0.0.1:8000/v1").rstrip("/")
 MAX_RESEARCH_ITERATIONS = 12
 MAX_RESEARCH_TOOL_CALLS = 12
 MAX_RESEARCH_SEARCH_CALLS = 12
+MAX_RESEARCH_EXECUTION_SECONDS = 120
 MAX_MAIN_TOOL_ROUNDS = 3
 MAX_MAIN_TOOL_CALLS = 4
 MAX_TOOL_OBSERVATION_CHARS = 12_000
@@ -79,6 +80,7 @@ class ChatResult:
     llm_calls: list[dict[str, object]]
     stages: list[dict[str, object]]
     research: dict[str, object]
+    selected_capabilities: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -97,6 +99,7 @@ class ResearchPlan:
     preferred_capabilities: tuple[str, ...] = ()
     source_preferences: tuple[str, ...] = ()
     ready_to_answer: bool = False
+    recommended_agent: str = ""
 
     @property
     def queries(self) -> tuple[str, ...]:
@@ -228,7 +231,7 @@ class AgentRuntime:
             ),
         ) if selected_agent in {"auto", "research"} else SearchDecision("NO_SEARCH")
         search_mode = decision.mode
-        route = route_request(message, selected_agent, search_mode)
+        route = route_request(message, selected_agent, search_mode, decision.recommended_agent)
         if allowed_agents is not None and route.agent not in allowed_agents:
             if selected_agent == "auto" and "main" in allowed_agents:
                 route = Route("main", "Main fallback because the routed capability is unavailable", "NO_SEARCH")
@@ -245,6 +248,7 @@ class AgentRuntime:
             "final_synthesis_executed": False,
             "termination_reason": "non_deep_response",
         }
+        selected_capabilities: tuple[str, ...] = ()
         if route.agent == "research" and route.search_mode != "NO_SEARCH":
             tools, answer, payload, research = self._run_deep_research(
                 message,
@@ -257,6 +261,7 @@ class AgentRuntime:
                 session.id,
             )
             research["mode"] = route.search_mode
+            selected_capabilities = self._research_capabilities(decision, tools)
         else:
             tool_message = decision.queries or (message,)
             tools = latency.stage(
@@ -290,7 +295,7 @@ class AgentRuntime:
             if public_context:
                 messages.append({"role": "user", "content": public_context})
             if route.agent in {"main", "coding"}:
-                answer, payload, dynamic_tools = self._run_main_tool_loop(
+                answer, payload, dynamic_tools, selected_capabilities = self._run_main_tool_loop(
                     message, messages, self._max_tokens(route), latency, project_scope, route.agent, session.id,
                 )
                 tools.extend(dynamic_tools)
@@ -314,6 +319,7 @@ class AgentRuntime:
             latency.llm_calls,
             latency.stages,
             research,
+            selected_capabilities,
         )
 
     def _run_main_tool_loop(
@@ -325,7 +331,7 @@ class AgentRuntime:
         project_scope: ProjectToolScope | None,
         agent: str = "main",
         media_owner_id: str | None = None,
-    ) -> tuple[str, dict[str, object], list[dict[str, object]]]:
+    ) -> tuple[str, dict[str, object], list[dict[str, object]], tuple[str, ...]]:
         role = get_role(agent)
         from runtime.media import MEDIA_DIRECTOR, MediaStatus
 
@@ -337,7 +343,7 @@ class AgentRuntime:
         available = [item for item in catalog if item["available"]]
         if not available:
             answer, payload = self._complete(messages, max_tokens, latency, "response")
-            return answer, payload, []
+            return answer, payload, [], ()
         selector_messages: list[dict[str, object]] = [{
             "role": "system",
             "content": (
@@ -366,9 +372,9 @@ class AgentRuntime:
         specifications = detailed_tools(selected)
         if not specifications:
             answer, payload = self._complete(messages, max_tokens, latency, "response")
-            return answer, payload, []
+            return answer, payload, [], selected
 
-        allowed_permissions = {"READ", "READ_PROJECT", "WRITE_MEMORY", "WRITE_ARTIFACT", "EXECUTE_MEDIA"}
+        allowed_permissions = {permission.value for permission in role.permission_policy}
         schemas = [spec.openai_schema() for spec in specifications if spec.permission in allowed_permissions]
         allowed = {spec.name: spec for spec in specifications if spec.permission in allowed_permissions}
         tool_policy = (
@@ -389,7 +395,7 @@ class AgentRuntime:
             assistant_message = self._assistant_message(last_payload)
             tool_calls = assistant_message.get("tool_calls")
             if not isinstance(tool_calls, list) or not tool_calls:
-                return self._assistant_text(last_payload), last_payload, activity
+                return self._assistant_text(last_payload), last_payload, activity, selected
             tool_calls = [
                 tool_call for tool_call in tool_calls
                 if isinstance(tool_call, dict) and isinstance(tool_call.get("id"), str)
@@ -445,7 +451,7 @@ class AgentRuntime:
             "content": "Give the final answer now. Do not request or announce additional tool work.",
         }]
         answer, payload = self._complete(final_messages, max_tokens, latency, "response")
-        return answer, payload, activity
+        return answer, payload, activity, selected
 
     @staticmethod
     def _parse_capability_selection(content: str) -> list[object]:
@@ -557,14 +563,19 @@ class AgentRuntime:
         round_activity: list[dict[str, object]] = []
         state_history = [ResearchState.PLANNING.value]
         executed_actions: set[str] = set()
+        fetched_urls: set[str] = set()
         tool_calls = 0
         search_calls = 0
         termination_reason = "research_iteration_limit"
         final_decision: ResearchDecision | None = None
         answer: str | None = None
         payload: dict[str, object] | None = None
+        research_started = perf_counter()
 
         for iteration in range(1, MAX_RESEARCH_ITERATIONS + 1):
+            if iteration > 1 and perf_counter() - research_started >= MAX_RESEARCH_EXECUTION_SECONDS:
+                termination_reason = "research_elapsed_time_limit"
+                break
             decision = latency.stage(
                 f"research_iteration_{iteration}_decision",
                 lambda: self._decide_research_action(
@@ -576,6 +587,7 @@ class AgentRuntime:
                 ),
             )
             action_queries = decision.queries
+            action_urls = tuple(url for url in decision.urls if url.casefold() not in fetched_urls)
             if decision.next_action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT"}:
                 action_queries = action_queries[:max(0, MAX_RESEARCH_SEARCH_CALLS - search_calls)]
             activity = {
@@ -583,7 +595,7 @@ class AgentRuntime:
                 "decision": decision.next_action,
                 "decision_summary": decision.decision_summary,
                 "queries": list(action_queries),
-                "urls": list(decision.urls),
+                "urls": list(action_urls),
                 "provider": decision.provider,
                 "unresolved": list(decision.unresolved_questions),
                 "ready_to_answer": decision.ready_to_answer,
@@ -604,7 +616,7 @@ class AgentRuntime:
                 state_history.append(ResearchState.SYNTHESIZING.value)
                 candidate_answer, candidate_payload = latency.stage(
                     "final_synthesis",
-                    lambda: self._synthesize_research(
+                    lambda: self._synthesize_research_resilient(
                         question, all_tools, system_prompt, latency, persistent_context, research_plan,
                         use_critic=decision.use_critic or decision.complexity == "COMPLEX",
                     ),
@@ -639,6 +651,10 @@ class AgentRuntime:
                 activity["decision_summary"] = "Search budget exhausted; planner must finalize with explicit limitations."
                 round_activity.append(activity)
                 continue
+            if decision.next_action == "FETCH_PAGE" and not action_urls:
+                activity["decision_summary"] = "Previously fetched URLs suppressed; choose new evidence or finalize."
+                round_activity.append(activity)
+                continue
             if decision.next_action == "LOOKUP_AUTHOR":
                 prior_web_output = next((
                     str(tool.get("output", "")) for tool in reversed(all_tools)
@@ -654,13 +670,14 @@ class AgentRuntime:
                 activity["identity_resolution"] = "resolved researcher identity"
                 activity["queries"] = [resolved_query]
             action_key = json.dumps(
-                [decision.next_action, decision.provider, action_queries, decision.urls], ensure_ascii=False
+                [decision.next_action, decision.provider, action_queries, action_urls], ensure_ascii=False
             ).casefold()
             if action_key in executed_actions:
                 activity["decision_summary"] = "Duplicate action suppressed; choose a different action or finalize."
                 round_activity.append(activity)
                 continue
             executed_actions.add(action_key)
+            fetched_urls.update(url.casefold() for url in action_urls)
             if round_activity:
                 state_history.append(ResearchState.FOLLOWUP.value)
             state_history.append({
@@ -733,7 +750,7 @@ class AgentRuntime:
                         tuple(all_tools),
                         decision.search_category,
                         decision.freshness_importance,
-                        decision.urls,
+                        action_urls,
                     ),
                 )
             tool_calls += 1
@@ -755,7 +772,7 @@ class AgentRuntime:
             state_history.append(ResearchState.SYNTHESIZING.value)
             answer, payload = latency.stage(
                 "final_synthesis",
-                lambda: self._synthesize_research(
+                lambda: self._synthesize_research_resilient(
                     question, all_tools, system_prompt, latency, persistent_context, research_plan,
                     use_critic=True,
                 ),
@@ -801,6 +818,28 @@ class AgentRuntime:
             "claim_taxonomy": ("FACT", "INFERENCE", "FORECAST", "UNKNOWN"),
             "result": research_result,
         }
+
+    @staticmethod
+    def _research_capabilities(
+        plan: ResearchPlan, tools: list[dict[str, object]]
+    ) -> tuple[str, ...]:
+        known = {capability.name for capability in CAPABILITIES}
+        selected = [name for name in plan.preferred_capabilities if name in known]
+        names = {str(tool.get("name", "")) for tool in tools}
+        explicit = {
+            str(tool.get("capability")) for tool in tools
+            if isinstance(tool.get("capability"), str) and tool.get("capability") in known
+        }
+        inferred = []
+        if names & {"web_search", "web_sources", "search_web", "search_news", "fetch_page"}:
+            inferred.append("web")
+        if any(name.startswith("academic") for name in names):
+            inferred.append("academic")
+        if any(name.startswith("project") for name in names):
+            inferred.append("project")
+        if any(name.startswith("media") for name in names):
+            inferred.append("media")
+        return tuple(dict.fromkeys((*selected, *sorted(explicit), *inferred)))
 
     @staticmethod
     def _research_result(answer: str, tools: list[dict[str, object]]) -> dict[str, object]:
@@ -1317,6 +1356,27 @@ class AgentRuntime:
     def _search_mode(self, message: str) -> str:
         return self._search_decision(message).mode
 
+    def _synthesize_research_resilient(
+        self,
+        question: str,
+        tools: list[dict[str, object]],
+        system_prompt: str,
+        latency: LatencyRecorder,
+        persistent_context: str,
+        source_plan: object,
+        use_critic: bool,
+    ) -> tuple[str, dict[str, object]]:
+        try:
+            return self._synthesize_research(
+                question, tools, system_prompt, latency, persistent_context, source_plan, use_critic
+            )
+        except ValueError as error:
+            if "no assistant content" not in str(error):
+                raise
+            return self._synthesize_research(
+                question, tools, system_prompt, latency, persistent_context, source_plan, False
+            )
+
     def _synthesize_research(
         self,
         question: str,
@@ -1789,7 +1849,8 @@ class AgentRuntime:
             '"depth":"none|quick|deep","freshness_importance":"low|normal|high","evidence_needs":[],'
             '"primary_source_importance":"low|normal|high","scholarly_evidence_value":"low|normal|high",'
             '"market_data_value":"low|normal|high","entities":[],"unresolved_questions":[],"search_queries":[],'
-            '"preferred_capabilities":[],"source_preferences":[],"ready_to_answer":false}. '
+            '"preferred_capabilities":[],"source_preferences":[],"ready_to_answer":false,'
+            '"role":"main|coding|research|server"}. '
             "Use NO_SEARCH for writing, translation, supplied-text work, stable concepts, or local server/repository questions whose answer "
             "does not materially depend on external facts. A real company, market, industry, policy, person, publication, or current-event "
             "analysis requires external evidence when its premises were not supplied by the user, even if the requested output is framed as "
@@ -1895,6 +1956,7 @@ class AgentRuntime:
             preferred_capabilities=strings("preferred_capabilities", 8),
             source_preferences=strings("source_preferences", 8),
             ready_to_answer=value.get("ready_to_answer") is True or mode == "NO_SEARCH",
+            recommended_agent=value.get("role") if value.get("role") in {"main", "coding", "research", "server"} else "",
         )
 
     _parse_search_decision = _parse_research_plan

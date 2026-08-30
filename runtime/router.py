@@ -15,7 +15,12 @@ class Route:
     search_mode: str = "NO_SEARCH"
 
 
-def route_request(message: str, selected_agent: str, search_mode: str = "NO_SEARCH") -> Route:
+def route_request(
+    message: str,
+    selected_agent: str,
+    search_mode: str = "NO_SEARCH",
+    recommended_agent: str = "",
+) -> Route:
     if selected_agent not in AGENT_CHOICES:
         raise ValueError("unknown agent selection")
     if selected_agent != "auto":
@@ -23,7 +28,10 @@ def route_request(message: str, selected_agent: str, search_mode: str = "NO_SEAR
 
     if search_mode != "NO_SEARCH":
         return Route("research", f"{search_mode.replace('_', ' ').title()} selected for external verification", search_mode)
+    if recommended_agent in {"main", "coding", "research", "server"}:
+        return Route(recommended_agent, f"KIM selected {recommended_agent.title()} expertise", search_mode)
 
+    # Planner failure compatibility only; capability selection remains model-owned.
     normalized = message.lower()
     if any(term in normalized for term in ("gpu", "nvidia", "vllm", "systemd", "서비스", "서버", "로그", "disk", "메모리")):
         return Route("server", "Server status or GPU diagnostics requested", search_mode)

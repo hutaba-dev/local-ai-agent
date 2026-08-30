@@ -63,6 +63,7 @@ class MainToolLoopTests(unittest.TestCase):
         selector_input = client.requests[0]["messages"][1]["content"]
         self.assertIn('"role": "coder"', selector_input)
         self.assertEqual(result.route.agent, "coding")
+        self.assertEqual(result.selected_capabilities, ("documentation",))
         self.assertEqual(result.tools[0]["capability"], "documentation")
         self.assertEqual(result.tools[0]["action"], "READ")
         self.assertEqual(
@@ -257,6 +258,18 @@ class MainToolLoopTests(unittest.TestCase):
         self.assertNotIn("tools", client.requests[1])
         self.assertEqual(result.tools, [])
         call.assert_not_called()
+
+    def test_selected_capability_is_observable_without_a_tool_call(self) -> None:
+        client = SequencedClient([
+            {"role": "assistant", "content": '{"capabilities":["documentation"]}'},
+            {"role": "assistant", "content": "현재 지식으로 답변합니다."},
+        ])
+
+        with patch.dict(os.environ, {"MCP_ENABLED": "true"}, clear=False):
+            result = AgentRuntime(client=client).chat("공식 문서 관점에서 설명해줘", "main")
+
+        self.assertEqual(result.selected_capabilities, ("documentation",))
+        self.assertEqual(result.tools, [])
 
     def test_project_scope_lazily_exposes_all_semantic_project_tools(self) -> None:
         client = SequencedClient([

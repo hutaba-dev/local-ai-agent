@@ -5,12 +5,13 @@ import os
 import unittest
 from unittest.mock import patch
 
-from runtime.capability_registry import capability_catalog, detailed_tools
+from runtime.capability_registry import PermissionClass, TOOL_SPECS, capability_catalog, detailed_tools
+from runtime.role_registry import get_role
 
 
 class CapabilityRegistryTests(unittest.TestCase):
     def test_catalog_is_compact_and_reports_unconfigured_scopes(self) -> None:
-        with patch.dict(os.environ, {"MCP_ENABLED": "true"}, clear=False):
+        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_MEDIA_ENABLED": "false"}, clear=False):
             catalog = capability_catalog(project_available=False, image_available=False)
 
         self.assertEqual(len(catalog), 9)
@@ -68,6 +69,26 @@ class CapabilityRegistryTests(unittest.TestCase):
 
         self.assertEqual(next(item["status"] for item in without_guard if item["name"] == "browser"), "UNCONFIGURED")
         self.assertTrue(next(item["available"] for item in with_guard if item["name"] == "browser"))
+
+    def test_every_tool_permission_is_declared(self) -> None:
+        declared = {permission.value for permission in PermissionClass}
+
+        self.assertEqual({tool.permission for tool in TOOL_SPECS.values()} - declared, set())
+
+    def test_role_permissions_match_composed_capabilities(self) -> None:
+        secretary = set(get_role("secretary").permission_policy)
+        coder = set(get_role("coder").permission_policy)
+        image_director = set(get_role("image_director").permission_policy)
+
+        self.assertTrue({
+            PermissionClass.READ_PROJECT,
+            PermissionClass.WRITE_MEMORY,
+            PermissionClass.WRITE_ARTIFACT,
+            PermissionClass.EXECUTE_MEDIA,
+        } <= secretary)
+        self.assertIn(PermissionClass.READ_PROJECT, coder)
+        self.assertIn(PermissionClass.EXECUTE_MEDIA, image_director)
+        self.assertNotIn(PermissionClass.WRITE_WORKSPACE, image_director)
 
 
 if __name__ == "__main__":

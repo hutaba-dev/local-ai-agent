@@ -21,7 +21,7 @@ from runtime.image_client import (
     ImageQualityAssessment,
 )
 from runtime.projects import ProjectStore
-from runtime.router import Route
+from runtime.router import Route, route_request
 from runtime.tool_registry import (
     ToolResult,
     _rank_relevant_web_results,
@@ -347,6 +347,12 @@ class WebRuntimeTests(unittest.TestCase):
         })
         messages = self.fake_client.requests[-1]["json"]["messages"]
         self.assertTrue(any(message["content"] == "현재 repository 구조를 실제로 확인해서 설명해줘." for message in messages))
+
+    def test_model_role_selection_precedes_keyword_fallback(self) -> None:
+        route = route_request("GPU 코드 구조를 설명해줘", "auto", "NO_SEARCH", "main")
+
+        self.assertEqual(route.agent, "main")
+        self.assertIn("KIM selected", route.summary)
 
     def test_runtime_sends_images_as_multimodal_content(self) -> None:
         result = self.runtime.chat(
@@ -1733,6 +1739,49 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertFalse(result.research["rounds"][0]["ready_to_answer"])
         self.assertEqual(result.research["termination_reason"], "llm_evidence_sufficient")
         self.assertEqual(result.llm_calls[-1]["purpose"], "direct_research_synthesis")
+        self.assertEqual(result.selected_capabilities, ("web",))
+
+    def test_research_suppresses_already_fetched_urls_across_rounds(self) -> None:
+        class FetchDedupClient(FakeClient):
+            def post(self, url: str, json: dict[str, object]) -> FakeResponse:
+                self.requests.append({"url": url, "json": json})
+                responses = (
+                    '{"search_mode":"DEEP_RESEARCH","queries":["current evidence"]}',
+                    '{"next_action":"FETCH_PAGE","urls":["https://a.example/x","https://b.example/y"],'
+                    '"unresolved_questions":["more evidence"],"ready_to_answer":false}',
+                    '{"next_action":"FETCH_PAGE","urls":["https://b.example/y","https://c.example/z"],'
+                    '"unresolved_questions":["more evidence"],"ready_to_answer":false}',
+                    '{"next_action":"FINAL_ANSWER","urls":[],"unresolved_questions":[],'
+                    '"ready_to_answer":true,"complexity":"SIMPLE"}',
+                    "최종 답변",
+                )
+                response = FakeResponse()
+                response.json = lambda: {"choices": [{"message": {"content": responses[len(self.requests) - 1]}}], "usage": {}}  # type: ignore[method-assign]
+                return response
+
+        with patch("runtime.agent_runtime.execute_research_action", return_value=[]) as execute:
+            result = AgentRuntime(client=FetchDedupClient()).chat("최신 근거를 조사해줘", "research")
+
+        self.assertEqual(execute.call_count, 2)
+        self.assertEqual(execute.call_args_list[0].args[-1], ("https://a.example/x", "https://b.example/y"))
+        self.assertEqual(execute.call_args_list[1].args[-1], ("https://c.example/z",))
+        self.assertEqual(result.content, "최종 답변")
+
+    def test_empty_critic_synthesis_retries_once_without_critic(self) -> None:
+        runtime = AgentRuntime(client=FakeClient())
+        payload = {"choices": [{"message": {"content": "복구된 최종 답변"}}], "usage": {}}
+        with patch.object(
+            runtime,
+            "_synthesize_research",
+            side_effect=[ValueError("vLLM response had no assistant content"), ("복구된 최종 답변", payload)],
+        ) as synthesize:
+            answer, returned_payload = runtime._synthesize_research_resilient(
+                "질문", [], "system", LatencyRecorder(), "", ResearchPlan("DEEP_RESEARCH"), True
+            )
+
+        self.assertEqual((answer, returned_payload), ("복구된 최종 답변", payload))
+        self.assertEqual(synthesize.call_count, 2)
+        self.assertFalse(synthesize.call_args_list[1].args[-1])
 
     def test_invalid_gap_output_triggers_followup_instead_of_early_completion(self) -> None:
         class InvalidGapClient(FakeClient):

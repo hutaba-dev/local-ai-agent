@@ -1057,11 +1057,11 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
     )
     final_call = result.llm_calls[-1] if result.llm_calls else None
     active_role = get_role(result.route.agent)
-    capabilities_used = list(dict.fromkeys(
+    capabilities_used = list(dict.fromkeys((*result.selected_capabilities, *(
         str(tool.get("capability"))
         for tool in result.tools
         if isinstance(tool, dict) and tool.get("capability")
-    ))
+    ))))
     return {
         "session_id": result.session_id,
         "project_id": request.project_id,
@@ -1071,6 +1071,7 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         "activity": {
             "brain": "KIM",
             "role": {"id": active_role.id, "name": active_role.name},
+            "capabilities_selected": list(result.selected_capabilities),
             "capabilities_used": capabilities_used,
             "selected_agent": result.selected_agent,
             "routed_agent": result.route.agent,
