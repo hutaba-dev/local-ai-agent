@@ -45,7 +45,7 @@ class MCPDeveloperTests(unittest.TestCase):
         self.assertTrue(all(name not in names for name in {"shell", "git_commit", "git_push", "git_reset", "git_checkout"}))
         result = self.call("git_log", {"limit": 2})
         branch = self.call("git_branch_info", {})
-        shown = self.call("git_show", {"revision": "HEAD", "relative_path": "runtime/agent_runtime.py"})
+        shown = self.call("git_show", {"revision": "HEAD"})
         self.assertFalse(result.is_error)
         self.assertFalse(branch.is_error)
         self.assertFalse(shown.is_error)
