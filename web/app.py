@@ -210,9 +210,13 @@ def project_write_failure(status: str, project_name: str | None = None) -> dict[
         "PROJECT_STORAGE_OFFLINE": "Project storage가 offline이라 저장하지 못했습니다.",
     }
     return {
+        "session_id": None,
         "content": messages[status],
         "project_id": None,
         "conversation_id": None,
+        "research_result": None,
+        "activity": None,
+        "generated_images": [],
         "project_write": {
             "status": status,
             "success": False,

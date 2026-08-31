@@ -287,6 +287,20 @@ function addGeneratedImages(article, images) {
   }
 }
 
+function chatResponsePresentation(payload) {
+  if (!payload || typeof payload.content !== "string") {
+    throw new Error("Invalid chat response: content is missing");
+  }
+  const activity = payload.activity && typeof payload.activity === "object" ? payload.activity : null;
+  const routedAgent = typeof activity?.routed_agent === "string" ? activity.routed_agent : null;
+  return {
+    content: payload.content,
+    label: routedAgent || "Assistant",
+    activity,
+    researchResult: payload.research_result || null,
+  };
+}
+
 function addMessageAttachments(article, items) {
   if (!items.length) return;
   const container = document.createElement("div");
@@ -847,8 +861,9 @@ form.addEventListener("submit", async (event) => {
     const payload = await request("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, selected_agent: selector.value, session_id: sessionId, attachment_ids: submittedAttachments.map((attachment) => attachment.attachment_id), continuation_image_id: continuationImageId, project_id: currentProject?.id || null, conversation_id: currentConversation?.id || null }) });
     sessionId = payload.session_id;
     if (payload.continuation_image_id) continuationImageId = payload.continuation_image_id;
+    const presentation = chatResponsePresentation(payload);
     const article = addMessage(
-      "assistant", payload.content, payload.activity?.routed_agent || "main", payload.activity, payload.research_result,
+      "assistant", presentation.content, presentation.label, presentation.activity, presentation.researchResult,
     );
     addGeneratedImages(article, payload.generated_images);
   } catch (error) {

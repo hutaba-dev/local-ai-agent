@@ -839,8 +839,12 @@ class WebRuntimeTests(unittest.TestCase):
             "message": "이 내용을 현재 프로젝트에 저장해줘.", "selected_agent": "main",
         })
 
-        self.assertEqual(response.json()["project_write"]["status"], "PROJECT_NOT_SELECTED")
-        self.assertIn("어느 Project에 저장할까요", response.json()["content"])
+        payload = response.json()
+        self.assertEqual(payload["project_write"]["status"], "PROJECT_NOT_SELECTED")
+        self.assertIn("어느 Project에 저장할까요", payload["content"])
+        self.assertIsNone(payload["activity"])
+        self.assertIsNone(payload["research_result"])
+        self.assertEqual(payload["generated_images"], [])
         self.assertEqual(client.get(f"/api/projects/{project['id']}/files").json()["files"], [])
         self.assertEqual(len(self.fake_client.requests), request_count)
 

@@ -26,6 +26,54 @@ class AnswerRenderingTests(unittest.TestCase):
             ["node", "-e", program], check=True, capture_output=True, text=True
         ).stdout
 
+    def present_chat_response(self, payload: dict[str, object]) -> dict[str, object]:
+        source = SCRIPT.read_text(encoding="utf-8")
+        start = source.index("function chatResponsePresentation")
+        end = source.index("function addMessageAttachments", start)
+        presenter = source[start:end]
+        program = (
+            f"{presenter}\nprocess.stdout.write(JSON.stringify("
+            f"chatResponsePresentation({json.dumps(payload)})));"
+        )
+        output = subprocess.run(
+            ["node", "-e", program], check=True, capture_output=True, text=True
+        ).stdout
+        return json.loads(output)
+
+    def test_project_clarification_without_activity_is_renderable(self) -> None:
+        presentation = self.present_chat_response({
+            "content": "현재 연결된 Project가 없습니다. 어느 Project에 저장할까요?",
+            "activity": None,
+            "project_write": {"status": "PROJECT_NOT_SELECTED"},
+        })
+
+        self.assertEqual(presentation["label"], "Assistant")
+        self.assertIsNone(presentation["activity"])
+        self.assertIn("어느 Project", presentation["content"])
+
+    def test_normal_research_response_preserves_routed_agent(self) -> None:
+        presentation = self.present_chat_response({
+            "content": "Research result",
+            "activity": {"routed_agent": "research"},
+            "research_result": {"body_markdown": "# Research result"},
+        })
+
+        self.assertEqual(presentation["label"], "research")
+        self.assertEqual(presentation["activity"]["routed_agent"], "research")
+        self.assertEqual(presentation["researchResult"]["body_markdown"], "# Research result")
+
+    def test_malformed_chat_response_without_content_is_rejected(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+        start = source.index("function chatResponsePresentation")
+        end = source.index("function addMessageAttachments", start)
+        presenter = source[start:end]
+        program = f"{presenter}\nchatResponsePresentation({{activity: null}});"
+
+        result = subprocess.run(["node", "-e", program], capture_output=True, text=True)
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Invalid chat response: content is missing", result.stderr)
+
     def test_research_markdown_renders_sections_table_sources_and_statuses(self) -> None:
         output = self.render(
             "# NVIDIA earnings\n\nSummary with VERIFIED evidence.\n\n"
