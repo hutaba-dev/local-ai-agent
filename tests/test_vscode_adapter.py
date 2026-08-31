@@ -182,6 +182,8 @@ class VSCodeAdapterTests(unittest.TestCase):
         self.assertGreater(pressure["tool_result_tokens"], 0)
         self.assertEqual(pressure["tool_count"], 1)
         self.assertEqual(pressure["requested_max_tokens"], 4096)
+        self.assertEqual(pressure["configured_vs_code_max_input_tokens"], 28672)
+        self.assertEqual(pressure["configured_vllm_max_model_len"], 32768)
         self.assertNotIn("private", json.dumps(pressure))
 
     def test_empty_user_continuation_is_observed_but_not_repaired_before_capture(self) -> None:
@@ -278,6 +280,107 @@ class VSCodeAdapterTests(unittest.TestCase):
         self.assertEqual(forwarded["messages"][-1], {"role": "user", "content": SYNTHETIC_CONTINUATION})
         self.assertEqual(metrics["synthetic_inserted"], 1)
         self.assertEqual(metrics["requests_2xx"], 1)
+
+    def test_streaming_reasoning_only_is_finalized_once_without_reasoning_leakage(self) -> None:
+        class ChunkStream(httpx.AsyncByteStream):
+            def __init__(self, chunks: list[bytes]) -> None:
+                self.chunks = chunks
+
+            async def __aiter__(self):
+                for chunk in self.chunks:
+                    yield chunk
+
+        responses = [
+            [
+                b'data: {"choices":[{"delta":{"reasoning_content":"private analysis"}}]}\n\n',
+                b'data: {"choices":[{"delta":{},"finish_reason":"length"}]}\n\n',
+                b"data: [DONE]\n\n",
+            ],
+            [
+                b'data: {"choices":[{"delta":{"content":"final answer"}}]}\n\n',
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\n\n',
+                b"data: [DONE]\n\n",
+            ],
+        ]
+        payload = {"model": "qwen3.8-27b", "messages": [
+            {"role": "user", "content": "finish"},
+        ], "tools": [{"type": "function", "function": {
+            "name": "read", "parameters": {"type": "object"},
+        }}], "tool_choice": "auto", "max_tokens": 32, "stream": True}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=ChunkStream(responses[len(self.requests) - 1]),
+            )
+
+        client, upstream = self.client(handler)
+        with patch("vscode_adapter.app.httpx.AsyncClient", return_value=upstream), client:
+            with client.stream("POST", "/v1/chat/completions", json=payload) as response:
+                received = b"".join(response.iter_bytes())
+
+        repair_payload = json.loads(self.requests[1].content)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(self.requests), 2)
+        self.assertIn(b'"content":"final answer"', received)
+        self.assertNotIn(b"private analysis", received)
+        self.assertNotIn(b"reasoning_content", received)
+        self.assertNotIn("tools", repair_payload)
+        self.assertNotIn("tool_choice", repair_payload)
+        self.assertEqual(repair_payload["max_tokens"], 512)
+        self.assertFalse(repair_payload["chat_template_kwargs"]["enable_thinking"])
+        self.assertEqual(metrics["empty_upstream_finals"], 1)
+        self.assertEqual(metrics["empty_output_repairs"], 1)
+        self.assertEqual(metrics["final_text_success"], 1)
+
+    def test_nonstream_reasoning_only_is_finalized(self) -> None:
+        responses = [
+            {"choices": [{"message": {
+                "role": "assistant", "content": None, "reasoning_content": "private analysis",
+            }, "finish_reason": "length"}]},
+            {"choices": [{"message": {
+                "role": "assistant", "content": "final answer",
+            }, "finish_reason": "stop"}]},
+        ]
+        payload = {"model": "qwen3.8-27b", "messages": [
+            {"role": "user", "content": "finish"},
+        ], "stream": False}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            return httpx.Response(200, json=responses[len(self.requests) - 1])
+
+        client, upstream = self.client(handler)
+        with patch("vscode_adapter.app.httpx.AsyncClient", return_value=upstream), client:
+            response = client.post("/v1/chat/completions", json=payload)
+
+        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(response.json()["choices"][0]["message"]["content"], "final answer")
+        self.assertNotIn("reasoning_content", response.text)
+        self.assertEqual(metrics["empty_output_repairs"], 1)
+
+    def test_empty_finalization_is_not_retried(self) -> None:
+        responses = [
+            {"choices": [{"message": {"role": "assistant", "content": None}, "finish_reason": "length"}]},
+            {"choices": [{"message": {"role": "assistant", "content": None}, "finish_reason": "length"}]},
+        ]
+        payload = {"model": "qwen3.8-27b", "messages": [
+            {"role": "user", "content": "finish"},
+        ], "stream": False}
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            self.requests.append(request)
+            return httpx.Response(200, json=responses[len(self.requests) - 1])
+
+        client, upstream = self.client(handler)
+        with patch("vscode_adapter.app.httpx.AsyncClient", return_value=upstream), client:
+            response = client.post("/v1/chat/completions", json=payload)
+
+        self.assertEqual(len(self.requests), 2)
+        self.assertIsNone(response.json()["choices"][0]["message"]["content"])
+        self.assertEqual(metrics["empty_output_repairs"], 1)
 
     def test_models_and_authorization_are_forwarded(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:

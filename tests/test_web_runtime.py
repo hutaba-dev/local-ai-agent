@@ -1,6 +1,7 @@
 import json
 import sqlite3
 from dataclasses import replace
+from types import SimpleNamespace
 
 from runtime.web_search import _s2_author_queries, _select_s2_author, academic_papers, fetch_sources, s2_get_author, s2_get_author_papers, s2_get_paper, s2_search_author, search, unpaywall_get_oa_location
 import os
@@ -409,12 +410,15 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertIn("[redacted host]", result.content)
         self.assertIn("[redacted IP]", result.content)
 
-    def test_fastapi_chat_uses_runtime_not_a_direct_vllm_proxy(self) -> None:
+    def test_fastapi_chat_reports_capability_selection_and_response_calls(self) -> None:
         previous_runtime = web_app.runtime
         web_app.runtime = self.runtime
         try:
-            client = self.authenticated_client()
-            response = client.post("/api/chat", json={"message": "안녕", "selected_agent": "main"})
+            with patch("runtime.agent_runtime.capability_catalog", return_value=[{
+                "name": "search_web", "available": True,
+            }]):
+                client = self.authenticated_client()
+                response = client.post("/api/chat", json={"message": "안녕", "selected_agent": "main"})
         finally:
             web_app.runtime = previous_runtime
 
@@ -422,10 +426,14 @@ class WebRuntimeTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["content"], "verified response")
         self.assertTrue(payload["activity"]["direct"])
-        self.assertEqual(payload["activity"]["whole_request_usage"]["llm_call_count"], 1)
-        self.assertEqual(payload["activity"]["whole_request_usage"]["input_tokens"], 10)
-        self.assertEqual(payload["activity"]["whole_request_usage"]["output_tokens"], 4)
+        self.assertEqual(payload["activity"]["whole_request_usage"]["llm_call_count"], 2)
+        self.assertEqual(payload["activity"]["whole_request_usage"]["input_tokens"], 20)
+        self.assertEqual(payload["activity"]["whole_request_usage"]["output_tokens"], 8)
         self.assertIn("end_to_end_tokens_per_second", payload["activity"])
+        self.assertEqual(
+            [call["purpose"] for call in payload["activity"]["llm_calls"]],
+            ["capability_selection", "response"],
+        )
         self.assertEqual(payload["activity"]["final_call"]["purpose"], "response")
         self.assertEqual(self.fake_client.requests[0]["url"], "http://127.0.0.1:8000/v1/chat/completions")
         self.assertEqual(self.fake_client.requests[0]["json"]["chat_template_kwargs"], {"enable_thinking": False})
@@ -1287,18 +1295,30 @@ class WebRuntimeTests(unittest.TestCase):
         messages = self.fake_client.requests[-1]["json"]["messages"]
         self.assertFalse(any(message["content"] == "private GPU diagnostic" for message in messages))
 
-    def test_auto_current_fact_routes_to_research_and_reports_missing_search_key(self) -> None:
+    def test_auto_current_fact_uses_mcp_when_legacy_search_keys_are_missing(self) -> None:
         runtime = AgentRuntime(client=SearchDecisionClient())
+        empty_mcp_result = SimpleNamespace(
+            success=True,
+            output={"results": []},
+            tool="search_web",
+            server="search",
+            status="AVAILABLE",
+            duration_ms=1,
+            executed=True,
+        )
         with patch.dict(os.environ, {
             "SEARXNG_URL": "", "SERPER_API_KEY": "", "BRAVE_SEARCH_API_KEY": "",
-        }):
+        }), patch("runtime.tool_registry.mcp_tool_enabled", return_value=True), patch(
+            "runtime.tool_registry.call_mcp_tool", return_value=empty_mcp_result,
+        ):
             result = runtime.chat("오늘 서울 날씨는 어때?", "auto")
 
         self.assertEqual(result.route.agent, "research")
         self.assertEqual(result.route.search_mode, "QUICK_SEARCH")
         self.assertEqual(result.tools[-1]["name"], "web_search")
         self.assertFalse(result.tools[-1]["success"])
-        self.assertIn("web search is required but unavailable", result.tools[-1]["error"])
+        self.assertEqual(result.tools[-1]["error"], "MCP search returned no usable results")
+        self.assertEqual(result.tools[-1]["details"]["execution"], "mcp")
         self.assertEqual(result.research["rounds"][0]["provider"], "auto")
 
     def test_model_search_decision_controls_search_mode(self) -> None:
