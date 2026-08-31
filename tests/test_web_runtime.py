@@ -21,7 +21,7 @@ from runtime.image_client import (
     ImagePromptPlan,
     ImageQualityAssessment,
 )
-from runtime.projects import ProjectStore
+from runtime.projects import ProjectStorageOfflineError, ProjectStore
 from runtime.router import Route, route_request
 from runtime.tool_registry import (
     ToolResult,
@@ -767,6 +767,189 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertFalse(storage.json()["online"])
         self.assertEqual(project.status_code, 503)
         self.assertEqual(general.status_code, 200)
+
+    def test_project_chat_explicit_report_save_uses_bound_project(self) -> None:
+        client = self.authenticated_client()
+        project = client.post("/api/projects", json={"name": "Bound Project"}).json()
+        conversation = client.post(
+            f"/api/projects/{project['id']}/conversations", json={"title": "Report"}
+        ).json()
+        result = self.runtime.chat("hello", "main")
+
+        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_PROJECT_ENABLED": "true"}), patch(
+            "web.app.runtime.chat", return_value=replace(result, content="verified report")
+        ):
+            response = client.post("/api/chat", json={
+                "message": "이 보고서를 저장해줘.",
+                "selected_agent": "main",
+                "project_id": project["id"],
+                "conversation_id": conversation["id"],
+            })
+
+        payload = response.json()
+        files = client.get(f"/api/projects/{project['id']}/files").json()["files"]
+        self.assertTrue(payload["project_write"]["success"])
+        self.assertEqual(payload["project_write"]["project_name"], "Bound Project")
+        self.assertEqual(payload["project_write"]["resource_type"], "artifact")
+        self.assertTrue(payload["project_write"]["resource_id"])
+        self.assertEqual(len(files), 1)
+
+    def test_general_chat_resolves_unique_named_project_for_save(self) -> None:
+        client = self.authenticated_client()
+        project = client.post("/api/projects", json={"name": "ABC"}).json()
+        result = self.runtime.chat("hello", "main")
+
+        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_PROJECT_ENABLED": "true"}), patch(
+            "web.app.runtime.chat", return_value=replace(result, content="named project report")
+        ):
+            response = client.post("/api/chat", json={
+                "message": "ABC 프로젝트에 이 보고서를 저장해줘.", "selected_agent": "main",
+            })
+
+        payload = response.json()
+        files = client.get(f"/api/projects/{project['id']}/files").json()["files"]
+        self.assertEqual(payload["project_id"], project["id"])
+        self.assertTrue(payload["project_write"]["success"])
+        self.assertEqual(payload["project_write"]["project_name"], "ABC")
+        self.assertEqual(len(files), 1)
+
+    def test_general_chat_prefers_longest_exact_named_project(self) -> None:
+        client = self.authenticated_client()
+        short = client.post("/api/projects", json={"name": "ABC"}).json()
+        long = client.post("/api/projects", json={"name": "Visual ABC"}).json()
+        result = self.runtime.chat("hello", "main")
+
+        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_PROJECT_ENABLED": "true"}), patch(
+            "web.app.runtime.chat", return_value=replace(result, content="long named project report")
+        ):
+            response = client.post("/api/chat", json={
+                "message": "Visual ABC 프로젝트에 보고서를 저장해줘.", "selected_agent": "main",
+            })
+
+        self.assertEqual(response.json()["project_id"], long["id"])
+        self.assertEqual(client.get(f"/api/projects/{short['id']}/files").json()["files"], [])
+        self.assertEqual(len(client.get(f"/api/projects/{long['id']}/files").json()["files"]), 1)
+
+    def test_general_chat_without_bound_project_requests_selection(self) -> None:
+        client = self.authenticated_client()
+        project = client.post("/api/projects", json={"name": "Do Not Guess"}).json()
+        request_count = len(self.fake_client.requests)
+
+        response = client.post("/api/chat", json={
+            "message": "이 내용을 현재 프로젝트에 저장해줘.", "selected_agent": "main",
+        })
+
+        self.assertEqual(response.json()["project_write"]["status"], "PROJECT_NOT_SELECTED")
+        self.assertIn("어느 Project에 저장할까요", response.json()["content"])
+        self.assertEqual(client.get(f"/api/projects/{project['id']}/files").json()["files"], [])
+        self.assertEqual(len(self.fake_client.requests), request_count)
+
+    def test_general_chat_does_not_guess_between_duplicate_project_names(self) -> None:
+        client = self.authenticated_client()
+        first = client.post("/api/projects", json={"name": "Duplicate"}).json()
+        second = client.post("/api/projects", json={"name": "Duplicate"}).json()
+
+        response = client.post("/api/chat", json={
+            "message": "Duplicate 프로젝트에 저장해줘.", "selected_agent": "main",
+        })
+
+        self.assertEqual(response.json()["project_write"]["status"], "AMBIGUOUS_PROJECT")
+        self.assertEqual(client.get(f"/api/projects/{first['id']}/files").json()["files"], [])
+        self.assertEqual(client.get(f"/api/projects/{second['id']}/files").json()["files"], [])
+
+    def test_general_chat_reports_named_project_not_found(self) -> None:
+        client = self.authenticated_client()
+
+        response = client.post("/api/chat", json={
+            "message": "Missing 프로젝트에 보고서를 저장해줘.", "selected_agent": "main",
+        })
+
+        self.assertEqual(response.json()["project_write"]["status"], "PROJECT_NOT_FOUND")
+        self.assertIn("찾을 수 없습니다", response.json()["content"])
+
+    def test_general_chat_reports_project_permission_denied(self) -> None:
+        guest = self.authenticated_client("test-guest")
+
+        response = guest.post("/api/chat", json={
+            "message": "ABC 프로젝트에 보고서를 저장해줘.", "selected_agent": "main",
+        })
+
+        self.assertEqual(response.json()["project_write"]["status"], "PERMISSION_DENIED")
+        self.assertIn("권한이 없습니다", response.json()["content"])
+
+    def test_general_media_save_uses_resolved_named_project(self) -> None:
+        client = self.authenticated_client()
+        project = client.post("/api/projects", json={"name": "Visual ABC"}).json()
+        generated = GeneratedImage(b"png", 42, "generate", "generate-42.png")
+
+        with patch("web.app.build_image_prompt", side_effect=planned_prompt), patch(
+            "web.app.assess_image_quality", return_value=PASSED_IMAGE_QUALITY
+        ), patch("web.app.create_image", return_value=generated):
+            response = client.post("/api/chat", json={
+                "message": "/image glass tower Visual ABC 프로젝트에 저장해줘.",
+            })
+
+        payload = response.json()
+        files = client.get(f"/api/projects/{project['id']}/files").json()["files"]
+        self.assertTrue(payload["project_write"]["success"])
+        self.assertEqual(payload["project_write"]["resource_type"], "image_artifact")
+        self.assertTrue(payload["project_write"]["resource_id"])
+        self.assertEqual(files[0]["original_name"], "generate-42.png")
+
+    def test_general_media_reports_partial_success_when_project_write_goes_offline(self) -> None:
+        client = self.authenticated_client()
+        client.post("/api/projects", json={"name": "Visual Offline"})
+        generated = GeneratedImage(b"png", 42, "generate", "generate-42.png")
+
+        with patch("web.app.build_image_prompt", side_effect=planned_prompt), patch(
+            "web.app.assess_image_quality", return_value=PASSED_IMAGE_QUALITY
+        ), patch("web.app.create_image", return_value=generated), patch.object(
+            web_app.project_store, "save_file", side_effect=ProjectStorageOfflineError("project storage is offline")
+        ):
+            response = client.post("/api/chat", json={
+                "message": "/image glass tower Visual Offline 프로젝트에 저장해줘.",
+            })
+
+        payload = response.json()
+        self.assertTrue(payload["generated_images"])
+        self.assertEqual(payload["project_write"]["status"], "PROJECT_STORAGE_OFFLINE")
+        self.assertTrue(payload["project_write"]["partial_success"])
+        self.assertIn("저장하지 못했습니다", payload["content"])
+
+    def test_explicit_project_save_reports_storage_offline_without_fallback(self) -> None:
+        previous_store = web_app.project_store
+        web_app.project_store = ProjectStore(
+            Path(self.temporary_directory.name) / "offline-write.db",
+            Path(self.temporary_directory.name) / "missing-write-storage",
+            require_mount=True,
+        )
+        try:
+            client = self.authenticated_client()
+            response = client.post("/api/chat", json={
+                "message": "이 내용을 현재 프로젝트에 저장해줘.", "selected_agent": "main",
+            })
+        finally:
+            web_app.project_store = previous_store
+
+        self.assertEqual(response.json()["project_write"]["status"], "PROJECT_STORAGE_OFFLINE")
+        self.assertIn("저장하지 못했습니다", response.json()["content"])
+
+    def test_general_research_without_save_intent_does_not_resolve_or_write_project(self) -> None:
+        client = self.authenticated_client()
+        base_result = self.runtime.chat("hello", "main")
+        result = replace(base_result, route=Route("research", "Research fixture", "QUICK_SEARCH"))
+
+        with patch("web.app.runtime.chat", return_value=result), patch.object(
+            web_app.project_store, "list_projects", wraps=web_app.project_store.list_projects
+        ) as list_projects, patch("web.app.call_mcp_tool") as project_write:
+            response = client.post("/api/chat", json={
+                "message": "최신 수소 연구를 요약해줘.", "selected_agent": "research",
+            })
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()["project_write"])
+        list_projects.assert_not_called()
+        project_write.assert_not_called()
 
     def test_web_image_command_returns_renderable_png(self) -> None:
         client = self.authenticated_client()

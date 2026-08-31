@@ -37,6 +37,7 @@ from runtime.image_client import (
     requests_reference_research,
 )
 from runtime.media import execute_media_edit, execute_media_generation
+from runtime.mcp_host import MCPCallOutcome, call_mcp_tool
 from runtime.projects import ProjectNotFoundError, ProjectPathError, ProjectStorageOfflineError, ProjectStore
 from runtime.project_tools import ProjectTools
 from runtime.role_registry import get_role, selectable_roles
@@ -154,6 +155,91 @@ class UploadedAttachment:
     images: tuple[tuple[str, str, bytes], ...]
     created_at: float
     image_context: dict[str, object] | None = None
+
+
+PROJECT_WRITE_PATTERN = re.compile(r"(?:저장|넣어|기록|보관|save|add)", re.IGNORECASE)
+PROJECT_REFERENCE_PATTERN = re.compile(r"(?:project|프로젝트)", re.IGNORECASE)
+
+
+def project_write_requested(message: str, bound_project_id: str | None) -> bool:
+    return bool(PROJECT_WRITE_PATTERN.search(message)) and bool(
+        bound_project_id or PROJECT_REFERENCE_PATTERN.search(message)
+    )
+
+
+def resolve_project_write_target(owner_id: str, message: str) -> tuple[dict[str, object] | None, str | None]:
+    projects = project_store.list_projects(owner_id)
+    matches = [
+        project for project in projects
+        if re.search(
+            rf"{re.escape(str(project.get('name', '')).strip())}\s*(?:project|프로젝트)(?:에|로|에다가)",
+            message,
+            re.IGNORECASE,
+        )
+    ]
+    if matches:
+        longest = max(len(str(project.get("name", ""))) for project in matches)
+        matches = [project for project in matches if len(str(project.get("name", ""))) == longest]
+    if len(matches) == 1:
+        return matches[0], None
+    if len(matches) > 1:
+        return None, "AMBIGUOUS_PROJECT"
+    named_reference = re.search(
+        r"([A-Za-z0-9가-힣][A-Za-z0-9가-힣 _-]{0,119}?)\s*(?:project|프로젝트)(?:에|로|에다가)",
+        message,
+        re.IGNORECASE,
+    )
+    if named_reference:
+        candidate = named_reference.group(1).strip().casefold()
+        generic_candidates = {
+            "현재", "지금", "이", "해당", "연결된", "current", "the current",
+            "내용을", "결과를", "보고서를", "이 내용을", "이 결과를", "이 보고서를",
+        }
+        generic_suffixes = (" 현재", " 지금", " 해당", " 연결된", " current", " the current")
+        if candidate not in generic_candidates and not candidate.endswith(generic_suffixes):
+            return None, "PROJECT_NOT_FOUND"
+    return None, "PROJECT_NOT_SELECTED"
+
+
+def project_write_failure(status: str, project_name: str | None = None) -> dict[str, object]:
+    messages = {
+        "PROJECT_NOT_SELECTED": "현재 연결된 Project가 없습니다. 어느 Project에 저장할까요?",
+        "PROJECT_NOT_FOUND": "요청한 Project를 찾을 수 없습니다. Project 이름을 확인해주세요.",
+        "AMBIGUOUS_PROJECT": "같은 이름의 Project가 여러 개입니다. 저장할 Project를 선택해주세요.",
+        "PERMISSION_DENIED": "이 계정은 Project에 저장할 권한이 없습니다.",
+        "PROJECT_STORAGE_OFFLINE": "Project storage가 offline이라 저장하지 못했습니다.",
+    }
+    return {
+        "content": messages[status],
+        "project_id": None,
+        "conversation_id": None,
+        "project_write": {
+            "status": status,
+            "success": False,
+            "project_name": project_name,
+            "resource_type": None,
+            "resource_id": None,
+        },
+    }
+
+
+def project_write_result(
+    outcome: MCPCallOutcome, project: dict[str, object], resource_type: str
+) -> dict[str, object]:
+    output = outcome.output or {}
+    resource = output.get("memory") if resource_type == "memory" else output.get("artifact")
+    resource_id = None
+    if isinstance(resource, dict):
+        resource_id = resource.get("id") or resource.get("artifact_id") or resource.get("file_id")
+    return {
+        "status": outcome.status,
+        "success": outcome.success,
+        "project_name": project.get("name"),
+        "project_id": project.get("id"),
+        "resource_type": resource_type,
+        "resource_id": resource_id,
+        "error": outcome.error,
+    }
 
 
 def current_user(request: Request) -> User:
@@ -645,6 +731,24 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         raise HTTPException(status_code=403, detail="guest accounts cannot upload files")
     if bool(request.project_id) != bool(request.conversation_id):
         raise HTTPException(status_code=422, detail="project_id and conversation_id must be provided together")
+    write_requested = project_write_requested(request.message, request.project_id)
+    write_project: dict[str, object] | None = None
+    if write_requested:
+        if user.role == "guest":
+            return project_write_failure("PERMISSION_DENIED")
+        try:
+            project_store.require_storage()
+            if request.project_id:
+                write_project = project_store.get_project(user.username, request.project_id)
+            else:
+                write_project, resolution_error = resolve_project_write_target(user.username, request.message)
+                if resolution_error:
+                    return project_write_failure(resolution_error)
+                request = request.model_copy(update={"project_id": str(write_project["id"])})
+        except ProjectStorageOfflineError:
+            return project_write_failure("PROJECT_STORAGE_OFFLINE")
+        except ProjectNotFoundError:
+            return project_write_failure("PROJECT_NOT_FOUND")
     project_context = ""
     project_user_message_id = None
     if request.project_id and request.conversation_id:
@@ -867,7 +971,8 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         )
         effective_mode = "regenerate" if internal_regenerate else generated.mode
         project_artifact = None
-        if request.project_id and request.conversation_id:
+        media_project_write = None
+        if request.project_id:
             if is_explicit_visual_preference(request.message):
                 project_store.add_memory(
                     user.username,
@@ -890,22 +995,36 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
                     "image.edit" if generated.mode == "edit" else "image.generate"
                 ],
             }, ensure_ascii=True, separators=(",", ":"))
-            project_artifact = project_store.save_file(
-                user.username,
-                request.project_id,
-                generated.filename,
-                generated.content,
-                "image/png",
-                "",
-                request.conversation_id,
-                artifact=True,
-                creator="assistant",
-                description=artifact_provenance,
-                source_message_id=project_user_message_id,
-            )
-            project_store.add_message(
-                user.username, request.project_id, request.conversation_id, "assistant", assistant_content
-            )
+            try:
+                project_artifact = project_store.save_file(
+                    user.username,
+                    request.project_id,
+                    generated.filename,
+                    generated.content,
+                    "image/png",
+                    "",
+                    request.conversation_id,
+                    artifact=True,
+                    creator="assistant",
+                    description=artifact_provenance,
+                    source_message_id=project_user_message_id,
+                )
+            except ProjectStorageOfflineError:
+                media_project_write = {
+                    "status": "PROJECT_STORAGE_OFFLINE",
+                    "success": False,
+                    "project_name": write_project.get("name") if write_project else None,
+                    "project_id": request.project_id,
+                    "resource_type": "image_artifact",
+                    "resource_id": None,
+                    "error": "project storage is offline",
+                    "partial_success": True,
+                }
+                assistant_content += " 이미지는 생성했지만 Project storage가 offline이라 저장하지 못했습니다."
+            if request.conversation_id:
+                project_store.add_message(
+                    user.username, request.project_id, request.conversation_id, "assistant", assistant_content
+                )
         image_activity = {
             "mode": effective_mode,
             "reason": decision_reason,
@@ -984,6 +1103,17 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             "project_id": request.project_id,
             "conversation_id": request.conversation_id,
             "project_artifact": project_artifact,
+            "project_write": media_project_write or {
+                "status": "AVAILABLE" if project_artifact else None,
+                "success": bool(project_artifact),
+                "project_name": write_project.get("name") if write_project else None,
+                "project_id": request.project_id,
+                "resource_type": "image_artifact" if project_artifact else None,
+                "resource_id": (
+                    project_artifact.get("artifact_id") or project_artifact.get("id")
+                    if isinstance(project_artifact, dict) else None
+                ),
+            } if write_requested else None,
         })
         return response
     message, images = attached_message(request.message, request.attachment_ids, owner)
@@ -994,7 +1124,7 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
     runtime_allowed_agents = allowed_agents(user)
     if request.attachment_ids:
         runtime_allowed_agents = runtime_allowed_agents | {"coding"}
-    session_id = None if request.project_id else request.session_id
+    session_id = None if request.project_id and request.conversation_id else request.session_id
     if user.role == "guest" and session_id and chat_session_roles.get(session_id) != "guest":
         session_id = None
     if session_id and chat_session_owners.get(session_id) not in {None, owner}:
@@ -1003,6 +1133,7 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         project_scope = ProjectToolScope(
             ProjectTools(project_store), user.username, request.project_id, request.conversation_id
         ) if request.project_id else None
+        runtime_project_scope = None if write_requested else project_scope
         result = await run_in_threadpool(
             runtime.chat,
             message,
@@ -1012,7 +1143,7 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             False,
             images,
             project_context,
-            project_scope,
+            runtime_project_scope,
         )
     except PermissionError as error:
         raise HTTPException(status_code=403, detail=str(error)) from error
@@ -1044,6 +1175,36 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             result.content,
             project_user_message_id,
         )
+    project_write = None
+    response_content = result.content
+    if write_requested and write_project and project_scope:
+        resource_type = "memory" if re.search(r"(?:memory|메모리|기억)", request.message, re.IGNORECASE) else "artifact"
+        if resource_type == "memory":
+            tool_name = "project_save_memory"
+            arguments = {
+                "memory_type": "research_result" if result.route.agent == "research" else "summary",
+                "content": result.content,
+                "confidence": "HIGH",
+            }
+        else:
+            tool_name = "project_save_artifact"
+            arguments = {
+                "name": f"chat-report-{int(time())}-{secrets.token_hex(3)}.md",
+                "content": result.content,
+                "artifact_type": "report" if result.route.agent == "research" or "보고서" in request.message else "text",
+                "description": "Saved from General Chat" if not request.conversation_id else "Saved from Project Chat",
+            }
+        outcome = await run_in_threadpool(call_mcp_tool, tool_name, arguments, project_scope)
+        project_write = project_write_result(outcome, write_project, resource_type)
+        if project_write["success"]:
+            response_content += (
+                f"\n\nProject 저장 성공: {project_write['project_name']} / "
+                f"{project_write['resource_type']} / {project_write['resource_id']}"
+            )
+        else:
+            response_content += (
+                f"\n\nProject 저장 실패: {project_write['status']}. 실제 저장은 수행되지 않았습니다."
+            )
     usage = result.usage or {}
     completion_tokens = usage.get("completion_tokens")
     end_to_end_tokens_per_second = None
@@ -1066,8 +1227,9 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         "session_id": result.session_id,
         "project_id": request.project_id,
         "conversation_id": request.conversation_id,
-        "content": result.content,
+        "content": response_content,
         "research_result": result.research.get("result"),
+        "project_write": project_write,
         "activity": {
             "brain": "KIM",
             "role": {"id": active_role.id, "name": active_role.name},

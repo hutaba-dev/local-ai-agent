@@ -848,7 +848,7 @@ form.addEventListener("submit", async (event) => {
     sessionId = payload.session_id;
     if (payload.continuation_image_id) continuationImageId = payload.continuation_image_id;
     const article = addMessage(
-      "assistant", payload.content, payload.activity.routed_agent, payload.activity, payload.research_result,
+      "assistant", payload.content, payload.activity?.routed_agent || "main", payload.activity, payload.research_result,
     );
     addGeneratedImages(article, payload.generated_images);
   } catch (error) {
