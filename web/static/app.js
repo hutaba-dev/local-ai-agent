@@ -866,6 +866,7 @@ form.addEventListener("submit", async (event) => {
       "assistant", presentation.content, presentation.label, presentation.activity, presentation.researchResult,
     );
     addGeneratedImages(article, payload.generated_images);
+    if (payload.project_action?.success) await loadProjects();
   } catch (error) {
     if (error.status === 404 && (submittedAttachments.length || continuationImageId)) {
       continuationImageId = null;

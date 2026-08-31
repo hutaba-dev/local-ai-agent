@@ -62,6 +62,39 @@ class AnswerRenderingTests(unittest.TestCase):
         self.assertEqual(presentation["activity"]["routed_agent"], "research")
         self.assertEqual(presentation["researchResult"]["body_markdown"], "# Research result")
 
+    def test_canonical_response_state_matrix_is_renderable(self) -> None:
+        fixtures = {
+            "A research": {
+                "content": "Research result",
+                "activity": {"routed_agent": "research"},
+                "research_result": {"body_markdown": "# Result"},
+            },
+            "B null route": {"content": "Direct answer", "activity": {"routed_agent": None}},
+            "C null activity": {"content": "Plain answer", "activity": None},
+            "D successful action": {
+                "content": "Project created",
+                "activity": {},
+                "project_action": {"success": True, "status": "AVAILABLE"},
+            },
+            "E clarification": {
+                "content": "Project 이름을 알려주세요.",
+                "activity": None,
+                "project_action": {"success": False, "status": "PROJECT_NAME_REQUIRED"},
+            },
+            "F partial success": {
+                "content": "Saved with a warning",
+                "activity": None,
+                "project_write": {"success": False, "status": "PARTIAL_SUCCESS"},
+            },
+        }
+
+        for name, payload in fixtures.items():
+            with self.subTest(name=name):
+                presentation = self.present_chat_response(payload)
+                self.assertEqual(presentation["content"], payload["content"])
+                self.assertIn(presentation["label"], {"Assistant", "research"})
+                self.assertIn("activity", presentation)
+
     def test_malformed_chat_response_without_content_is_rejected(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")
         start = source.index("function chatResponsePresentation")

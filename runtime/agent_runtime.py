@@ -109,6 +109,12 @@ class ResearchPlan:
 SearchDecision = ResearchPlan
 
 
+@dataclass(frozen=True)
+class ProjectActionPlan:
+    action: str
+    project_name: str = ""
+
+
 class ResearchState(str, Enum):
     PLANNING = "PLANNING"
     SEARCHING = "SEARCHING"
@@ -207,6 +213,36 @@ class AgentRuntime:
     def new_session(self) -> str:
         return self.sessions.create().id
 
+    def plan_project_action(self, message: str, current_session_available: bool) -> ProjectActionPlan:
+        prompt = (
+            "Classify the requested Project action. Return exactly one JSON object with keys action and project_name. "
+            "action must be CREATE_AND_IMPORT when the user asks to create a new Project and copy/import the current "
+            "conversation into it; SAVE_TO_EXISTING for saving content to a current or named existing Project; "
+            "otherwise CLARIFY. Extract only the user-specified Project name, preserving its spelling. "
+            "Do not invent a name. Conversation import requires a current session. Do not answer the user."
+        )
+        try:
+            content, _ = self._complete(
+                [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": json.dumps({
+                        "request": message,
+                        "current_session_available": current_session_available,
+                    }, ensure_ascii=False)},
+                ],
+                160,
+                purpose="project_action_selection",
+                temperature=0,
+            )
+            value = self._parse_json_object(content)
+            action = value.get("action")
+            name = value.get("project_name")
+            if action not in {"CREATE_AND_IMPORT", "SAVE_TO_EXISTING", "CLARIFY"}:
+                raise ValueError("model did not return a valid Project action")
+            return ProjectActionPlan(action, name.strip()[:120] if isinstance(name, str) else "")
+        except (httpx.HTTPError, ValueError):
+            return ProjectActionPlan("SAVE_TO_EXISTING")
+
     def chat(
         self,
         message: str,
@@ -291,7 +327,7 @@ class AgentRuntime:
                         f"<project_context>\n{persistent_context}\n</project_context>"
                     ),
                 }] if persistent_context else []),
-                *session.messages,
+                *({"role": item["role"], "content": item["content"]} for item in session.messages),
                 {"role": "user", "content": user_content},
             ]
             if public_context:
@@ -308,7 +344,13 @@ class AgentRuntime:
         if self._finish_reason(payload) == "length":
             answer += "\n\n> Response was truncated at the output limit. Ask to continue for the remaining section."
         self.sessions.append(session, "user", message)
-        self.sessions.append(session, "assistant", answer)
+        research_result = research.get("result")
+        self.sessions.append(
+            session,
+            "assistant",
+            answer,
+            {"research_result": research_result} if isinstance(research_result, dict) else None,
+        )
         usage = payload.get("usage")
         return ChatResult(
             session.id,

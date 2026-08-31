@@ -7,7 +7,13 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from runtime.projects import ProjectNotFoundError, ProjectPathError, ProjectStorageOfflineError, ProjectStore
+from runtime.projects import (
+    ProjectConversationImportError,
+    ProjectNotFoundError,
+    ProjectPathError,
+    ProjectStorageOfflineError,
+    ProjectStore,
+)
 from runtime.project_tools import ProjectTools
 from runtime.tool_registry import ProjectToolScope, run_agent_tools
 
@@ -78,6 +84,46 @@ class ProjectStoreTests(unittest.TestCase):
         restarted = ProjectStore(self.database, self.data_root, require_mount=False)
         messages = restarted.list_messages("owner", project["id"], conversation["id"])
         self.assertEqual(messages[0]["content"], "Pressure is 12 bar")
+
+    def test_create_project_imports_conversation_with_provenance_and_research_metadata(self) -> None:
+        source = [
+            {"role": "user", "content": "NVIDIA를 조사해줘"},
+            {
+                "role": "assistant",
+                "content": "조사 결과",
+                "metadata": {"research_result": {"body_markdown": "# 조사 결과", "sources": []}},
+            },
+        ]
+
+        project, conversation = self.store.create_project_with_imported_conversation(
+            "owner", "안호선", "source-session", source
+        )
+
+        messages = self.store.list_messages("owner", project["id"], conversation["id"])
+        events = self.store.list_events("owner", project["id"])
+        self.assertEqual([message["content"] for message in messages], ["NVIDIA를 조사해줘", "조사 결과"])
+        self.assertEqual(messages[1]["tool_metadata"][0]["type"], "research_result")
+        imported = next(event for event in events if event["event_type"] == "conversation_imported")
+        self.assertEqual(imported["details"], {
+            "source": "general_chat", "source_conversation_id": "source-session",
+        })
+
+    def test_import_failure_rolls_back_created_project(self) -> None:
+        with patch.object(self.store, "add_message", side_effect=RuntimeError("write failed")):
+            with self.assertRaises(ProjectConversationImportError):
+                self.store.create_project_with_imported_conversation(
+                    "owner", "Rollback", "source-session", [{"role": "user", "content": "hello"}]
+                )
+
+        self.assertEqual(self.store.list_projects("owner"), [])
+
+    def test_duplicate_project_names_remain_distinct_by_immutable_id(self) -> None:
+        first = self.store.create_project("owner", "Duplicate")
+        second, _ = self.store.create_project_with_imported_conversation(
+            "owner", "Duplicate", "source-session", []
+        )
+
+        self.assertNotEqual(first["id"], second["id"])
 
     def test_memory_search_and_conflict_history(self) -> None:
         project = self.store.create_project("owner", "Memory")

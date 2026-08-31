@@ -49,6 +49,10 @@ class ProjectPathError(ProjectError):
     pass
 
 
+class ProjectConversationImportError(ProjectError):
+    pass
+
+
 @dataclass(frozen=True)
 class StorageStatus:
     online: bool
@@ -315,6 +319,43 @@ class ProjectStore:
             )
             self._event(connection, project_id, conversation_id, "conversation_created", owner_id, {"title": title})
         return self.get_conversation(owner_id, project_id, conversation_id)
+
+    def create_project_with_imported_conversation(
+        self,
+        owner_id: str,
+        name: str,
+        source_session_id: str,
+        messages: Iterable[dict[str, object]],
+        title: str = "Imported General Chat",
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        project = self.create_project(owner_id, name)
+        try:
+            conversation = self.create_conversation(owner_id, str(project["id"]), title)
+            for message in messages:
+                role = message.get("role")
+                content = message.get("content")
+                if role not in {"user", "assistant"} or not isinstance(content, str):
+                    continue
+                metadata = message.get("metadata")
+                tool_metadata: list[dict[str, object]] = []
+                if isinstance(metadata, dict) and isinstance(metadata.get("research_result"), dict):
+                    tool_metadata.append({"type": "research_result", "result": metadata["research_result"]})
+                self.add_message(
+                    owner_id, str(project["id"]), str(conversation["id"]), str(role), content, tool_metadata
+                )
+            with self._connect() as connection:
+                self._event(
+                    connection,
+                    str(project["id"]),
+                    str(conversation["id"]),
+                    "conversation_imported",
+                    owner_id,
+                    {"source": "general_chat", "source_conversation_id": source_session_id},
+                )
+            return project, conversation
+        except Exception as error:
+            self.delete_project(owner_id, str(project["id"]))
+            raise ProjectConversationImportError("conversation import failed") from error
 
     def get_conversation(self, owner_id: str, project_id: str, conversation_id: str) -> dict[str, object]:
         with self._connect() as connection:

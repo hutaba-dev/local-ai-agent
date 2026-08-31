@@ -38,7 +38,13 @@ from runtime.image_client import (
 )
 from runtime.media import execute_media_edit, execute_media_generation
 from runtime.mcp_host import MCPCallOutcome, call_mcp_tool
-from runtime.projects import ProjectNotFoundError, ProjectPathError, ProjectStorageOfflineError, ProjectStore
+from runtime.projects import (
+    ProjectConversationImportError,
+    ProjectNotFoundError,
+    ProjectPathError,
+    ProjectStorageOfflineError,
+    ProjectStore,
+)
 from runtime.project_tools import ProjectTools
 from runtime.role_registry import get_role, selectable_roles
 from runtime.router import AGENT_CHOICES
@@ -217,6 +223,7 @@ def project_write_failure(status: str, project_name: str | None = None) -> dict[
         "research_result": None,
         "activity": None,
         "generated_images": [],
+        "project_action": None,
         "project_write": {
             "status": status,
             "success": False,
@@ -243,6 +250,36 @@ def project_write_result(
         "resource_type": resource_type,
         "resource_id": resource_id,
         "error": outcome.error,
+    }
+
+
+def project_action_response(
+    content: str,
+    status: str,
+    *,
+    session_id: str | None = None,
+    project: dict[str, object] | None = None,
+    conversation: dict[str, object] | None = None,
+    error: str | None = None,
+) -> dict[str, object]:
+    return {
+        "session_id": session_id,
+        "content": content,
+        "project_id": project.get("id") if project else None,
+        "conversation_id": conversation.get("id") if conversation else None,
+        "research_result": None,
+        "activity": None,
+        "generated_images": [],
+        "project_write": None,
+        "project_action": {
+            "status": status,
+            "success": status == "AVAILABLE",
+            "project_id": project.get("id") if project else None,
+            "project_name": project.get("name") if project else None,
+            "conversation_id": conversation.get("id") if conversation else None,
+            "source": "general_chat",
+            "error": error,
+        },
     }
 
 
@@ -410,6 +447,7 @@ def image_chat_response(
             "filename": filename,
             "data_url": f"data:image/png;base64,{base64.b64encode(image_content).decode()}",
         }],
+        "project_action": None,
         "activity": {
             "selected_agent": request.selected_agent,
             "routed_agent": "image",
@@ -740,8 +778,85 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
     if write_requested:
         if user.role == "guest":
             return project_write_failure("PERMISSION_DENIED")
+        if request.session_id:
+            source_owner = chat_session_owners.get(request.session_id)
+            if source_owner is None:
+                return project_action_response(
+                    "가져올 General Chat 대화를 찾을 수 없습니다. 현재 대화에서 다시 요청해주세요.",
+                    "SOURCE_CONVERSATION_NOT_FOUND",
+                    session_id=request.session_id,
+                )
+            if source_owner != chat_owner(http_request):
+                return project_action_response(
+                    "다른 사용자 또는 브라우저의 General Chat 대화는 가져올 수 없습니다.",
+                    "SOURCE_CONVERSATION_PERMISSION_DENIED",
+                    session_id=request.session_id,
+                )
         try:
             project_store.require_storage()
+            action = await run_in_threadpool(
+                runtime.plan_project_action, request.message, bool(request.session_id)
+            )
+            if action.action == "CREATE_AND_IMPORT":
+                if not action.project_name:
+                    return project_action_response(
+                        "새 Project 이름이 필요합니다. Project 이름을 알려주세요.",
+                        "PROJECT_NAME_REQUIRED",
+                        session_id=request.session_id,
+                    )
+                source_messages = runtime.sessions.snapshot(request.session_id or "")
+                if source_messages is None:
+                    return project_action_response(
+                        "가져올 General Chat 대화를 찾을 수 없습니다. 현재 대화에서 다시 요청해주세요.",
+                        "SOURCE_CONVERSATION_NOT_FOUND",
+                        session_id=request.session_id,
+                    )
+                success_content = (
+                    f"새 Project '{action.project_name}'을 만들고 현재 대화를 Project에 저장했습니다."
+                )
+                imported_messages = [
+                    *source_messages,
+                    {"role": "user", "content": request.message},
+                    {"role": "assistant", "content": success_content},
+                ]
+                try:
+                    project, conversation = await run_in_threadpool(
+                        project_store.create_project_with_imported_conversation,
+                        user.username,
+                        action.project_name,
+                        request.session_id or "",
+                        imported_messages,
+                    )
+                except ProjectStorageOfflineError:
+                    return project_action_response(
+                        "Project storage가 offline이라 새 Project를 만들지 못했습니다.",
+                        "PROJECT_STORAGE_OFFLINE",
+                        session_id=request.session_id,
+                    )
+                except ValueError as error:
+                    return project_action_response(
+                        f"새 Project를 만들지 못했습니다: {error}",
+                        "PROJECT_CREATE_FAILED",
+                        session_id=request.session_id,
+                        error=str(error),
+                    )
+                except ProjectConversationImportError as error:
+                    return project_action_response(
+                        "새 Project 생성 또는 대화 가져오기에 실패했습니다. Project는 생성되지 않았습니다.",
+                        "CONVERSATION_IMPORT_FAILED",
+                        session_id=request.session_id,
+                        error=str(error),
+                    )
+                source_session = runtime.sessions.get_or_create(request.session_id)
+                runtime.sessions.append(source_session, "user", request.message)
+                runtime.sessions.append(source_session, "assistant", success_content)
+                return project_action_response(
+                    success_content,
+                    "AVAILABLE",
+                    session_id=request.session_id,
+                    project=project,
+                    conversation=conversation,
+                )
             if request.project_id:
                 write_project = project_store.get_project(user.username, request.project_id)
             else:
@@ -1233,6 +1348,7 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         "conversation_id": request.conversation_id,
         "content": response_content,
         "research_result": result.research.get("result"),
+        "project_action": None,
         "project_write": project_write,
         "activity": {
             "brain": "KIM",

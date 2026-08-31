@@ -10,7 +10,7 @@ from uuid import uuid4
 @dataclass
 class Session:
     id: str
-    messages: list[dict[str, str]] = field(default_factory=list)
+    messages: list[dict[str, object]] = field(default_factory=list)
     updated_at: float = field(default_factory=time)
 
 
@@ -29,7 +29,16 @@ class SessionStore:
             return self._sessions[session_id]
         return self.create()
 
-    def append(self, session: Session, role: str, content: str) -> None:
-        session.messages.append({"role": role, "content": content})
+    def append(
+        self, session: Session, role: str, content: str, metadata: dict[str, object] | None = None
+    ) -> None:
+        message: dict[str, object] = {"role": role, "content": content}
+        if metadata:
+            message["metadata"] = metadata
+        session.messages.append(message)
         session.messages = session.messages[-self._max_messages :]
         session.updated_at = time()
+
+    def snapshot(self, session_id: str) -> list[dict[str, object]] | None:
+        session = self._sessions.get(session_id)
+        return [dict(message) for message in session.messages] if session else None

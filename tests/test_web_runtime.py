@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
-from runtime.agent_runtime import AgentRuntime, LatencyRecorder, ResearchPlan
+from runtime.agent_runtime import AgentRuntime, LatencyRecorder, ProjectActionPlan, ResearchPlan
 from runtime.image_client import (
     GeneratedImage,
     ImageEditCompletion,
@@ -21,7 +21,7 @@ from runtime.image_client import (
     ImagePromptPlan,
     ImageQualityAssessment,
 )
-from runtime.projects import ProjectStorageOfflineError, ProjectStore
+from runtime.projects import ProjectConversationImportError, ProjectStorageOfflineError, ProjectStore
 from runtime.router import Route, route_request
 from runtime.tool_registry import (
     ToolResult,
@@ -847,6 +847,105 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(payload["generated_images"], [])
         self.assertEqual(client.get(f"/api/projects/{project['id']}/files").json()["files"], [])
         self.assertEqual(len(self.fake_client.requests), request_count)
+
+    def test_general_chat_creates_project_and_copies_current_conversation(self) -> None:
+        previous_runtime = web_app.runtime
+        web_app.runtime = self.runtime
+        client = self.authenticated_client()
+        try:
+            session_id = client.post("/api/new-session").json()["session_id"]
+            session = self.runtime.sessions.get_or_create(session_id)
+            self.runtime.sessions.append(session, "user", "NVIDIA를 조사해줘")
+            self.runtime.sessions.append(session, "assistant", "조사 결과")
+            source_before = self.runtime.sessions.snapshot(session_id)
+            with patch.object(
+                self.runtime, "plan_project_action", return_value=ProjectActionPlan("CREATE_AND_IMPORT", "안호선")
+            ):
+                response = client.post("/api/chat", json={
+                    "message": "이 대화 내용을 새프로젝트에 저장해줘.\n프로젝트 이름은 안호선",
+                    "selected_agent": "main",
+                    "session_id": session_id,
+                })
+        finally:
+            web_app.runtime = previous_runtime
+
+        payload = response.json()
+        project = web_app.project_store.get_project("test-admin", payload["project_id"])
+        messages = web_app.project_store.list_messages(
+            "test-admin", payload["project_id"], payload["conversation_id"]
+        )
+        self.assertEqual(payload["project_action"]["status"], "AVAILABLE")
+        self.assertEqual(project["name"], "안호선")
+        self.assertEqual([message["content"] for message in messages[:2]], [
+            "NVIDIA를 조사해줘", "조사 결과",
+        ])
+        self.assertEqual(self.runtime.sessions.snapshot(session_id)[:2], source_before)
+        self.assertEqual(len(self.runtime.sessions.snapshot(session_id)), 4)
+        self.assertIsNone(payload["activity"])
+
+    def test_new_project_import_failure_returns_canonical_response(self) -> None:
+        previous_runtime = web_app.runtime
+        web_app.runtime = self.runtime
+        client = self.authenticated_client()
+        try:
+            session_id = client.post("/api/new-session").json()["session_id"]
+            with patch.object(
+                self.runtime, "plan_project_action", return_value=ProjectActionPlan("CREATE_AND_IMPORT", "Rollback")
+            ), patch.object(
+                web_app.project_store,
+                "create_project_with_imported_conversation",
+                side_effect=ProjectConversationImportError("import failed"),
+            ):
+                response = client.post("/api/chat", json={
+                    "message": "새 Project에 현재 대화를 저장해줘", "session_id": session_id,
+                })
+        finally:
+            web_app.runtime = previous_runtime
+
+        payload = response.json()
+        self.assertEqual(payload["project_action"]["status"], "CONVERSATION_IMPORT_FAILED")
+        self.assertFalse(payload["project_action"]["success"])
+        self.assertIsNone(payload["activity"])
+
+    def test_new_project_import_requires_current_session(self) -> None:
+        previous_runtime = web_app.runtime
+        web_app.runtime = self.runtime
+        client = self.authenticated_client()
+        try:
+            with patch.object(
+                self.runtime, "plan_project_action", return_value=ProjectActionPlan("CREATE_AND_IMPORT", "Missing")
+            ):
+                response = client.post("/api/chat", json={
+                    "message": "새 Project에 현재 대화를 저장해줘", "session_id": "missing-session",
+                })
+        finally:
+            web_app.runtime = previous_runtime
+
+        self.assertEqual(response.json()["project_action"]["status"], "SOURCE_CONVERSATION_NOT_FOUND")
+        self.assertEqual(web_app.project_store.list_projects("test-admin"), [])
+
+    def test_new_project_import_rejects_session_owned_by_another_browser(self) -> None:
+        previous_runtime = web_app.runtime
+        web_app.runtime = self.runtime
+        client = self.authenticated_client()
+        try:
+            session_id = self.runtime.new_session()
+            web_app.chat_session_owners[session_id] = "another-owner"
+            self.runtime.sessions.append(
+                self.runtime.sessions.get_or_create(session_id), "user", "private source"
+            )
+            with patch.object(self.runtime, "plan_project_action") as planner:
+                response = client.post("/api/chat", json={
+                    "message": "새 Project에 현재 대화를 저장해줘", "session_id": session_id,
+                })
+        finally:
+            web_app.runtime = previous_runtime
+
+        self.assertEqual(
+            response.json()["project_action"]["status"], "SOURCE_CONVERSATION_PERMISSION_DENIED"
+        )
+        planner.assert_not_called()
+        self.assertEqual(web_app.project_store.list_projects("test-admin"), [])
 
     def test_general_chat_does_not_guess_between_duplicate_project_names(self) -> None:
         client = self.authenticated_client()
