@@ -125,6 +125,19 @@ class ProjectStoreTests(unittest.TestCase):
 
         self.assertNotEqual(first["id"], second["id"])
 
+    def test_retrying_same_conversation_import_reuses_project_without_duplicate_messages(self) -> None:
+        first_project, first_conversation = self.store.create_project_with_imported_conversation(
+            "owner", "Retry", "source-session", [{"role": "user", "content": "original"}]
+        )
+        second_project, second_conversation = self.store.create_project_with_imported_conversation(
+            "owner", "Retry", "source-session", [{"role": "user", "content": "retry"}]
+        )
+
+        self.assertEqual(second_project["id"], first_project["id"])
+        self.assertEqual(second_conversation["id"], first_conversation["id"])
+        messages = self.store.list_messages("owner", first_project["id"], first_conversation["id"])
+        self.assertEqual([message["content"] for message in messages], ["original"])
+
     def test_memory_search_and_conflict_history(self) -> None:
         project = self.store.create_project("owner", "Memory")
         old = self.store.add_memory("owner", project["id"], "decision", "Test pressure is 12 bar")

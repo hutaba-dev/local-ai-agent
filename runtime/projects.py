@@ -328,6 +328,9 @@ class ProjectStore:
         messages: Iterable[dict[str, object]],
         title: str = "Imported General Chat",
     ) -> tuple[dict[str, object], dict[str, object]]:
+        existing = self.find_imported_conversation(owner_id, name, source_session_id)
+        if existing is not None:
+            return existing
         project = self.create_project(owner_id, name)
         try:
             conversation = self.create_conversation(owner_id, str(project["id"]), title)
@@ -356,6 +359,28 @@ class ProjectStore:
         except Exception as error:
             self.delete_project(owner_id, str(project["id"]))
             raise ProjectConversationImportError("conversation import failed") from error
+
+    def find_imported_conversation(
+        self, owner_id: str, name: str, source_session_id: str
+    ) -> tuple[dict[str, object], dict[str, object]] | None:
+        with self._connect() as connection:
+            rows = connection.execute(
+                """SELECT projects.id AS project_id, project_events.conversation_id, project_events.details
+                FROM projects
+                JOIN project_events ON project_events.project_id = projects.id
+                WHERE projects.owner_id = ? AND projects.name = ? AND projects.archived_at IS NULL
+                  AND project_events.event_type = 'conversation_imported'
+                ORDER BY project_events.created_at DESC""",
+                (owner_id, name.strip()),
+            ).fetchall()
+        for row in rows:
+            details = json.loads(row["details"])
+            if details.get("source") == "general_chat" and details.get("source_conversation_id") == source_session_id:
+                return (
+                    self.get_project(owner_id, row["project_id"]),
+                    self.get_conversation(owner_id, row["project_id"], row["conversation_id"]),
+                )
+        return None
 
     def get_conversation(self, owner_id: str, project_id: str, conversation_id: str) -> dict[str, object]:
         with self._connect() as connection:

@@ -865,7 +865,7 @@ class WebRuntimeTests(unittest.TestCase):
                     "message": "이 대화 내용을 새프로젝트에 저장해줘.\n프로젝트 이름은 안호선",
                     "selected_agent": "main",
                     "session_id": session_id,
-                })
+                }, headers={"X-Web-Response-Contract": "nullable-activity-v1"})
         finally:
             web_app.runtime = previous_runtime
 
@@ -882,6 +882,54 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.sessions.snapshot(session_id)[:2], source_before)
         self.assertEqual(len(self.runtime.sessions.snapshot(session_id)), 4)
         self.assertIsNone(payload["activity"])
+
+    def test_legacy_web_project_action_success_has_safe_activity_parent(self) -> None:
+        previous_runtime = web_app.runtime
+        web_app.runtime = self.runtime
+        client = self.authenticated_client()
+        try:
+            session_id = client.post("/api/new-session").json()["session_id"]
+            with patch.object(
+                self.runtime, "plan_project_action", return_value=ProjectActionPlan("CREATE_AND_IMPORT", "Legacy")
+            ):
+                payload = client.post("/api/chat", json={
+                    "message": "현재 대화를 새 Project에 저장해줘", "session_id": session_id,
+                }).json()
+        finally:
+            web_app.runtime = previous_runtime
+
+        self.assertEqual(payload["project_action"]["status"], "AVAILABLE")
+        self.assertEqual(payload["activity"]["routed_agent"], "main")
+        self.assertEqual(payload["activity"]["tools"], [])
+
+    def test_retrying_project_import_returns_same_project_without_duplicate_messages(self) -> None:
+        previous_runtime = web_app.runtime
+        web_app.runtime = self.runtime
+        client = self.authenticated_client()
+        try:
+            session_id = client.post("/api/new-session").json()["session_id"]
+            session = self.runtime.sessions.get_or_create(session_id)
+            self.runtime.sessions.append(session, "user", "source message")
+            with patch.object(
+                self.runtime, "plan_project_action", return_value=ProjectActionPlan("CREATE_AND_IMPORT", "Retry")
+            ):
+                first = client.post("/api/chat", json={
+                    "message": "현재 대화를 새 Project에 저장해줘", "session_id": session_id,
+                }).json()
+                second = client.post("/api/chat", json={
+                    "message": "현재 대화를 새 Project에 저장해줘", "session_id": session_id,
+                }).json()
+        finally:
+            web_app.runtime = previous_runtime
+
+        self.assertEqual(second["project_id"], first["project_id"])
+        self.assertEqual(second["conversation_id"], first["conversation_id"])
+        self.assertEqual(len(web_app.project_store.list_projects("test-admin")), 1)
+        messages = web_app.project_store.list_messages(
+            "test-admin", first["project_id"], first["conversation_id"]
+        )
+        self.assertEqual(len(messages), 3)
+        self.assertEqual(len(self.runtime.sessions.snapshot(session_id)), 3)
 
     def test_new_project_import_failure_returns_canonical_response(self) -> None:
         previous_runtime = web_app.runtime

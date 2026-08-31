@@ -73,7 +73,7 @@ class AnswerRenderingTests(unittest.TestCase):
             "C null activity": {"content": "Plain answer", "activity": None},
             "D successful action": {
                 "content": "Project created",
-                "activity": {},
+                "activity": None,
                 "project_action": {"success": True, "status": "AVAILABLE"},
             },
             "E clarification": {
@@ -86,6 +86,16 @@ class AnswerRenderingTests(unittest.TestCase):
                 "activity": None,
                 "project_write": {"success": False, "status": "PARTIAL_SUCCESS"},
             },
+            "G tool-only status": {
+                "content": "Tool completed",
+                "activity": None,
+                "project_write": {"success": True, "status": "AVAILABLE"},
+            },
+            "H error response": {
+                "content": "Project storage is offline",
+                "activity": None,
+                "project_action": {"success": False, "status": "PROJECT_STORAGE_OFFLINE"},
+            },
         }
 
         for name, payload in fixtures.items():
@@ -94,6 +104,13 @@ class AnswerRenderingTests(unittest.TestCase):
                 self.assertEqual(presentation["content"], payload["content"])
                 self.assertIn(presentation["label"], {"Assistant", "research"})
                 self.assertIn("activity", presentation)
+
+    def test_project_action_submit_path_never_dereferences_nullable_activity(self) -> None:
+        source = SCRIPT.read_text(encoding="utf-8")
+
+        self.assertNotIn("payload.activity.routed_agent", source)
+        self.assertIn("const presentation = chatResponsePresentation(payload);", source)
+        self.assertIn("presentation.label, presentation.activity", source)
 
     def test_malformed_chat_response_without_content_is_rejected(self) -> None:
         source = SCRIPT.read_text(encoding="utf-8")

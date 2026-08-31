@@ -261,6 +261,7 @@ def project_action_response(
     project: dict[str, object] | None = None,
     conversation: dict[str, object] | None = None,
     error: str | None = None,
+    activity: dict[str, object] | None = None,
 ) -> dict[str, object]:
     return {
         "session_id": session_id,
@@ -268,7 +269,7 @@ def project_action_response(
         "project_id": project.get("id") if project else None,
         "conversation_id": conversation.get("id") if conversation else None,
         "research_result": None,
-        "activity": None,
+        "activity": activity,
         "generated_images": [],
         "project_write": None,
         "project_action": {
@@ -280,6 +281,25 @@ def project_action_response(
             "source": "general_chat",
             "error": error,
         },
+    }
+
+
+def legacy_project_action_activity(request: ChatRequest, http_request: Request) -> dict[str, object] | None:
+    if http_request.headers.get("X-Web-Response-Contract") == "nullable-activity-v1":
+        return None
+    return {
+        "selected_agent": request.selected_agent,
+        "routed_agent": "main",
+        "direct": True,
+        "route_summary": "Project action",
+        "tools": [],
+        "duration_ms": 0,
+        "usage": {},
+        "llm_calls": [],
+        "stages": [],
+        "research_rounds": 0,
+        "whole_request_usage": {"input_tokens": 0, "output_tokens": 0, "llm_call_count": 0},
+        "final_call": None,
     }
 
 
@@ -814,6 +834,19 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
                 success_content = (
                     f"새 Project '{action.project_name}'을 만들고 현재 대화를 Project에 저장했습니다."
                 )
+                existing_import = project_store.find_imported_conversation(
+                    user.username, action.project_name, request.session_id or ""
+                )
+                if existing_import is not None:
+                    project, conversation = existing_import
+                    return project_action_response(
+                        success_content,
+                        "AVAILABLE",
+                        session_id=request.session_id,
+                        project=project,
+                        conversation=conversation,
+                        activity=legacy_project_action_activity(request, http_request),
+                    )
                 imported_messages = [
                     *source_messages,
                     {"role": "user", "content": request.message},
@@ -856,6 +889,7 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
                     session_id=request.session_id,
                     project=project,
                     conversation=conversation,
+                    activity=legacy_project_action_activity(request, http_request),
                 )
             if request.project_id:
                 write_project = project_store.get_project(user.username, request.project_id)

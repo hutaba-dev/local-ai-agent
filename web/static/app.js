@@ -858,7 +858,7 @@ form.addEventListener("submit", async (event) => {
   input.disabled = true;
   sendButton.disabled = true;
   try {
-    const payload = await request("/api/chat", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, selected_agent: selector.value, session_id: sessionId, attachment_ids: submittedAttachments.map((attachment) => attachment.attachment_id), continuation_image_id: continuationImageId, project_id: currentProject?.id || null, conversation_id: currentConversation?.id || null }) });
+    const payload = await request("/api/chat", { method: "POST", headers: { "Content-Type": "application/json", "X-Web-Response-Contract": "nullable-activity-v1" }, body: JSON.stringify({ message, selected_agent: selector.value, session_id: sessionId, attachment_ids: submittedAttachments.map((attachment) => attachment.attachment_id), continuation_image_id: continuationImageId, project_id: currentProject?.id || null, conversation_id: currentConversation?.id || null }) });
     sessionId = payload.session_id;
     if (payload.continuation_image_id) continuationImageId = payload.continuation_image_id;
     const presentation = chatResponsePresentation(payload);
