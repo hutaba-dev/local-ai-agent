@@ -111,10 +111,10 @@ class _CacheEntry:
 
 class SearchCache:
     def __init__(self) -> None:
-        self._entries: dict[tuple[str, str, str, str], _CacheEntry] = {}
+        self._entries: dict[tuple[str, str, str, str, int], _CacheEntry] = {}
         self._lock = Lock()
 
-    def get(self, key: tuple[str, str, str, str]) -> tuple[NormalizedSearchResult, ...] | None:
+    def get(self, key: tuple[str, str, str, str, int]) -> tuple[NormalizedSearchResult, ...] | None:
         if not _env_bool("SEARCH_CACHE_ENABLED", True):
             return None
         now = monotonic()
@@ -127,7 +127,7 @@ class SearchCache:
                 return None
             return entry.results
 
-    def set(self, key: tuple[str, str, str, str], results: tuple[NormalizedSearchResult, ...], ttl: int) -> None:
+    def set(self, key: tuple[str, str, str, str, int], results: tuple[NormalizedSearchResult, ...], ttl: int) -> None:
         if not _env_bool("SEARCH_CACHE_ENABLED", True):
             return
         with self._lock:
@@ -618,8 +618,8 @@ def _category_for(query: str, context: dict[str, object]) -> str:
     return category if category in {"web", "news"} else "web"
 
 
-def _cache_key(provider: str, request: SearchRequest) -> tuple[str, str, str, str]:
-    return provider, normalize_query(request.query), request.category, (request.freshness or "").upper()
+def _cache_key(provider: str, request: SearchRequest) -> tuple[str, str, str, str, int]:
+    return provider, normalize_query(request.query), request.category, (request.freshness or "").upper(), request.count
 
 
 def _cache_ttl(request: SearchRequest) -> int:

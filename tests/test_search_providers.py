@@ -170,6 +170,45 @@ class SearchProviderTests(unittest.TestCase):
         self.assertTrue(second.cache_hit)
         self.assertEqual(call.call_count, 1)
 
+    def test_cache_key_includes_count(self):
+        from runtime.search_providers import _cache_key
+
+        provider = SearXNGProvider("http://127.0.0.1:8088")
+        key_quick = _cache_key(provider.name, SearchRequest("repeat query", count=5))
+        key_deep = _cache_key(provider.name, SearchRequest("repeat query", count=8))
+
+        self.assertNotEqual(key_quick, key_deep)
+
+    def test_different_count_does_not_share_cache(self):
+        response = JsonResponse({"results": [
+            {"title": f"Result {index}", "url": f"https://domain{index}.example/item", "content": "cached evidence"}
+            for index in range(8)
+        ]})
+        provider = SearXNGProvider("http://127.0.0.1:8088")
+        with patch("runtime.search_providers.httpx.request", return_value=response) as call:
+            quick = provider.search(SearchRequest("repeat query", count=5))
+            deep = provider.search(SearchRequest("repeat query", count=8))
+
+        self.assertFalse(quick.cache_hit)
+        self.assertFalse(deep.cache_hit)
+        self.assertEqual(len(quick.results), 5)
+        self.assertEqual(len(deep.results), 8)
+        self.assertEqual(call.call_count, 2)
+
+    def test_same_count_still_uses_cache(self):
+        response = JsonResponse({"results": [
+            {"title": f"Result {index}", "url": f"https://domain{index}.example/item", "content": "cached evidence"}
+            for index in range(8)
+        ]})
+        provider = SearXNGProvider("http://127.0.0.1:8088")
+        with patch("runtime.search_providers.httpx.request", return_value=response) as call:
+            first = provider.search(SearchRequest("repeat query", count=8))
+            second = provider.search(SearchRequest("repeat query", count=8))
+
+        self.assertFalse(first.cache_hit)
+        self.assertTrue(second.cache_hit)
+        self.assertEqual(call.call_count, 1)
+
     def test_h_duplicate_url_keeps_cross_provider_provenance(self):
         first = search_result("searxng", 1, "https://Example.com/report/?utm_source=search")
         second = search_result("serper", 1, "https://www.example.com/report")
