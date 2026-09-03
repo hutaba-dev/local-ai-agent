@@ -11,15 +11,18 @@ from runtime.role_registry import get_role
 
 class CapabilityRegistryTests(unittest.TestCase):
     def test_catalog_is_compact_and_reports_unconfigured_scopes(self) -> None:
-        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_MEDIA_ENABLED": "false"}, clear=False):
+        with patch.dict(os.environ, {
+            "MCP_ENABLED": "true", "MCP_MEDIA_ENABLED": "false", "MCP_GOOGLE_ENABLED": "false",
+        }, clear=False):
             catalog = capability_catalog(project_available=False, image_available=False)
 
-        self.assertEqual(len(catalog), 9)
-        self.assertLess(len(json.dumps(catalog)), 3_000)
+        self.assertEqual(len(catalog), 10)
+        self.assertLess(len(json.dumps(catalog)), 4_000)
         status = {item["name"]: item["status"] for item in catalog}
         self.assertEqual(status["project"], "UNCONFIGURED")
         self.assertEqual(status["media"], "DISABLED")
         self.assertEqual(status["github"], "UNCONFIGURED")
+        self.assertEqual(status["google"], "DISABLED")
         documentation = next(item for item in catalog if item["name"] == "documentation")
         git = next(item for item in catalog if item["name"] == "git")
         self.assertEqual((documentation["provider"], documentation["permission"]), ("context7", "READ"))
@@ -69,6 +72,57 @@ class CapabilityRegistryTests(unittest.TestCase):
 
         self.assertEqual(next(item["status"] for item in without_guard if item["name"] == "browser"), "UNCONFIGURED")
         self.assertTrue(next(item["available"] for item in with_guard if item["name"] == "browser"))
+
+    def test_google_is_disabled_when_flag_is_off(self) -> None:
+        with patch.dict(os.environ, {
+            "MCP_ENABLED": "true", "MCP_GOOGLE_ENABLED": "false", "GOOGLE_WORKSPACE_CREDENTIALS": "",
+        }, clear=False):
+            catalog = capability_catalog()
+
+        google = next(item for item in catalog if item["name"] == "google")
+        self.assertFalse(google["available"])
+        self.assertEqual(google["status"], "DISABLED")
+        self.assertEqual(google["health"], "DISABLED")
+
+    def test_google_is_unconfigured_when_flag_is_on_but_no_credentials(self) -> None:
+        with patch.dict(os.environ, {
+            "MCP_ENABLED": "true", "MCP_GOOGLE_ENABLED": "true", "GOOGLE_WORKSPACE_CREDENTIALS": "",
+        }, clear=False):
+            catalog = capability_catalog()
+
+        google = next(item for item in catalog if item["name"] == "google")
+        self.assertFalse(google["available"])
+        self.assertEqual(google["status"], "UNCONFIGURED")
+        self.assertEqual(google["health"], "UNCONFIGURED")
+
+    def test_google_is_available_when_flag_and_credentials_are_set(self) -> None:
+        with patch.dict(os.environ, {
+            "MCP_ENABLED": "true", "MCP_GOOGLE_ENABLED": "true", "GOOGLE_WORKSPACE_CREDENTIALS": "test-credentials",
+        }, clear=False):
+            catalog = capability_catalog()
+
+        google = next(item for item in catalog if item["name"] == "google")
+        self.assertTrue(google["available"])
+        self.assertEqual(google["status"], "AVAILABLE")
+        self.assertEqual(google["health"], "AVAILABLE")
+
+    def test_google_tools_are_exposed_only_when_google_is_selected(self) -> None:
+        with patch.dict(os.environ, {
+            "MCP_ENABLED": "true", "MCP_GOOGLE_ENABLED": "true", "GOOGLE_WORKSPACE_CREDENTIALS": "test-credentials",
+        }, clear=False):
+            selected = detailed_tools(("google",))
+            without_google = detailed_tools(("web",))
+
+        self.assertEqual(
+            {tool.name for tool in selected},
+            {"google_drive_list", "google_docs_create", "google_sheets_create"},
+        )
+        self.assertEqual({tool.server for tool in selected}, {"google-mcp"})
+        self.assertEqual(
+            {tool.permission for tool in selected},
+            {"READ", "WRITE_ARTIFACT"},
+        )
+        self.assertNotIn("google_drive_list", {tool.name for tool in without_google})
 
     def test_every_tool_permission_is_declared(self) -> None:
         declared = {permission.value for permission in PermissionClass}

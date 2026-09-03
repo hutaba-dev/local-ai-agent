@@ -16,6 +16,7 @@ from mcp_servers.browser_server import BROWSER_MCP
 from mcp_servers.context7_server import CONTEXT7_MCP
 from mcp_servers.developer_server import DEVELOPER_MCP
 from mcp_servers.fetch_server import fetch_mcp
+from mcp_servers.google_server import GOOGLE_MCP
 from mcp_servers.github_server import GITHUB_MCP
 from mcp_servers.media_server import create_media_mcp
 from mcp_servers.project_server import ProjectScope, create_project_mcp
@@ -83,7 +84,7 @@ def mcp_tool_enabled(tool_name: str) -> bool:
 	capability = next((item for item in CAPABILITIES if item.name == spec.capability), None)
 	if spec.capability == "media":
 		return _env_enabled("MCP_MEDIA_ENABLED", _env_enabled("MCP_IMAGE_ENABLED", False))
-	default = False if spec.capability == "browser" else True
+	default = False if spec.capability in {"browser", "google"} else True
 	return bool(capability and _env_enabled(capability.feature_flag, default))
 
 
@@ -97,6 +98,7 @@ class MCPHost:
 			"browser-mcp": BROWSER_MCP,
 			"academic-mcp": ACADEMIC_MCP,
 			"github-mcp": GITHUB_MCP,
+			"google-mcp": GOOGLE_MCP,
 		}
 		self._tools = {
 			name: MCPToolRecord(
@@ -119,6 +121,8 @@ class MCPHost:
 			return _env_enabled("MCP_PLAYWRIGHT_EGRESS_GUARD", False)
 		if record.server == "github-mcp":
 			return bool(os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN"))
+		if record.server == "google-mcp":
+			return bool(os.getenv("GOOGLE_WORKSPACE_CREDENTIALS"))
 		if record.server == "project-mcp":
 			return project_scope is not None
 		if record.server == "media-mcp":
@@ -150,6 +154,10 @@ class MCPHost:
 		for server_name, server in self._servers.items():
 			server_records = [record for record in self._tools.values() if record.server == server_name]
 			if server_name == "github-mcp" and not os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN"):
+				for record in server_records:
+					record.health = MCPHealth.UNCONFIGURED.value
+				continue
+			if server_name == "google-mcp" and not os.getenv("GOOGLE_WORKSPACE_CREDENTIALS"):
 				for record in server_records:
 					record.health = MCPHealth.UNCONFIGURED.value
 				continue
