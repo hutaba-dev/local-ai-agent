@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from runtime.agent_runtime import AgentRuntime
 from runtime.mcp_host import MCPCallOutcome
+from mcp_servers.google_server import GoogleToolScope
 
 
 class FakeResponse:
@@ -242,6 +243,50 @@ class MainToolLoopTests(unittest.TestCase):
         self.assertEqual(result.tools, [])
         self.assertNotIn("tools", client.requests[1])
         call.assert_not_called()
+
+    def test_non_google_request_does_not_expose_google_tools(self) -> None:
+        client = SequencedClient([
+            {"role": "assistant", "content": '{"capabilities":[]}'},
+            {"role": "assistant", "content": "TCP는 연결형이고 UDP는 비연결형입니다."},
+        ])
+        scope = GoogleToolScope("alice", SimpleNamespace())
+        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_GOOGLE_ENABLED": "true"}, clear=False), patch(
+            "runtime.agent_runtime.call_mcp_tool"
+        ) as call:
+            result = AgentRuntime(client=client).chat(
+                "TCP와 UDP 차이 설명해줘", "main", google_scope=scope
+            )
+
+        self.assertEqual(result.selected_capabilities, ())
+        self.assertNotIn("tools", client.requests[1])
+        call.assert_not_called()
+
+    def test_google_request_exposes_and_calls_existing_drive_tool_with_user_scope(self) -> None:
+        client = SequencedClient([
+            {"role": "assistant", "content": '{"capabilities":["google"]}'},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_drive",
+                "type": "function",
+                "function": {"name": "google_drive_list", "arguments": '{"limit":5}'},
+            }]},
+            {"role": "assistant", "content": "접근 가능한 Drive 파일을 확인했습니다."},
+        ])
+        scope = GoogleToolScope("alice", SimpleNamespace())
+        outcome = MCPCallOutcome(
+            True, True, "google_drive_list", "google-mcp", "AVAILABLE",
+            {"status": "AVAILABLE", "files": []}, None, 1,
+        )
+        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_GOOGLE_ENABLED": "true"}, clear=False), patch(
+            "runtime.agent_runtime.call_mcp_tool", return_value=outcome
+        ) as call:
+            result = AgentRuntime(client=client).chat(
+                "내 Google Drive에서 AHNBYS가 접근 가능한 파일을 보여줘", "main", google_scope=scope
+            )
+
+        exposed = {tool["function"]["name"] for tool in client.requests[1]["tools"]}
+        self.assertIn("google_drive_list", exposed)
+        self.assertEqual(result.selected_capabilities, ("google",))
+        self.assertIs(call.call_args.args[4], scope)
 
     def test_project_capability_is_unavailable_without_project_scope(self) -> None:
         client = SequencedClient([

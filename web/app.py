@@ -50,6 +50,7 @@ from runtime.project_tools import ProjectTools
 from runtime.role_registry import get_role, selectable_roles
 from runtime.router import AGENT_CHOICES
 from runtime.tool_registry import ProjectToolScope
+from mcp_servers.google_server import GoogleToolScope
 from runtime.web_search import fetch_visual_thumbnails, search, visual_search
 from web.auth import SessionSigner, User, configured_user_store
 from web import google_oauth
@@ -1382,6 +1383,7 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             ProjectTools(project_store), user.username, request.project_id, request.conversation_id
         ) if request.project_id else None
         runtime_project_scope = None if write_requested else project_scope
+        google_scope = GoogleToolScope(user.username, user_store) if google_oauth.configured() else None
         result = await run_in_threadpool(
             runtime.chat,
             message,
@@ -1392,6 +1394,7 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             images,
             project_context,
             runtime_project_scope,
+            google_scope,
         )
     except PermissionError as error:
         raise HTTPException(status_code=403, detail=str(error)) from error

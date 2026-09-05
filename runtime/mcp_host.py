@@ -16,7 +16,7 @@ from mcp_servers.browser_server import BROWSER_MCP
 from mcp_servers.context7_server import CONTEXT7_MCP
 from mcp_servers.developer_server import DEVELOPER_MCP
 from mcp_servers.fetch_server import fetch_mcp
-from mcp_servers.google_server import GOOGLE_MCP
+from mcp_servers.google_server import GOOGLE_MCP, GoogleToolScope, create_google_mcp
 from mcp_servers.github_server import GITHUB_MCP
 from mcp_servers.media_server import create_media_mcp
 from mcp_servers.project_server import ProjectScope, create_project_mcp
@@ -39,6 +39,11 @@ class MCPHealth(str, Enum):
 	MODEL_LIMITED = "MODEL_LIMITED"
 	CAPABILITY_LIMITED = "CAPABILITY_LIMITED"
 	PROJECT_STORAGE_OFFLINE = "PROJECT_STORAGE_OFFLINE"
+	NOT_CONNECTED = "NOT_CONNECTED"
+	AUTH_REFRESH_FAILED = "AUTH_REFRESH_FAILED"
+	GOOGLE_API_UNAVAILABLE = "GOOGLE_API_UNAVAILABLE"
+	PERMISSION_DENIED = "PERMISSION_DENIED"
+	INVALID_REQUEST = "INVALID_REQUEST"
 	ERROR = "ERROR"
 
 
@@ -116,13 +121,17 @@ class MCPHost:
 		self._lock = Lock()
 
 	@staticmethod
-	def _configured(record: MCPToolRecord, project_scope: ProjectScope | None = None) -> bool:
+	def _configured(
+		record: MCPToolRecord,
+		project_scope: ProjectScope | None = None,
+		google_scope: GoogleToolScope | None = None,
+	) -> bool:
 		if record.server == "browser-mcp":
 			return _env_enabled("MCP_PLAYWRIGHT_EGRESS_GUARD", False)
 		if record.server == "github-mcp":
 			return bool(os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN"))
 		if record.server == "google-mcp":
-			return bool(os.getenv("GOOGLE_WORKSPACE_CREDENTIALS"))
+			return google_scope is not None
 		if record.server == "project-mcp":
 			return project_scope is not None
 		if record.server == "media-mcp":
@@ -136,6 +145,7 @@ class MCPHost:
 		record: MCPToolRecord,
 		project_scope: ProjectScope | None = None,
 		media_owner_id: str | None = None,
+		google_scope: GoogleToolScope | None = None,
 	) -> object | None:
 		if record.server == "project-mcp":
 			return create_project_mcp(project_scope) if project_scope is not None else None
@@ -148,16 +158,14 @@ class MCPHost:
 				owner_id=media_owner_id or f"host-{id(self)}",
 				project_id=None, conversation_id=None, tools=None,
 			))
+		if record.server == "google-mcp":
+			return create_google_mcp(google_scope) if google_scope is not None else None
 		return self._servers.get(record.server)
 
 	async def _discover_async(self) -> None:
 		for server_name, server in self._servers.items():
 			server_records = [record for record in self._tools.values() if record.server == server_name]
 			if server_name == "github-mcp" and not os.getenv("GITHUB_PERSONAL_ACCESS_TOKEN"):
-				for record in server_records:
-					record.health = MCPHealth.UNCONFIGURED.value
-				continue
-			if server_name == "google-mcp" and not os.getenv("GOOGLE_WORKSPACE_CREDENTIALS"):
 				for record in server_records:
 					record.health = MCPHealth.UNCONFIGURED.value
 				continue
@@ -184,7 +192,11 @@ class MCPHost:
 			asyncio.run(self._discover_async())
 			self._discovered = True
 
-	def catalog(self, project_scope: ProjectScope | None = None) -> list[dict[str, object]]:
+	def catalog(
+		self,
+		project_scope: ProjectScope | None = None,
+		google_scope: GoogleToolScope | None = None,
+	) -> list[dict[str, object]]:
 		self.discover()
 		project_health = MCPHealth.UNCONFIGURED.value
 		if project_scope is not None:
@@ -204,7 +216,7 @@ class MCPHost:
 			media_health = str(MEDIA_DIRECTOR.status().get("health", MCPHealth.UNAVAILABLE.value))
 		for record in self._tools.values():
 			value = asdict(record)
-			if not self._configured(record, project_scope):
+			if not self._configured(record, project_scope, google_scope):
 				value["health"] = MCPHealth.UNCONFIGURED.value
 			elif not mcp_tool_enabled(record.name):
 				value["health"] = MCPHealth.UNCONFIGURED.value
@@ -222,6 +234,7 @@ class MCPHost:
 		arguments: dict[str, object],
 		project_scope: ProjectScope | None = None,
 		media_owner_id: str | None = None,
+		google_scope: GoogleToolScope | None = None,
 	) -> MCPCallOutcome:
 		started = perf_counter()
 		record = self._tools.get(tool_name)
@@ -230,7 +243,7 @@ class MCPHost:
 				False, False, tool_name, "", MCPHealth.UNAVAILABLE.value, None,
 				"MCP tool is not registered", 0,
 			)
-		if not self._configured(record, project_scope):
+		if not self._configured(record, project_scope, google_scope):
 			return MCPCallOutcome(
 				False, False, tool_name, record.server, MCPHealth.UNCONFIGURED.value, None,
 				"MCP capability is not configured", 0,
@@ -240,7 +253,7 @@ class MCPHost:
 				False, False, tool_name, record.server, MCPHealth.UNCONFIGURED.value, None,
 				"MCP capability is disabled", 0,
 			)
-		server = self._server_for(record, project_scope, media_owner_id)
+		server = self._server_for(record, project_scope, media_owner_id, google_scope)
 		if server is None:
 			record.health = MCPHealth.UNAVAILABLE.value
 			return MCPCallOutcome(
@@ -295,15 +308,19 @@ class MCPHost:
 		arguments: dict[str, object],
 		project_scope: ProjectScope | None = None,
 		media_owner_id: str | None = None,
+		google_scope: GoogleToolScope | None = None,
 	) -> MCPCallOutcome:
-		return asyncio.run(self._call_async(tool_name, arguments, project_scope, media_owner_id))
+		return asyncio.run(self._call_async(tool_name, arguments, project_scope, media_owner_id, google_scope))
 
 
 MCP_HOST = MCPHost()
 
 
-def mcp_tool_catalog(project_scope: ProjectScope | None = None) -> list[dict[str, object]]:
-	return MCP_HOST.catalog(project_scope)
+def mcp_tool_catalog(
+	project_scope: ProjectScope | None = None,
+	google_scope: GoogleToolScope | None = None,
+) -> list[dict[str, object]]:
+	return MCP_HOST.catalog(project_scope, google_scope)
 
 
 def call_mcp_tool(
@@ -311,5 +328,6 @@ def call_mcp_tool(
 	arguments: dict[str, object],
 	project_scope: ProjectScope | None = None,
 	media_owner_id: str | None = None,
+	google_scope: GoogleToolScope | None = None,
 ) -> MCPCallOutcome:
-	return MCP_HOST.call(tool_name, arguments, project_scope, media_owner_id)
+	return MCP_HOST.call(tool_name, arguments, project_scope, media_owner_id, google_scope)

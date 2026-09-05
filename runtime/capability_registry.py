@@ -144,7 +144,7 @@ TOOL_SPECS = {
     "media_generate_image": AgentToolSpec("media_generate_image", "media", "Generate one image from explicit subject, composition, style, camera, lighting, and background intent; optionally save it to the current Project.", "media-mcp", "gpu_compute", "EXECUTE_MEDIA", _object({"subject": _string("Primary visual subject", 500), "intent": _string("Additional visual intent", 2000), "composition": _string("Composition", 300), "style": _string("Visual style", 300), "camera": _string("Camera or framing", 300), "lighting": _string("Lighting", 300), "background": _string("Background", 300), "quality_priority": {"type": "string", "enum": ["FAST", "BALANCED", "QUALITY"]}, "latency_priority": {"type": "string", "enum": ["FAST", "BALANCED"]}, "output_size": {"type": "string", "enum": ["512x512"]}, "save_to_project": {"type": "boolean"}}, ("subject",))),
     "media_edit_image": AgentToolSpec("media_edit_image", "media", "Apply every requested visual change to one authorized logical source image while preserving identity and unchanged elements.", "media-mcp", "gpu_compute", "EXECUTE_MEDIA", _object({"source_image_id": _string("Opaque generated image or current Project file ID", 100), "intent": _string("Complete edit request; preserve all distinct modifications", 2000), "preserve_identity": {"type": "boolean"}, "preserve_elements": {"type": "array", "items": _string("Element to preserve", 200), "maxItems": 20}, "quality_priority": {"type": "string", "enum": ["FAST", "BALANCED", "QUALITY"]}, "latency_priority": {"type": "string", "enum": ["FAST", "BALANCED"]}, "output_size": {"type": "string", "enum": ["512x512"]}, "save_to_project": {"type": "boolean"}}, ("source_image_id", "intent"))),
     "media_adjust_pose": AgentToolSpec("media_adjust_pose", "media", "Adjust one authorized portrait source image to a front-facing pose while preserving identity.", "media-mcp", "gpu_compute", "EXECUTE_MEDIA", _object({"source_image_id": _string("Opaque generated image or current Project file ID", 100), "pose": {"type": "string", "enum": ["front_facing"]}, "preserve_identity": {"type": "boolean"}, "save_to_project": {"type": "boolean"}}, ("source_image_id",))),
-    "google_drive_list": AgentToolSpec("google_drive_list", "google", "List or search Google Drive files the user can access and return bounded file metadata only.", "google-mcp", "external", "READ", _object({"query": _string("Optional Drive search text", 300), "mime_type": _string("Optional MIME type filter, e.g. application/vnd.google-apps.document", 200), "limit": {"type": "integer", "minimum": 1, "maximum": 100}})),
+    "google_drive_list": AgentToolSpec("google_drive_list", "google", "List or search files available through the connected user's Google Drive drive.file grant and return bounded metadata only.", "google-mcp", "external", "READ", _object({"query": _string("Optional file-name search text", 300), "mime_type": _string("Optional MIME type filter, e.g. application/vnd.google-apps.document", 200), "limit": {"type": "integer", "minimum": 1, "maximum": 100}, "page_size": {"type": "integer", "minimum": 1, "maximum": 100}, "page_token": _string("Optional token from the preceding page", 2048)})),
     "google_docs_create": AgentToolSpec("google_docs_create", "google", "Create a Google Docs document from a user-provided title and plain text or Markdown content.", "google-mcp", "external", "WRITE_ARTIFACT", _object({"title": _string("Document title", 300), "content": _string("Document body as plain text or Markdown", 20000), "folder_id": _string("Optional Drive folder ID", 100)}, ("title", "content"))),
     "google_sheets_create": AgentToolSpec("google_sheets_create", "google", "Create a Google Sheets spreadsheet from column headers and tabular rows.", "google-mcp", "external", "WRITE_ARTIFACT", _object({"title": _string("Spreadsheet title", 300), "headers": {"type": "array", "items": _string("Column header", 200), "minItems": 1, "maxItems": 50}, "rows": {"type": "array", "items": {"type": "array", "items": _string("Cell value", 2000), "maxItems": 50}, "maxItems": 500}, "sheet_name": _string("Optional sheet tab name", 100), "folder_id": _string("Optional Drive folder ID", 100)}, ("title", "headers", "rows"))),
 }
@@ -155,7 +155,12 @@ def _enabled(flag: str, default: bool = True) -> bool:
     return default if value is None else value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def capability_catalog(*, project_available: bool = False, image_available: bool = False) -> list[dict[str, object]]:
+def capability_catalog(
+    *,
+    project_available: bool = False,
+    image_available: bool = False,
+    google_available: bool | None = None,
+) -> list[dict[str, object]]:
     catalog = []
     for capability in CAPABILITIES:
         default = False if capability.name in {"browser", "media", "google"} else True
@@ -173,7 +178,7 @@ def capability_catalog(*, project_available: bool = False, image_available: bool
         elif capability.name == "media":
             configured = image_available
         elif capability.name == "google":
-            configured = bool(os.getenv("GOOGLE_WORKSPACE_CREDENTIALS"))
+            configured = bool(os.getenv("GOOGLE_WORKSPACE_CREDENTIALS")) if google_available is None else google_available
         provider_states: dict[str, str] | None = None
         health = "AVAILABLE" if enabled and configured else ("UNCONFIGURED" if enabled else "DISABLED")
         if capability.name == "academic" and enabled:

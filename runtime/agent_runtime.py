@@ -21,6 +21,7 @@ from hangul_romanize.rule import academic as academic_romanization
 
 from runtime.capability_registry import CAPABILITIES, capability_catalog, detailed_tools
 from runtime.mcp_host import call_mcp_tool
+from mcp_servers.google_server import GoogleToolScope
 from runtime.role_registry import get_role
 from runtime.router import Route, route_request
 from runtime.sessions import SessionStore
@@ -253,6 +254,7 @@ class AgentRuntime:
         images: tuple[tuple[str, str, bytes], ...] = (),
         persistent_context: str = "",
         project_scope: ProjectToolScope | None = None,
+        google_scope: GoogleToolScope | None = None,
     ) -> ChatResult:
         if not message.strip():
             raise ValueError("message must not be empty")
@@ -334,7 +336,7 @@ class AgentRuntime:
                 messages.append({"role": "user", "content": public_context})
             if route.agent in {"main", "coding"}:
                 answer, payload, dynamic_tools, selected_capabilities = self._run_main_tool_loop(
-                    message, messages, self._max_tokens(route), latency, project_scope, route.agent, session.id,
+                    message, messages, self._max_tokens(route), latency, project_scope, route.agent, session.id, google_scope,
                 )
                 tools.extend(dynamic_tools)
             else:
@@ -375,6 +377,7 @@ class AgentRuntime:
         project_scope: ProjectToolScope | None,
         agent: str = "main",
         media_owner_id: str | None = None,
+        google_scope: GoogleToolScope | None = None,
     ) -> tuple[str, dict[str, object], list[dict[str, object]], tuple[str, ...]]:
         role = get_role(agent)
         from runtime.media import MEDIA_DIRECTOR, MediaStatus
@@ -383,6 +386,7 @@ class AgentRuntime:
         catalog = capability_catalog(
             project_available=project_scope is not None,
             image_available=media_health == MediaStatus.AVAILABLE.value,
+            google_available=google_scope is not None,
         )
         available = [item for item in catalog if item["available"]]
         if not available:
@@ -466,7 +470,7 @@ class AgentRuntime:
                     server, status, call_executed, duration_ms = "", "ERROR", False, 0
                 else:
                     executed_signatures.add(signature)
-                    outcome = call_mcp_tool(name, arguments, project_scope, media_owner_id)
+                    outcome = call_mcp_tool(name, arguments, project_scope, media_owner_id, google_scope)
                     observation = outcome.output or {"status": outcome.status, "error": outcome.error}
                     success = outcome.success
                     server, status, call_executed, duration_ms = (
