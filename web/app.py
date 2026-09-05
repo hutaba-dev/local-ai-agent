@@ -7,6 +7,7 @@ import secrets
 import hashlib
 import json
 import base64
+import logging
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -51,6 +52,7 @@ from runtime.router import AGENT_CHOICES
 from runtime.tool_registry import ProjectToolScope
 from runtime.web_search import fetch_visual_thumbnails, search, visual_search
 from web.auth import SessionSigner, User, configured_user_store
+from web import google_oauth
 from web.uploads import ExtractedUpload, IMAGE_EXTENSIONS, UploadError, extract_text, image_thumbnail_data_url, max_upload_bytes, safe_filename
 
 
@@ -84,6 +86,20 @@ ROLE_ALLOWED_AGENTS = {
     "manager": frozenset({"auto", "main", "research"}),
     "guest": frozenset({"auto", "main", "research"}),
 }
+
+
+class OAuthAccessLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple) and len(record.args) >= 3:
+            path = record.args[2]
+            if isinstance(path, str) and path.startswith("/oauth/google?"):
+                arguments = list(record.args)
+                arguments[2] = "/oauth/google?<redacted>"
+                record.args = tuple(arguments)
+        return True
+
+
+logging.getLogger("uvicorn.access").addFilter(OAuthAccessLogFilter())
 
 
 def session_timeout_seconds(user: User) -> int:
@@ -307,6 +323,13 @@ def current_user(request: Request) -> User:
     return request.state.user
 
 
+def current_session_key(request: Request) -> str:
+    session_key = session_signer.session_key(request.cookies.get(SESSION_COOKIE))
+    if session_key is None:
+        raise HTTPException(status_code=401, detail="login required")
+    return session_key
+
+
 def chat_owner(request: Request) -> str:
     token = request.cookies.get(SESSION_COOKIE, "")
     session_key = session_signer.session_key(token)
@@ -524,6 +547,78 @@ def me(request: Request) -> dict[str, str | int | bool]:
         "session_idle_timeout_seconds": session_timeout_seconds(user),
         "can_upload": user.role != "guest",
         "can_use_projects": user.role != "guest",
+    }
+
+
+@app.post("/api/google/connect")
+def google_connect(request: Request) -> RedirectResponse:
+    if not google_oauth.configured():
+        raise HTTPException(status_code=503, detail="Google OAuth is not configured")
+    state = secrets.token_urlsafe(32)
+    user = current_user(request)
+    user_store.create_google_oauth_state(
+        state,
+        user.username,
+        current_session_key(request),
+        int(time()) + 10 * 60,
+    )
+    return RedirectResponse(google_oauth.authorization_url(state), status_code=303)
+
+
+@app.get("/oauth/google")
+async def google_callback(
+    request: Request,
+    state: str | None = None,
+    code: str | None = None,
+    error: str | None = None,
+) -> RedirectResponse:
+    if error or not state or not code:
+        raise HTTPException(status_code=400, detail="Google authorization was not completed")
+    user = current_user(request)
+    if not user_store.consume_google_oauth_state(state, user.username, current_session_key(request)):
+        raise HTTPException(status_code=400, detail="Google authorization state is invalid or expired")
+    try:
+        token = await google_oauth.exchange_code(code)
+        user_store.save_google_token(
+            user.username,
+            token.access_token,
+            token.refresh_token,
+            token.expires_at,
+            token.scopes,
+            token.token_type,
+        )
+    except (google_oauth.GoogleOAuthError, RuntimeError) as exchange_error:
+        raise HTTPException(status_code=502, detail="Google authorization failed") from exchange_error
+    return RedirectResponse("/?google=connected", status_code=303)
+
+
+@app.get("/api/google/status")
+async def google_status(request: Request) -> dict[str, object]:
+    configured = google_oauth.configured()
+    if not configured:
+        return {"configured": False, "connected": False, "expires_at": None, "scopes": []}
+    user = current_user(request)
+    try:
+        token = user_store.google_token(user.username)
+        if token and token.expires_at <= int(time()) + 60 and token.refresh_token:
+            refreshed = await google_oauth.refresh_access_token(token.refresh_token)
+            user_store.save_google_token(
+                user.username,
+                refreshed.access_token,
+                refreshed.refresh_token,
+                refreshed.expires_at,
+                refreshed.scopes,
+                refreshed.token_type,
+            )
+            token = user_store.google_token(user.username)
+    except (google_oauth.GoogleOAuthError, RuntimeError):
+        token = None
+    connected = bool(token and token.expires_at > int(time()))
+    return {
+        "configured": True,
+        "connected": connected,
+        "expires_at": token.expires_at if connected else None,
+        "scopes": list(token.scopes) if connected else [],
     }
 
 

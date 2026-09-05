@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
@@ -12,6 +13,8 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+
+from cryptography.fernet import Fernet, InvalidToken
 
 
 USERNAME_PATTERN = re.compile(r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{2,39}$")
@@ -26,9 +29,21 @@ class User:
     active: bool
 
 
+@dataclass(frozen=True)
+class GoogleToken:
+    access_token: str
+    refresh_token: str | None
+    expires_at: int
+    scopes: tuple[str, ...]
+    token_type: str
+    updated_at: str
+
+
 class UserStore:
-    def __init__(self, database_path: Path) -> None:
+    def __init__(self, database_path: Path, oauth_secret: str | None = None) -> None:
         self.database_path = database_path
+        secret = oauth_secret or os.getenv("WEB_SESSION_SECRET")
+        self._oauth_cipher = Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest())) if secret else None
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as connection:
             schema = connection.execute(
@@ -44,6 +59,7 @@ class UserStore:
                     SELECT username, password_hash, role, active, created_at FROM users_before_manager_role"""
                 )
                 connection.execute("DROP TABLE users_before_manager_role")
+            self._create_oauth_tables(connection)
 
     @staticmethod
     def _create_table(connection: sqlite3.Connection) -> None:
@@ -55,6 +71,31 @@ class UserStore:
                 active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             )"""
+        )
+
+    @staticmethod
+    def _create_oauth_tables(connection: sqlite3.Connection) -> None:
+        connection.executescript(
+            """CREATE TABLE IF NOT EXISTS google_oauth_states (
+                state_hash TEXT PRIMARY KEY,
+                username TEXT NOT NULL,
+                session_hash TEXT NOT NULL,
+                expires_at INTEGER NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE
+            );
+            CREATE INDEX IF NOT EXISTS idx_google_oauth_states_expiry
+                ON google_oauth_states(expires_at);
+            CREATE TABLE IF NOT EXISTS google_oauth_tokens (
+                username TEXT PRIMARY KEY,
+                access_token TEXT NOT NULL,
+                refresh_token TEXT,
+                expires_at INTEGER NOT NULL,
+                scopes TEXT NOT NULL,
+                token_type TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(username) REFERENCES users(username) ON DELETE CASCADE
+            );"""
         )
 
     def _connect(self) -> sqlite3.Connection:
@@ -115,6 +156,99 @@ class UserStore:
             )
         if result.rowcount != 1:
             raise ValueError("username does not exist")
+
+    @staticmethod
+    def _digest(value: str) -> str:
+        return hashlib.sha256(value.encode()).hexdigest()
+
+    def create_google_oauth_state(
+        self, state: str, username: str, session_key: str, expires_at: int
+    ) -> None:
+        now = datetime.now(UTC)
+        with self._connect() as connection:
+            connection.execute("DELETE FROM google_oauth_states WHERE expires_at < ?", (int(now.timestamp()),))
+            connection.execute(
+                "INSERT INTO google_oauth_states(state_hash, username, session_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
+                (self._digest(state), username, self._digest(session_key), expires_at, now.isoformat()),
+            )
+
+    def consume_google_oauth_state(
+        self, state: str, username: str, session_key: str, now: int | None = None
+    ) -> bool:
+        current_time = int(datetime.now(UTC).timestamp()) if now is None else now
+        state_hash = self._digest(state)
+        with self._connect() as connection:
+            row = connection.execute(
+                """DELETE FROM google_oauth_states WHERE state_hash = ?
+                RETURNING username, session_hash, expires_at""",
+                (state_hash,),
+            ).fetchone()
+        return bool(
+            row
+            and hmac.compare_digest(row[0], username)
+            and hmac.compare_digest(row[1], self._digest(session_key))
+            and row[2] >= current_time
+        )
+
+    def _cipher(self) -> Fernet:
+        if self._oauth_cipher is None:
+            raise RuntimeError("OAuth token encryption is not configured")
+        return self._oauth_cipher
+
+    def save_google_token(
+        self,
+        username: str,
+        access_token: str,
+        refresh_token: str | None,
+        expires_at: int,
+        scopes: tuple[str, ...],
+        token_type: str,
+    ) -> None:
+        cipher = self._cipher()
+        encrypted_access = cipher.encrypt(access_token.encode()).decode()
+        encrypted_refresh = cipher.encrypt(refresh_token.encode()).decode() if refresh_token else None
+        now = datetime.now(UTC).isoformat()
+        with self._connect() as connection:
+            if encrypted_refresh is None:
+                existing = connection.execute(
+                    "SELECT refresh_token FROM google_oauth_tokens WHERE username = ?", (username,)
+                ).fetchone()
+                encrypted_refresh = existing[0] if existing else None
+            connection.execute(
+                """INSERT INTO google_oauth_tokens(
+                    username, access_token, refresh_token, expires_at, scopes, token_type, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(username) DO UPDATE SET
+                    access_token = excluded.access_token,
+                    refresh_token = excluded.refresh_token,
+                    expires_at = excluded.expires_at,
+                    scopes = excluded.scopes,
+                    token_type = excluded.token_type,
+                    updated_at = excluded.updated_at""",
+                (username, encrypted_access, encrypted_refresh, expires_at, json.dumps(scopes), token_type, now),
+            )
+
+    def google_token(self, username: str) -> GoogleToken | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                """SELECT access_token, refresh_token, expires_at, scopes, token_type, updated_at
+                FROM google_oauth_tokens WHERE username = ?""",
+                (username,),
+            ).fetchone()
+        if row is None:
+            return None
+        cipher = self._cipher()
+        try:
+            return GoogleToken(
+                access_token=cipher.decrypt(row[0].encode()).decode(),
+                refresh_token=cipher.decrypt(row[1].encode()).decode() if row[1] else None,
+                expires_at=row[2],
+                scopes=tuple(json.loads(row[3])),
+                token_type=row[4],
+                updated_at=row[5],
+            )
+        except (InvalidToken, UnicodeDecodeError, ValueError, TypeError) as error:
+            raise RuntimeError("Stored OAuth token could not be decrypted") from error
 
 
 class SessionSigner:
@@ -184,4 +318,4 @@ class SessionSigner:
 
 def configured_user_store() -> UserStore:
     path = Path(os.getenv("WEB_USER_DB", "local-memory/web-users.sqlite3"))
-    return UserStore(path)
+    return UserStore(path, os.getenv("WEB_SESSION_SECRET"))

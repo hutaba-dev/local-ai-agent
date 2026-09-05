@@ -21,6 +21,7 @@ button, select, textarea, input { font: inherit; }
 h1 { margin: 0; font-size: 28px; font-weight: 700; letter-spacing: 0; }
 h2 { margin: 0; font-size: 21px; letter-spacing: 0; }
 .controls { display: flex; align-items: center; flex-wrap: wrap; justify-content: flex-end; gap: 10px; }
+.google-connect { margin: 0; }
 .agent-select { color: var(--muted); font: 700 12px/1.2 ui-monospace, monospace; }
 select, button, textarea { border: 1px solid var(--line); border-radius: 5px; }
 select { display: block; margin-top: 5px; background: var(--panel); color: var(--ink); padding: 7px 9px; }

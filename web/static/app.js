@@ -10,6 +10,8 @@ const newChatButton = document.querySelector("#new-chat");
 const logoutButton = document.querySelector("#logout");
 const accountName = document.querySelector("#account-name");
 const status = document.querySelector("#connection-status");
+const googleStatus = document.querySelector("#google-status");
+const googleConnect = document.querySelector("#google-connect");
 const sidebar = document.querySelector("#project-sidebar");
 const sidebarToggle = document.querySelector("#sidebar-toggle");
 const sidebarScrim = document.querySelector("#sidebar-scrim");
@@ -936,9 +938,12 @@ selectionCopyButton.addEventListener("click", () => copyText(selectedAssistantTe
 
 async function initialize() {
   try {
-    const [agentPayload, health, account] = await Promise.all([request("/api/agents"), request("/health"), request("/api/me")]);
+    const [agentPayload, health, account, google] = await Promise.all([request("/api/agents"), request("/health"), request("/api/me"), request("/api/google/status")]);
     selector.innerHTML = agentPayload.agents.map((agent) => `<option value="${agent.id}">${agent.label}</option>`).join("");
     accountName.textContent = `${account.username} (${account.role})`;
+    googleStatus.textContent = google.connected ? "Google connected" : (google.configured ? "Google disconnected" : "Google unavailable");
+    googleStatus.className = `status ${google.connected ? "online" : "offline"}`;
+    googleConnect.hidden = !google.configured || google.connected;
     attachButton.hidden = !account.can_upload;
     fileInput.disabled = !account.can_upload;
     canUseProjects = account.can_use_projects;
