@@ -14,6 +14,7 @@ from web import google_oauth
 
 DRIVE_FILES_ENDPOINT = "https://www.googleapis.com/drive/v3/files"
 DRIVE_FILE_FIELDS = "nextPageToken,files(id,name,mimeType,modifiedTime,createdTime,webViewLink)"
+DOCS_CREATE_ENDPOINT = "https://docs.googleapis.com/v1/documents"
 
 
 class GoogleTokenStore(Protocol):
@@ -199,6 +200,131 @@ async def list_drive_files(
         }
 
 
+def _docs_error(
+    status: str,
+    message: str,
+    document_id: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "status": status,
+        "tool": "google_docs_create",
+        "message": message,
+    }
+    if document_id:
+        payload.update({
+            "document_id": document_id,
+            "url": f"https://docs.google.com/document/d/{document_id}/edit",
+            "partial": True,
+        })
+    return payload
+
+
+def _docs_http_error(status_code: int, document_id: str | None = None) -> dict[str, object]:
+    if status_code == 401:
+        return _docs_error("AUTH_REFRESH_FAILED", "Google authorization is no longer valid", document_id)
+    if status_code == 403:
+        return _docs_error("PERMISSION_DENIED", "The connected Google account cannot create this document", document_id)
+    if status_code == 429:
+        return _docs_error("RATE_LIMITED", "Google Docs rate limit reached; retry later", document_id)
+    if status_code >= 500:
+        return _docs_error("GOOGLE_API_UNAVAILABLE", "Google Docs is temporarily unavailable", document_id)
+    if document_id:
+        return _docs_error("DOCUMENT_CREATE_FAILED", "The document was created but its body could not be inserted", document_id)
+    return _docs_error("INVALID_REQUEST", "Google Docs rejected the document request")
+
+
+async def create_google_document(
+    scope: GoogleToolScope,
+    title: str,
+    content: str,
+    folder_id: str | None = None,
+) -> dict[str, object]:
+    normalized_title = title.strip()
+    if not normalized_title or len(normalized_title) > 300:
+        return _docs_error("INVALID_REQUEST", "title must contain between 1 and 300 characters")
+    if not content.strip() or len(content) > 20_000:
+        return _docs_error("INVALID_REQUEST", "content must contain between 1 and 20000 characters")
+    if folder_id:
+        return _docs_error("INVALID_REQUEST", "folder placement is not supported in this phase")
+    token = scope.token_store.google_token(scope.username)
+    if token is None:
+        return _docs_error("NOT_CONNECTED", "Connect Google Workspace before creating Docs")
+    if getattr(token, "expires_at", 0) <= int(time()) + 60:
+        try:
+            token = await _refresh(scope, getattr(token, "refresh_token", None))
+        except google_oauth.GoogleOAuthError:
+            return _docs_error("AUTH_REFRESH_FAILED", "Google authorization could not be refreshed")
+        if token is None:
+            return _docs_error("AUTH_REFRESH_FAILED", "Google authorization could not be refreshed")
+
+    refreshed_after_unauthorized = False
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.post(
+                    DOCS_CREATE_ENDPOINT,
+                    json={"title": normalized_title},
+                    headers={"Authorization": f"Bearer {getattr(token, 'access_token', '')}"},
+                )
+        except httpx.HTTPError:
+            return _docs_error("GOOGLE_API_UNAVAILABLE", "Google Docs is temporarily unavailable")
+        if response.status_code == 401 and not refreshed_after_unauthorized:
+            try:
+                token = await _refresh(scope, getattr(token, "refresh_token", None))
+            except google_oauth.GoogleOAuthError:
+                token = None
+            if token is None:
+                return _docs_error("AUTH_REFRESH_FAILED", "Google authorization could not be refreshed")
+            refreshed_after_unauthorized = True
+            continue
+        if response.status_code >= 400:
+            return _docs_http_error(response.status_code)
+        try:
+            create_payload = response.json()
+        except ValueError:
+            create_payload = None
+        document_id = create_payload.get("documentId") if isinstance(create_payload, dict) else None
+        if not isinstance(document_id, str) or not document_id:
+            return _docs_error("DOCUMENT_CREATE_FAILED", "Google Docs did not return a document ID")
+        break
+
+    batch_endpoint = f"{DOCS_CREATE_ENDPOINT}/{document_id}:batchUpdate"
+    refreshed_after_unauthorized = False
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.post(
+                    batch_endpoint,
+                    json={"requests": [{"insertText": {"location": {"index": 1}, "text": content}}]},
+                    headers={"Authorization": f"Bearer {getattr(token, 'access_token', '')}"},
+                )
+        except httpx.HTTPError:
+            return _docs_error(
+                "GOOGLE_API_UNAVAILABLE", "The document was created but Google Docs is temporarily unavailable", document_id
+            )
+        if response.status_code == 401 and not refreshed_after_unauthorized:
+            try:
+                token = await _refresh(scope, getattr(token, "refresh_token", None))
+            except google_oauth.GoogleOAuthError:
+                token = None
+            if token is None:
+                return _docs_error("AUTH_REFRESH_FAILED", "Google authorization could not be refreshed", document_id)
+            refreshed_after_unauthorized = True
+            continue
+        if response.status_code >= 400:
+            return _docs_http_error(response.status_code, document_id)
+        return {
+            "status": "AVAILABLE",
+            "tool": "google_docs_create",
+            "document_id": document_id,
+            "title": normalized_title,
+            "url": f"https://docs.google.com/document/d/{document_id}/edit",
+            "scope": google_oauth.DRIVE_FILE_SCOPE,
+            "scope_limited": True,
+            "content_format": "plain_text",
+        }
+
+
 def create_google_mcp(scope: GoogleToolScope) -> MCPServer:
     server = MCPServer(
         "ahnbys-google-scoped",
@@ -223,9 +349,20 @@ def create_google_mcp(scope: GoogleToolScope) -> MCPServer:
     ) -> dict[str, object]:
         return await list_drive_files(scope, query, mime_type, limit, page_size, page_token)
 
-    @server.tool(name="google_docs_create", description="Google Docs creation is not configured in this phase.", structured_output=True)
-    def scoped_google_docs_create(title: str, content: str, folder_id: str | None = None) -> dict[str, object]:
-        return google_docs_create(title, content, folder_id)
+    @server.tool(
+        name="google_docs_create",
+        description=(
+            "Create a Google Docs document for the connected user and insert the supplied content as plain text. "
+            "Returns the document ID and Google Docs URL."
+        ),
+        structured_output=True,
+    )
+    async def scoped_google_docs_create(
+        title: str,
+        content: str,
+        folder_id: str | None = None,
+    ) -> dict[str, object]:
+        return await create_google_document(scope, title, content, folder_id)
 
     @server.tool(name="google_sheets_create", description="Google Sheets creation is not configured in this phase.", structured_output=True)
     def scoped_google_sheets_create(

@@ -288,6 +288,36 @@ class MainToolLoopTests(unittest.TestCase):
         self.assertEqual(result.selected_capabilities, ("google",))
         self.assertIs(call.call_args.args[4], scope)
 
+    def test_google_docs_request_calls_existing_write_artifact_tool(self) -> None:
+        client = SequencedClient([
+            {"role": "assistant", "content": '{"capabilities":["google"]}'},
+            {"role": "assistant", "content": None, "tool_calls": [{
+                "id": "call_docs",
+                "type": "function",
+                "function": {
+                    "name": "google_docs_create",
+                    "arguments": '{"title":"Meeting notes","content":"Decisions"}',
+                },
+            }]},
+            {"role": "assistant", "content": "Google Docs 문서를 생성했습니다."},
+        ])
+        scope = GoogleToolScope("alice", SimpleNamespace())
+        outcome = MCPCallOutcome(
+            True, True, "google_docs_create", "google-mcp", "AVAILABLE",
+            {"status": "AVAILABLE", "document_id": "doc-1"}, None, 1,
+        )
+        with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_GOOGLE_ENABLED": "true"}, clear=False), patch(
+            "runtime.agent_runtime.call_mcp_tool", return_value=outcome
+        ) as call:
+            result = AgentRuntime(client=client).chat(
+                "회의 결과를 Google Docs 문서로 만들어줘", "main", google_scope=scope
+            )
+
+        self.assertEqual(result.selected_capabilities, ("google",))
+        self.assertEqual(result.tools[0]["name"], "google_docs_create")
+        self.assertEqual(result.tools[0]["action"], "WRITE_ARTIFACT")
+        self.assertIs(call.call_args.args[4], scope)
+
     def test_project_capability_is_unavailable_without_project_scope(self) -> None:
         client = SequencedClient([
             {"role": "assistant", "content": '{"capabilities":["project"]}'},

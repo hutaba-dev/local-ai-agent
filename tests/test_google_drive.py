@@ -217,12 +217,12 @@ class GoogleDriveMCPContractTests(unittest.TestCase):
         self.assertEqual(outcome.status, "NOT_CONNECTED")
         self.assertEqual(outcome.output["files"], [])
 
-    def test_docs_and_sheets_remain_unconfigured(self) -> None:
+    def test_sheets_remains_unconfigured(self) -> None:
         scope = GoogleToolScope("alice", FakeTokenStore(None))
         with patch.dict(os.environ, {"MCP_ENABLED": "true", "MCP_GOOGLE_ENABLED": "true"}, clear=False):
             outcome = call_mcp_tool(
-                "google_docs_create",
-                {"title": "Not created", "content": "No write in Phase 3C-1"},
+                "google_sheets_create",
+                {"title": "Not created", "headers": ["A"], "rows": []},
                 google_scope=scope,
             )
 
