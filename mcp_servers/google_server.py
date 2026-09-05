@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from time import time
 from typing import Protocol
+from urllib.parse import quote
 
 import httpx
 from mcp.server import MCPServer
@@ -15,6 +17,11 @@ from web import google_oauth
 DRIVE_FILES_ENDPOINT = "https://www.googleapis.com/drive/v3/files"
 DRIVE_FILE_FIELDS = "nextPageToken,files(id,name,mimeType,modifiedTime,createdTime,webViewLink)"
 DOCS_CREATE_ENDPOINT = "https://docs.googleapis.com/v1/documents"
+SHEETS_CREATE_ENDPOINT = "https://sheets.googleapis.com/v4/spreadsheets"
+MAX_SHEET_ROWS = 500
+MAX_SHEET_COLUMNS = 50
+MAX_SHEET_CELLS = 20_000
+MAX_SHEET_STRING_LENGTH = 2_000
 
 
 class GoogleTokenStore(Protocol):
@@ -325,6 +332,179 @@ async def create_google_document(
         }
 
 
+def _sheets_error(
+    status: str,
+    message: str,
+    spreadsheet_id: str | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "status": status,
+        "tool": "google_sheets_create",
+        "message": message,
+    }
+    if spreadsheet_id:
+        payload.update({
+            "spreadsheet_id": spreadsheet_id,
+            "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
+            "partial": True,
+        })
+    return payload
+
+
+def _sheets_http_error(status_code: int, spreadsheet_id: str | None = None) -> dict[str, object]:
+    if status_code == 401:
+        return _sheets_error("AUTH_REFRESH_FAILED", "Google authorization is no longer valid", spreadsheet_id)
+    if status_code == 403:
+        return _sheets_error("PERMISSION_DENIED", "The connected Google account cannot create this spreadsheet", spreadsheet_id)
+    if status_code == 429:
+        return _sheets_error("RATE_LIMITED", "Google Sheets rate limit reached; retry later", spreadsheet_id)
+    if status_code >= 500:
+        return _sheets_error("GOOGLE_API_UNAVAILABLE", "Google Sheets is temporarily unavailable", spreadsheet_id)
+    if spreadsheet_id:
+        return _sheets_error("VALUES_WRITE_FAILED", "The spreadsheet was created but its values could not be written", spreadsheet_id)
+    return _sheets_error("INVALID_REQUEST", "Google Sheets rejected the spreadsheet request")
+
+
+def _sheet_values(
+    values: list[list[object]] | None,
+    headers: list[object] | None,
+    rows: list[list[object]] | None,
+) -> list[list[object]] | None:
+    if values is not None and (headers is not None or rows is not None):
+        return None
+    if values is None:
+        if headers is None or rows is None:
+            return None
+        values = [headers, *rows]
+    if not isinstance(values, list) or not values or len(values) > MAX_SHEET_ROWS:
+        return None
+    cell_count = 0
+    for row in values:
+        if not isinstance(row, list) or not row or len(row) > MAX_SHEET_COLUMNS:
+            return None
+        cell_count += len(row)
+        for cell in row:
+            if cell is not None and not isinstance(cell, (str, int, float, bool)):
+                return None
+            if isinstance(cell, str) and len(cell) > MAX_SHEET_STRING_LENGTH:
+                return None
+            if isinstance(cell, float) and not math.isfinite(cell):
+                return None
+    return values if cell_count <= MAX_SHEET_CELLS else None
+
+
+async def create_google_spreadsheet(
+    scope: GoogleToolScope,
+    title: str,
+    values: list[list[object]] | None = None,
+    headers: list[object] | None = None,
+    rows: list[list[object]] | None = None,
+    sheet_name: str | None = None,
+    start_range: str = "A1",
+    folder_id: str | None = None,
+) -> dict[str, object]:
+    normalized_title = title.strip()
+    normalized_sheet_name = sheet_name.strip() if isinstance(sheet_name, str) else None
+    normalized_range = start_range.strip() if isinstance(start_range, str) else ""
+    normalized_values = _sheet_values(values, headers, rows)
+    if not normalized_title or len(normalized_title) > 300:
+        return _sheets_error("INVALID_REQUEST", "title must contain between 1 and 300 characters")
+    if normalized_values is None:
+        return _sheets_error("INVALID_REQUEST", "values must be a non-empty bounded 2D array of scalar values")
+    if normalized_sheet_name is not None and (not normalized_sheet_name or len(normalized_sheet_name) > 100):
+        return _sheets_error("INVALID_REQUEST", "sheet_name must contain between 1 and 100 characters")
+    if not normalized_range or len(normalized_range) > 100:
+        return _sheets_error("INVALID_REQUEST", "start_range must contain between 1 and 100 characters")
+    if folder_id:
+        return _sheets_error("INVALID_REQUEST", "folder placement is not supported in this phase")
+    token = scope.token_store.google_token(scope.username)
+    if token is None:
+        return _sheets_error("NOT_CONNECTED", "Connect Google Workspace before creating Sheets")
+    if getattr(token, "expires_at", 0) <= int(time()) + 60:
+        try:
+            token = await _refresh(scope, getattr(token, "refresh_token", None))
+        except google_oauth.GoogleOAuthError:
+            return _sheets_error("AUTH_REFRESH_FAILED", "Google authorization could not be refreshed")
+        if token is None:
+            return _sheets_error("AUTH_REFRESH_FAILED", "Google authorization could not be refreshed")
+
+    create_body: dict[str, object] = {"properties": {"title": normalized_title}}
+    if normalized_sheet_name:
+        create_body["sheets"] = [{"properties": {"title": normalized_sheet_name}}]
+    refreshed_after_unauthorized = False
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.post(
+                    SHEETS_CREATE_ENDPOINT,
+                    json=create_body,
+                    headers={"Authorization": f"Bearer {getattr(token, 'access_token', '')}"},
+                )
+        except httpx.HTTPError:
+            return _sheets_error("GOOGLE_API_UNAVAILABLE", "Google Sheets is temporarily unavailable")
+        if response.status_code == 401 and not refreshed_after_unauthorized:
+            try:
+                token = await _refresh(scope, getattr(token, "refresh_token", None))
+            except google_oauth.GoogleOAuthError:
+                token = None
+            if token is None:
+                return _sheets_error("AUTH_REFRESH_FAILED", "Google authorization could not be refreshed")
+            refreshed_after_unauthorized = True
+            continue
+        if response.status_code >= 400:
+            return _sheets_http_error(response.status_code)
+        try:
+            create_payload = response.json()
+        except ValueError:
+            create_payload = None
+        spreadsheet_id = create_payload.get("spreadsheetId") if isinstance(create_payload, dict) else None
+        if not isinstance(spreadsheet_id, str) or not spreadsheet_id:
+            return _sheets_error("SPREADSHEET_CREATE_FAILED", "Google Sheets did not return a spreadsheet ID")
+        break
+
+    target_range = normalized_range
+    if normalized_sheet_name:
+        escaped_name = normalized_sheet_name.replace("'", "''")
+        target_range = f"'{escaped_name}'!{normalized_range}"
+    values_endpoint = f"{SHEETS_CREATE_ENDPOINT}/{spreadsheet_id}/values/{quote(target_range, safe='')}"
+    refreshed_after_unauthorized = False
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.put(
+                    values_endpoint,
+                    params={"valueInputOption": "RAW"},
+                    json={"range": target_range, "majorDimension": "ROWS", "values": normalized_values},
+                    headers={"Authorization": f"Bearer {getattr(token, 'access_token', '')}"},
+                )
+        except httpx.HTTPError:
+            return _sheets_error(
+                "GOOGLE_API_UNAVAILABLE", "The spreadsheet was created but Google Sheets is temporarily unavailable", spreadsheet_id
+            )
+        if response.status_code == 401 and not refreshed_after_unauthorized:
+            try:
+                token = await _refresh(scope, getattr(token, "refresh_token", None))
+            except google_oauth.GoogleOAuthError:
+                token = None
+            if token is None:
+                return _sheets_error("AUTH_REFRESH_FAILED", "Google authorization could not be refreshed", spreadsheet_id)
+            refreshed_after_unauthorized = True
+            continue
+        if response.status_code >= 400:
+            return _sheets_http_error(response.status_code, spreadsheet_id)
+        return {
+            "status": "AVAILABLE",
+            "tool": "google_sheets_create",
+            "spreadsheet_id": spreadsheet_id,
+            "title": normalized_title,
+            "url": f"https://docs.google.com/spreadsheets/d/{spreadsheet_id}/edit",
+            "rows_written": len(normalized_values),
+            "columns_written": max(len(row) for row in normalized_values),
+            "scope": google_oauth.DRIVE_FILE_SCOPE,
+            "scope_limited": True,
+        }
+
+
 def create_google_mcp(scope: GoogleToolScope) -> MCPServer:
     server = MCPServer(
         "ahnbys-google-scoped",
@@ -364,15 +544,26 @@ def create_google_mcp(scope: GoogleToolScope) -> MCPServer:
     ) -> dict[str, object]:
         return await create_google_document(scope, title, content, folder_id)
 
-    @server.tool(name="google_sheets_create", description="Google Sheets creation is not configured in this phase.", structured_output=True)
-    def scoped_google_sheets_create(
+    @server.tool(
+        name="google_sheets_create",
+        description=(
+            "Create a Google Sheets spreadsheet for the connected user and write a bounded 2D scalar values array. "
+            "Legacy headers and rows inputs remain supported."
+        ),
+        structured_output=True,
+    )
+    async def scoped_google_sheets_create(
         title: str,
-        headers: list[str],
-        rows: list[list[str]],
+        values: list[list[object]] | None = None,
+        headers: list[object] | None = None,
+        rows: list[list[object]] | None = None,
         sheet_name: str | None = None,
+        start_range: str = "A1",
         folder_id: str | None = None,
     ) -> dict[str, object]:
-        return google_sheets_create(title, headers, rows, sheet_name, folder_id)
+        return await create_google_spreadsheet(
+            scope, title, values, headers, rows, sheet_name, start_range, folder_id
+        )
 
     return server
 
