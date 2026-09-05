@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import re
 from time import time
 from typing import Protocol
 from urllib.parse import quote
@@ -22,6 +23,10 @@ MAX_SHEET_ROWS = 500
 MAX_SHEET_COLUMNS = 50
 MAX_SHEET_CELLS = 20_000
 MAX_SHEET_STRING_LENGTH = 2_000
+SUPPORTED_CHART_TYPES = frozenset({"LINE", "BAR", "COLUMN", "PIE"})
+A1_RANGE_PATTERN = re.compile(
+    r"^(?:(?:'((?:[^']|'')+)'|([^'!]+))!)?([A-Za-z]+)([1-9][0-9]*):([A-Za-z]+)([1-9][0-9]*)$"
+)
 
 
 class GoogleTokenStore(Protocol):
@@ -505,6 +510,240 @@ async def create_google_spreadsheet(
         }
 
 
+def _chart_error(status: str, message: str) -> dict[str, object]:
+    return {"status": status, "tool": "google_sheets_add_chart", "message": message}
+
+
+def _chart_http_error(status_code: int, operation: str) -> dict[str, object]:
+    if status_code == 401:
+        return _chart_error("AUTH_REFRESH_FAILED", "Google authorization is no longer valid")
+    if status_code == 403:
+        return _chart_error("PERMISSION_DENIED", "The connected Google account cannot modify this spreadsheet")
+    if status_code == 404:
+        return _chart_error("SPREADSHEET_NOT_FOUND", "The spreadsheet or worksheet was not found")
+    if status_code == 429:
+        return _chart_error("RATE_LIMITED", "Google Sheets rate limit reached; retry later")
+    if status_code >= 500:
+        return _chart_error("GOOGLE_API_UNAVAILABLE", "Google Sheets is temporarily unavailable")
+    if operation == "chart":
+        return _chart_error("CHART_CREATE_FAILED", "Google Sheets rejected the chart request")
+    return _chart_error("INVALID_REQUEST", "Google Sheets rejected the spreadsheet request")
+
+
+def _column_number(column: str) -> int:
+    value = 0
+    for character in column.upper():
+        value = value * 26 + ord(character) - ord("A") + 1
+    return value
+
+
+def parse_a1_grid_range(data_range: str) -> tuple[str | None, dict[str, int]] | None:
+    match = A1_RANGE_PATTERN.fullmatch(data_range.strip()) if isinstance(data_range, str) else None
+    if match is None:
+        return None
+    quoted_sheet, plain_sheet, start_column, start_row, end_column, end_row = match.groups()
+    sheet_name = quoted_sheet.replace("''", "'") if quoted_sheet is not None else plain_sheet
+    start_column_number = _column_number(start_column)
+    end_column_number = _column_number(end_column)
+    start_row_number = int(start_row)
+    end_row_number = int(end_row)
+    if (
+        end_column_number < start_column_number
+        or end_row_number < start_row_number
+        or end_column_number - start_column_number + 1 < 2
+        or end_row_number - start_row_number + 1 < 2
+        or end_column_number > 18_278
+        or end_row_number > 1_000_000
+    ):
+        return None
+    return sheet_name, {
+        "startRowIndex": start_row_number - 1,
+        "endRowIndex": end_row_number,
+        "startColumnIndex": start_column_number - 1,
+        "endColumnIndex": end_column_number,
+    }
+
+
+def _chart_spec(chart_type: str, grid_range: dict[str, int], title: str | None) -> dict[str, object]:
+    domain_range = {**grid_range, "endColumnIndex": grid_range["startColumnIndex"] + 1}
+    series_ranges = [
+        {**grid_range, "startColumnIndex": column, "endColumnIndex": column + 1}
+        for column in range(grid_range["startColumnIndex"] + 1, grid_range["endColumnIndex"])
+    ]
+    spec: dict[str, object] = {}
+    if title:
+        spec["title"] = title
+    if chart_type == "PIE":
+        spec["pieChart"] = {
+            "legendPosition": "RIGHT_LEGEND",
+            "domain": {"sourceRange": {"sources": [domain_range]}},
+            "series": {"sourceRange": {"sources": [series_ranges[0]]}},
+            "threeDimensional": False,
+        }
+    else:
+        spec["basicChart"] = {
+            "chartType": chart_type,
+            "legendPosition": "BOTTOM_LEGEND",
+            "axis": [
+                {"position": "BOTTOM_AXIS", "title": ""},
+                {"position": "LEFT_AXIS", "title": ""},
+            ],
+            "domains": [{"domain": {"sourceRange": {"sources": [domain_range]}}}],
+            "series": [
+                {"series": {"sourceRange": {"sources": [series_range]}}}
+                for series_range in series_ranges
+            ],
+            "headerCount": 1,
+        }
+    return spec
+
+
+async def add_google_sheets_chart(
+    scope: GoogleToolScope,
+    spreadsheet_id: str,
+    chart_type: str,
+    data_range: str,
+    title: str | None = None,
+    sheet_id: int | None = None,
+    anchor_row: int | None = None,
+    anchor_column: int | None = None,
+) -> dict[str, object]:
+    normalized_spreadsheet_id = spreadsheet_id.strip() if isinstance(spreadsheet_id, str) else ""
+    normalized_chart_type = chart_type.strip().upper() if isinstance(chart_type, str) else ""
+    normalized_title = title.strip() if isinstance(title, str) else None
+    parsed_range = parse_a1_grid_range(data_range)
+    if not normalized_spreadsheet_id or len(normalized_spreadsheet_id) > 200 or not re.fullmatch(r"[A-Za-z0-9_-]+", normalized_spreadsheet_id):
+        return _chart_error("INVALID_REQUEST", "spreadsheet_id is invalid")
+    if normalized_chart_type not in SUPPORTED_CHART_TYPES:
+        return _chart_error("CHART_TYPE_UNSUPPORTED", "chart_type must be LINE, BAR, COLUMN, or PIE")
+    if parsed_range is None:
+        return _chart_error("RANGE_INVALID", "data_range must be a rectangular A1 range with headers and data")
+    if normalized_title is not None and (not normalized_title or len(normalized_title) > 300):
+        return _chart_error("INVALID_REQUEST", "title must contain between 1 and 300 characters")
+    for name, value in (("sheet_id", sheet_id), ("anchor_row", anchor_row), ("anchor_column", anchor_column)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            return _chart_error("INVALID_REQUEST", f"{name} must be a non-negative integer")
+    sheet_name, grid_range = parsed_range
+    if normalized_chart_type == "PIE" and grid_range["endColumnIndex"] - grid_range["startColumnIndex"] != 2:
+        return _chart_error("RANGE_INVALID", "PIE charts require exactly one domain and one series column")
+
+    token = scope.token_store.google_token(scope.username)
+    if token is None:
+        return _chart_error("NOT_CONNECTED", "Connect Google Workspace before adding charts")
+    if getattr(token, "expires_at", 0) <= int(time()) + 60:
+        try:
+            token = await _refresh(scope, getattr(token, "refresh_token", None))
+        except google_oauth.GoogleOAuthError:
+            return _chart_error("AUTH_REFRESH_FAILED", "Google authorization could not be refreshed")
+        if token is None:
+            return _chart_error("AUTH_REFRESH_FAILED", "Google authorization could not be refreshed")
+
+    if sheet_id is None:
+        metadata_endpoint = f"{SHEETS_CREATE_ENDPOINT}/{normalized_spreadsheet_id}"
+        refreshed_after_unauthorized = False
+        while True:
+            try:
+                async with httpx.AsyncClient(timeout=15) as client:
+                    response = await client.get(
+                        metadata_endpoint,
+                        params={"fields": "sheets.properties(sheetId,title)"},
+                        headers={"Authorization": f"Bearer {getattr(token, 'access_token', '')}"},
+                    )
+            except httpx.HTTPError:
+                return _chart_error("GOOGLE_API_UNAVAILABLE", "Google Sheets is temporarily unavailable")
+            if response.status_code == 401 and not refreshed_after_unauthorized:
+                try:
+                    token = await _refresh(scope, getattr(token, "refresh_token", None))
+                except google_oauth.GoogleOAuthError:
+                    token = None
+                if token is None:
+                    return _chart_error("AUTH_REFRESH_FAILED", "Google authorization could not be refreshed")
+                refreshed_after_unauthorized = True
+                continue
+            if response.status_code >= 400:
+                return _chart_http_error(response.status_code, "metadata")
+            try:
+                metadata = response.json()
+            except ValueError:
+                metadata = None
+            sheets = metadata.get("sheets") if isinstance(metadata, dict) else None
+            if not isinstance(sheets, list):
+                return _chart_error("SPREADSHEET_NOT_FOUND", "The spreadsheet has no accessible worksheets")
+            properties = [item.get("properties") for item in sheets if isinstance(item, dict)]
+            target = next((item for item in properties if isinstance(item, dict) and (
+                sheet_name is None or item.get("title") == sheet_name
+            )), None)
+            resolved_sheet_id = target.get("sheetId") if isinstance(target, dict) else None
+            if isinstance(resolved_sheet_id, bool) or not isinstance(resolved_sheet_id, int):
+                return _chart_error("SPREADSHEET_NOT_FOUND", "The requested worksheet was not found")
+            sheet_id = resolved_sheet_id
+            break
+
+    source_range = {"sheetId": sheet_id, **grid_range}
+    resolved_anchor_row = anchor_row if anchor_row is not None else grid_range["startRowIndex"]
+    resolved_anchor_column = anchor_column if anchor_column is not None else grid_range["endColumnIndex"] + 1
+    chart = {
+        "spec": _chart_spec(normalized_chart_type, source_range, normalized_title),
+        "position": {
+            "overlayPosition": {
+                "anchorCell": {
+                    "sheetId": sheet_id,
+                    "rowIndex": resolved_anchor_row,
+                    "columnIndex": resolved_anchor_column,
+                },
+                "offsetXPixels": 0,
+                "offsetYPixels": 0,
+            }
+        },
+    }
+    batch_endpoint = f"{SHEETS_CREATE_ENDPOINT}/{normalized_spreadsheet_id}:batchUpdate"
+    refreshed_after_unauthorized = False
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.post(
+                    batch_endpoint,
+                    json={"requests": [{"addChart": {"chart": chart}}]},
+                    headers={"Authorization": f"Bearer {getattr(token, 'access_token', '')}"},
+                )
+        except httpx.HTTPError:
+            return _chart_error("GOOGLE_API_UNAVAILABLE", "Google Sheets is temporarily unavailable")
+        if response.status_code == 401 and not refreshed_after_unauthorized:
+            try:
+                token = await _refresh(scope, getattr(token, "refresh_token", None))
+            except google_oauth.GoogleOAuthError:
+                token = None
+            if token is None:
+                return _chart_error("AUTH_REFRESH_FAILED", "Google authorization could not be refreshed")
+            refreshed_after_unauthorized = True
+            continue
+        if response.status_code >= 400:
+            return _chart_http_error(response.status_code, "chart")
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
+        replies = payload.get("replies") if isinstance(payload, dict) else None
+        add_chart = replies[0].get("addChart") if isinstance(replies, list) and replies and isinstance(replies[0], dict) else None
+        returned_chart = add_chart.get("chart") if isinstance(add_chart, dict) else None
+        chart_id = returned_chart.get("chartId") if isinstance(returned_chart, dict) else None
+        if isinstance(chart_id, bool) or not isinstance(chart_id, int):
+            return _chart_error("CHART_CREATE_FAILED", "Google Sheets did not return a chart ID")
+        return {
+            "status": "AVAILABLE",
+            "tool": "google_sheets_add_chart",
+            "spreadsheet_id": normalized_spreadsheet_id,
+            "chart_id": chart_id,
+            "chart_type": normalized_chart_type,
+            "title": normalized_title,
+            "data_range": data_range.strip(),
+            "sheet_id": sheet_id,
+            "url": f"https://docs.google.com/spreadsheets/d/{normalized_spreadsheet_id}/edit",
+            "scope": google_oauth.DRIVE_FILE_SCOPE,
+            "scope_limited": True,
+        }
+
+
 def create_google_mcp(scope: GoogleToolScope) -> MCPServer:
     server = MCPServer(
         "ahnbys-google-scoped",
@@ -565,6 +804,24 @@ def create_google_mcp(scope: GoogleToolScope) -> MCPServer:
             scope, title, values, headers, rows, sheet_name, start_range, folder_id
         )
 
+    @server.tool(
+        name="google_sheets_add_chart",
+        description="Add a LINE, BAR, COLUMN, or PIE embedded chart using a bounded A1 data range.",
+        structured_output=True,
+    )
+    async def scoped_google_sheets_add_chart(
+        spreadsheet_id: str,
+        chart_type: str,
+        data_range: str,
+        title: str | None = None,
+        sheet_id: int | None = None,
+        anchor_row: int | None = None,
+        anchor_column: int | None = None,
+    ) -> dict[str, object]:
+        return await add_google_sheets_chart(
+            scope, spreadsheet_id, chart_type, data_range, title, sheet_id, anchor_row, anchor_column
+        )
+
     return server
 
 
@@ -620,6 +877,27 @@ def google_sheets_create(
         sheet_name=sheet_name,
         folder_id=folder_id,
         spreadsheet_url=None,
+    )
+
+
+@GOOGLE_MCP.tool(
+    description="Add a supported embedded chart to an existing Google Sheet using a validated A1 range.",
+    structured_output=True,
+)
+def google_sheets_add_chart(
+    spreadsheet_id: str,
+    chart_type: str,
+    data_range: str,
+    title: str | None = None,
+    sheet_id: int | None = None,
+    anchor_row: int | None = None,
+    anchor_column: int | None = None,
+) -> dict[str, object]:
+    return _unconfigured(
+        "google_sheets_add_chart",
+        spreadsheet_id=spreadsheet_id,
+        chart_type=chart_type,
+        data_range=data_range,
     )
 
 

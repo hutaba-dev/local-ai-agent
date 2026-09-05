@@ -115,7 +115,7 @@ class CapabilityRegistryTests(unittest.TestCase):
 
         self.assertEqual(
             {tool.name for tool in selected},
-            {"google_drive_list", "google_docs_create", "google_sheets_create"},
+            {"google_drive_list", "google_docs_create", "google_sheets_create", "google_sheets_add_chart"},
         )
         self.assertEqual({tool.server for tool in selected}, {"google-mcp"})
         self.assertEqual(

@@ -90,7 +90,7 @@ CAPABILITIES = (
         "google", "Google Workspace",
         "Use Google Drive, Docs, and Sheets for authorized workspace document operations when the user explicitly requests Google Workspace access.",
         "external", "MCP_GOOGLE_ENABLED",
-        ("google_drive_list", "google_docs_create", "google_sheets_create"), "google",
+        ("google_drive_list", "google_docs_create", "google_sheets_create", "google_sheets_add_chart"), "google",
     ),
 )
 
@@ -147,6 +147,7 @@ TOOL_SPECS = {
     "google_drive_list": AgentToolSpec("google_drive_list", "google", "List or search files available through the connected user's Google Drive drive.file grant and return bounded metadata only.", "google-mcp", "external", "READ", _object({"query": _string("Optional file-name search text", 300), "mime_type": _string("Optional MIME type filter, e.g. application/vnd.google-apps.document", 200), "limit": {"type": "integer", "minimum": 1, "maximum": 100}, "page_size": {"type": "integer", "minimum": 1, "maximum": 100}, "page_token": _string("Optional token from the preceding page", 2048)})),
     "google_docs_create": AgentToolSpec("google_docs_create", "google", "Create a Google Docs document for the connected user and insert the supplied content as plain text.", "google-mcp", "external", "WRITE_ARTIFACT", _object({"title": _string("Document title", 300), "content": _string("Document body inserted as plain text", 20000), "folder_id": _string("Reserved for future folder placement; omit in this phase", 100)}, ("title", "content"))),
     "google_sheets_create": AgentToolSpec("google_sheets_create", "google", "Create a Google Sheets spreadsheet and write bounded tabular scalar values.", "google-mcp", "external", "WRITE_ARTIFACT", _object({"title": _string("Spreadsheet title", 300), "values": {"type": "array", "items": {"type": "array", "items": {"type": ["string", "number", "boolean", "null"]}, "minItems": 1, "maxItems": 50}, "minItems": 1, "maxItems": 500}, "headers": {"type": "array", "items": {"type": ["string", "number", "boolean", "null"]}, "minItems": 1, "maxItems": 50}, "rows": {"type": "array", "items": {"type": "array", "items": {"type": ["string", "number", "boolean", "null"]}, "minItems": 1, "maxItems": 50}, "maxItems": 499}, "sheet_name": _string("Optional first worksheet name", 100), "start_range": _string("Optional A1 start range; defaults to A1", 100), "folder_id": _string("Reserved for future folder placement; omit in this phase", 100)}, ("title",))),
+    "google_sheets_add_chart": AgentToolSpec("google_sheets_add_chart", "google", "Add a supported embedded chart to an existing Google Sheet using a validated A1 data range.", "google-mcp", "external", "WRITE_ARTIFACT", _object({"spreadsheet_id": _string("Target Google spreadsheet ID", 200), "chart_type": {"type": "string", "enum": ["LINE", "BAR", "COLUMN", "PIE"]}, "data_range": _string("A1 range with optional worksheet name, e.g. A1:B5 or Sheet1!A1:B5", 200), "title": _string("Optional chart title", 300), "sheet_id": {"type": "integer", "minimum": 0}, "anchor_row": {"type": "integer", "minimum": 0}, "anchor_column": {"type": "integer", "minimum": 0}}, ("spreadsheet_id", "chart_type", "data_range"))),
 }
 
 
