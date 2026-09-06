@@ -120,6 +120,21 @@ class ResearchPlan:
         return self.search_queries
 
 
+@dataclass(frozen=True)
+class TaskGoal:
+    research_required: bool
+    deliverables: tuple[str, ...]
+    return_links: bool
+
+    @classmethod
+    def from_plan(cls, plan: ResearchPlan) -> "TaskGoal":
+        return cls(
+            research_required=plan.mode != "NO_SEARCH",
+            deliverables=plan.requested_outputs,
+            return_links=any(output in {"google_docs_create", "google_sheets_create"} for output in plan.requested_outputs),
+        )
+
+
 SearchDecision = ResearchPlan
 
 
@@ -227,6 +242,34 @@ class AgentRuntime:
     def new_session(self) -> str:
         return self.sessions.create().id
 
+    @staticmethod
+    def _latest_research_result(messages: list[dict[str, object]]) -> dict[str, object] | None:
+        for message in reversed(messages):
+            metadata = message.get("metadata")
+            result = metadata.get("research_result") if isinstance(metadata, dict) else None
+            if isinstance(result, dict) and isinstance(result.get("body_markdown"), str):
+                return result
+        return None
+
+    @staticmethod
+    def _latest_orchestration(messages: list[dict[str, object]]) -> dict[str, object] | None:
+        for message in reversed(messages):
+            metadata = message.get("metadata")
+            orchestration = metadata.get("orchestration") if isinstance(metadata, dict) else None
+            if isinstance(orchestration, dict):
+                return orchestration
+        return None
+
+    @staticmethod
+    def _conversation_planning_context(messages: list[dict[str, object]]) -> str:
+        context = []
+        for message in messages[-4:]:
+            role = message.get("role")
+            content = message.get("content")
+            if role in {"user", "assistant"} and isinstance(content, str):
+                context.append({"role": role, "content": content[:1500]})
+        return json.dumps(context, ensure_ascii=False)
+
     def plan_project_action(self, message: str, current_session_available: bool) -> ProjectActionPlan:
         prompt = (
             "Classify the requested Project action. Return exactly one JSON object with keys action and project_name. "
@@ -274,6 +317,8 @@ class AgentRuntime:
         started = perf_counter()
         latency = LatencyRecorder()
         session = self.sessions.get_or_create(session_id)
+        prior_research = self._latest_research_result(session.messages)
+        prior_orchestration = self._latest_orchestration(session.messages)
         decision = ResearchPlan("NO_SEARCH", ready_to_answer=True) if images else latency.stage(
             "research_mode_decision",
             lambda: self._search_decision(
@@ -281,10 +326,18 @@ class AgentRuntime:
                 latency,
                 persistent_context=persistent_context,
                 research_agent_selected=selected_agent == "research",
+                conversation_context=self._conversation_planning_context(session.messages) if session.messages else "",
             ),
         ) if selected_agent in {"auto", "research"} else SearchDecision("NO_SEARCH")
+        goal = TaskGoal.from_plan(decision)
         search_mode = decision.mode
         route = route_request(message, selected_agent, search_mode, decision.recommended_agent)
+        reuse_research = (
+            selected_agent == "auto" and prior_research is not None
+            and not goal.research_required and bool(goal.deliverables)
+        )
+        if reuse_research:
+            route = Route("main", "KIM resumed a completed Research artifact for requested deliverables", "NO_SEARCH")
         if allowed_agents is not None and route.agent not in allowed_agents:
             if selected_agent == "auto" and "main" in allowed_agents:
                 route = Route("main", "Main fallback because the routed capability is unavailable", "NO_SEARCH")
@@ -303,7 +356,36 @@ class AgentRuntime:
         }
         selected_capabilities: tuple[str, ...] = ()
         orchestration: dict[str, object] = {}
-        if route.agent == "research" and route.search_mode != "NO_SEARCH":
+        if reuse_research:
+            answer = str(prior_research["body_markdown"])
+            payload = {}
+            research = {
+                **research,
+                "state": ResearchState.COMPLETE.value,
+                "termination_reason": "reused_completed_research",
+                "result": prior_research,
+            }
+            completed_outputs = {
+                str(step.get("tool")) for step in (prior_orchestration or {}).get("steps", [])
+                if isinstance(step, dict) and step.get("status") == "AVAILABLE"
+            }
+            pending_outputs = tuple(output for output in goal.deliverables if output not in completed_outputs)
+            if pending_outputs:
+                answer, payload, tools, orchestration = self._run_post_research_orchestration(
+                    message, answer, payload, latency, pending_outputs,
+                    project_scope, google_scope, session.id,
+                )
+            else:
+                tools = []
+                orchestration = prior_orchestration or {"status": "AVAILABLE", "steps": []}
+                answer, payload = self._finalize_orchestration_response(
+                    message, answer, orchestration, latency,
+                )
+            selected_capabilities = tuple(dict.fromkeys(
+                str(tool.get("capability")) for tool in tools if tool.get("capability")
+            ))
+            research["orchestration"] = orchestration
+        elif route.agent == "research" and route.search_mode != "NO_SEARCH":
             tools, answer, payload, research = self._run_deep_research(
                 message,
                 decision,
@@ -406,6 +488,7 @@ class AgentRuntime:
         media_owner_id: str | None = None,
     ) -> tuple[str, dict[str, object], list[dict[str, object]], dict[str, object]]:
         artifact_report = sanitize_report(report)
+        required_outputs = tuple(dict.fromkeys(requested_outputs))
         available_tools = []
         if project_scope is not None and "project_save_artifact" in requested_outputs:
             available_tools.append({
@@ -426,8 +509,10 @@ class AgentRuntime:
                 "purpose": "Create one compact information-focused concept image from the final research synthesis.",
                 "required_arguments": ["visual_brief"],
             })
-        if not available_tools:
+        if not required_outputs:
             return report, payload, [], {"status": "NOT_REQUESTED", "steps": []}
+        available_names = {str(item["name"]) for item in available_tools}
+        unavailable_outputs = tuple(output for output in required_outputs if output not in available_names)
         planner_prompt = {
             "request": request,
             "completed_report": artifact_report[:12_000],
@@ -458,25 +543,46 @@ class AgentRuntime:
                 ],
             },
         }
-        try:
-            content, _ = self._complete(
-                [{"role": "system", "content": (
-                    "You plan post-research deliverables after final synthesis is complete. Decide WHAT outputs are required and their dependencies. "
-                    "Return JSON only as {\"steps\":[{\"id\":\"...\",\"tool\":\"...\",\"depends_on\":[],\"arguments\":{}}]}."
-                )}, {"role": "user", "content": json.dumps(planner_prompt, ensure_ascii=False)}],
-                2400,
-                latency,
-                "orchestration_plan",
-                temperature=0,
-            )
-            steps = self._parse_orchestration_steps(content, {item["name"] for item in available_tools})
-        except (httpx.HTTPError, ValueError):
-            steps = ()
-        if not steps:
-            return report, payload, [], {"status": "NOT_REQUESTED", "steps": []}
+        steps: tuple[OrchestrationStep, ...] = ()
+        if available_tools:
+            try:
+                content, _ = self._complete(
+                    [{"role": "system", "content": (
+                        "You plan post-research deliverables after final synthesis is complete. Decide WHAT outputs are required and their dependencies. "
+                        "Return JSON only as {\"steps\":[{\"id\":\"...\",\"tool\":\"...\",\"depends_on\":[],\"arguments\":{}}]}."
+                    )}, {"role": "user", "content": json.dumps(planner_prompt, ensure_ascii=False)}],
+                    2400,
+                    latency,
+                    "orchestration_plan",
+                    temperature=0,
+                )
+                steps = self._parse_orchestration_steps(content, available_names)
+            except (httpx.HTTPError, ValueError):
+                pass
+        steps, planning_failures = self._complete_required_orchestration_steps(
+            steps, tuple(output for output in required_outputs if output in available_names)
+        )
 
         activity: list[dict[str, object]] = []
         state: dict[str, dict[str, object]] = {}
+        for output in unavailable_outputs:
+            step_state = {
+                "step_id": f"unavailable_{output}", "capability": self._orchestration_capability(output),
+                "tool": output, "status": "UNAVAILABLE", "dependencies": [],
+                "result_reference": None, "artifact_ids": [], "external_urls": [],
+                "error_category": "CAPABILITY_UNAVAILABLE", "retryable": True,
+            }
+            state[step_state["step_id"]] = step_state
+            activity.append(self._orchestration_activity(step_state, False, None))
+        for output in planning_failures:
+            step_state = {
+                "step_id": f"planning_failed_{output}", "capability": self._orchestration_capability(output),
+                "tool": output, "status": "PLANNING_FAILED", "dependencies": [],
+                "result_reference": None, "artifact_ids": [], "external_urls": [],
+                "error_category": "PLANNING_FAILED", "retryable": True,
+            }
+            state[step_state["step_id"]] = step_state
+            activity.append(self._orchestration_activity(step_state, False, None))
         sheet_datasets: dict[str, TabularDataset] = {}
         executed_tools: set[str] = set()
         for step in steps:
@@ -605,9 +711,58 @@ class AgentRuntime:
         succeeded = sum(1 for item in state.values() if item["status"] == "AVAILABLE")
         failed = len(state) - succeeded
         status = "AVAILABLE" if failed == 0 else "PARTIAL_SUCCESS" if succeeded else "FAILED"
-        orchestration = {"status": status, "steps": list(state.values()), "max_steps": MAX_ORCHESTRATION_STEPS}
+        terminal_tools = {str(item["tool"]) for item in state.values()}
+        goal_satisfied = all(output in terminal_tools for output in required_outputs)
+        orchestration = {
+            "status": status if goal_satisfied else "PENDING",
+            "steps": list(state.values()),
+            "max_steps": MAX_ORCHESTRATION_STEPS,
+            "required_deliverables": list(required_outputs),
+            "goal_satisfied": goal_satisfied,
+            "events": [
+                "Parent task started", "Research completed", "Parent resumed",
+                *(
+                    "Google Docs created" if item["tool"] == "google_docs_create" and item["status"] == "AVAILABLE"
+                    else "Google Sheets created" if item["tool"] == "google_sheets_create" and item["status"] == "AVAILABLE"
+                    else f"{item['tool']} {item['status']}"
+                    for item in state.values()
+                ),
+                "Goal satisfaction passed" if goal_satisfied else "Goal satisfaction pending",
+                "Final response emitted" if goal_satisfied else "Final response blocked",
+            ],
+        }
+        if not goal_satisfied:
+            raise RuntimeError("required deliverables remain pending")
         final_answer, final_payload = self._finalize_orchestration_response(request, report, orchestration, latency)
         return final_answer, final_payload or payload, activity, orchestration
+
+    @staticmethod
+    def _complete_required_orchestration_steps(
+        steps: tuple[OrchestrationStep, ...], required_outputs: tuple[str, ...],
+    ) -> tuple[tuple[OrchestrationStep, ...], tuple[str, ...]]:
+        completed = list(steps)
+        planned_tools = {step.tool for step in completed}
+        planning_failures: list[str] = []
+        for output in required_outputs:
+            if output in planned_tools:
+                continue
+            step_id = f"required_{len(completed) + 1}"
+            if output == "project_save_artifact":
+                completed.append(OrchestrationStep(step_id, output, (), {"name": "research-report.md"}))
+            elif output == "google_docs_create":
+                completed.append(OrchestrationStep(step_id, output, (), {"title": "Research report"}))
+            elif output == "google_sheets_create":
+                completed.append(OrchestrationStep(step_id, output, (), {"title": "Research data"}))
+            elif output == "google_sheets_add_chart":
+                sheet = next((step for step in completed if step.tool == "google_sheets_create"), None)
+                if sheet is None:
+                    planning_failures.append(output)
+                    continue
+                completed.append(OrchestrationStep(step_id, output, (sheet.id,), {}))
+            else:
+                planning_failures.append(output)
+            planned_tools.add(output)
+        return tuple(completed), tuple(planning_failures)
 
     @staticmethod
     def _parse_orchestration_steps(content: str, allowed_tools: set[str]) -> tuple[OrchestrationStep, ...]:
@@ -765,7 +920,7 @@ class AgentRuntime:
             "step_id", "tool", "status", "artifact_ids", "external_urls", "error_category", "retryable"
         )} for step in orchestration.get("steps", []) if isinstance(step, dict)]
         try:
-            return self._complete(
+            answer, payload = self._complete(
                 [{"role": "system", "content": (
                     "Write the final user response for a completed multi-capability task. Start with a concise analysis summary, then state Project save status, "
                     "Google Docs and Sheets links, chart status, image artifact status, and any partial failures or retryable steps. "
@@ -777,9 +932,12 @@ class AgentRuntime:
                 1600, latency, "orchestration_final_response", temperature=0,
             )
         except (httpx.HTTPError, ValueError):
-            links = [url for step in compact_steps for url in step.get("external_urls", []) if isinstance(url, str)]
-            suffix = "\n\n" + "\n".join(links) if links else ""
-            return f"{report}\n\nOrchestration status: {orchestration['status']}{suffix}", {}
+            answer, payload = f"{report}\n\nOrchestration status: {orchestration['status']}", {}
+        links = [url for step in compact_steps for url in step.get("external_urls", []) if isinstance(url, str)]
+        missing_links = [url for url in links if url not in answer]
+        if missing_links:
+            answer += "\n\n" + "\n".join(missing_links)
+        return answer, payload
 
     def _run_main_tool_loop(
         self,
@@ -1047,6 +1205,9 @@ class AgentRuntime:
                     project_scope is not None,
                 ),
             )
+            decision = self._require_external_evidence_before_final(
+                decision, research_plan, all_tools, tool_calls
+            )
             action_queries = decision.queries
             action_urls = tuple(url for url in decision.urls if url.casefold() not in fetched_urls)
             if decision.next_action in {"SEARCH_WEB", "SEARCH_ACADEMIC", "LOOKUP_AUTHOR", "SEARCH_DOCUMENT"}:
@@ -1283,12 +1444,94 @@ class AgentRuntime:
             "search_calls": search_calls,
             "max_search_calls": MAX_RESEARCH_SEARCH_CALLS,
             "search": self._search_activity(all_tools, round_activity),
+            "events": self._research_events(all_tools, state_history),
             "analysis_pipeline": (
                 "EVIDENCE_NORMALIZATION", "CAUSAL_ANALYST", "RESEARCH_CRITIC", "FINAL_SYNTHESIS",
             ),
             "claim_taxonomy": ("FACT", "INFERENCE", "FORECAST", "UNKNOWN"),
             "result": research_result,
         }
+
+    @staticmethod
+    def _require_external_evidence_before_final(
+        decision: ResearchDecision,
+        research_plan: ResearchPlan,
+        tools: list[dict[str, object]],
+        prior_tool_calls: int,
+    ) -> ResearchDecision:
+        if (
+            decision.next_action != "FINAL_ANSWER"
+            or not decision.ready_to_answer
+            or decision.unresolved_questions
+            or not research_plan.needs_external_information
+        ):
+            return decision
+        evidence = AgentRuntime._evidence_package(tools)
+        if evidence.get("sources") or evidence.get("representative_works"):
+            return decision
+        available_actions = {
+            str(item.get("action"))
+            for item in research_tool_catalog()
+            if item.get("available") is True and item.get("status") != "UNAVAILABLE"
+        }
+        discovered_urls = AgentRuntime._discovered_web_urls(tools)
+        fetch_attempted = any(tool.get("name") == "web_sources" for tool in tools)
+        if discovered_urls and not fetch_attempted and "FETCH_PAGE" in available_actions:
+            return ResearchDecision(
+                "FETCH_PAGE", urls=discovered_urls[:3],
+                unresolved_questions=("Discovered source pages have not been fetched.",),
+                decision_summary="Fetch discovered Web sources before synthesis.",
+            )
+        if prior_tool_calls == 0 and "SEARCH_WEB" in available_actions:
+            queries = research_plan.search_queries or ("External evidence for the user request",)
+            return ResearchDecision(
+                "SEARCH_WEB", queries=queries[:4], provider="auto",
+                unresolved_questions=("External evidence has not been collected.",),
+                decision_summary="Initial evidence is empty; run available Web discovery before synthesis.",
+                freshness_importance=research_plan.freshness_importance,
+                primary_source_importance=research_plan.primary_source_importance,
+            )
+        if prior_tool_calls == 0 and "SEARCH_ACADEMIC" in available_actions:
+            queries = research_plan.search_queries or ("External evidence for the user request",)
+            return ResearchDecision(
+                "SEARCH_ACADEMIC", queries=queries[:4],
+                unresolved_questions=("External evidence has not been collected.",),
+                decision_summary="Initial evidence is empty; run available scholarly discovery before synthesis.",
+                scholarly_evidence_value=research_plan.scholarly_evidence_value,
+            )
+        return decision
+
+    @staticmethod
+    def _discovered_web_urls(tools: list[dict[str, object]]) -> tuple[str, ...]:
+        urls: list[str] = []
+        for tool in tools:
+            if tool.get("name") != "web_search" or not tool.get("success"):
+                continue
+            try:
+                records = json.loads(str(tool.get("output", "")))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(records, list):
+                continue
+            for record in records:
+                url = record.get("url") if isinstance(record, dict) else None
+                if isinstance(url, str) and urlparse(url).scheme in {"http", "https"}:
+                    urls.append(url)
+        return tuple(dict.fromkeys(urls))
+
+    @staticmethod
+    def _research_events(tools: list[dict[str, object]], state_history: list[str]) -> list[str]:
+        events = ["Research started", "Initial evidence empty"]
+        if any(tool.get("name") == "web_search" for tool in tools):
+            events.extend(("Search started", "Search completed"))
+        evidence = AgentRuntime._evidence_package(tools)
+        source_count = len(evidence.get("sources", [])) + len(evidence.get("representative_works", []))
+        if source_count:
+            events.append(f"Evidence collected: {source_count} sources")
+        if ResearchState.FOLLOWUP.value in state_history:
+            events.append("Follow-up search completed")
+        events.extend(("Gap analysis completed", "Research synthesis completed"))
+        return events
 
     @staticmethod
     def _research_capabilities(
@@ -1346,6 +1589,7 @@ class AgentRuntime:
             if re.search(rf"\b{label}\b(?=\s*:|\s*[·|])", answer, re.IGNORECASE)
         ]
         return {
+            "status": "RESEARCH_COMPLETED",
             "body_markdown": answer,
             "sources": sources,
             "annotations": annotations,
@@ -2338,6 +2582,7 @@ class AgentRuntime:
         *,
         persistent_context: str = "",
         research_agent_selected: bool = False,
+        conversation_context: str = "",
     ) -> ResearchPlan:
         decision_prompt = (
             "You are the canonical Research Planner. Decide what evidence and capabilities this request needs before answering. "
@@ -2371,10 +2616,12 @@ class AgentRuntime:
         )
         try:
             classifier_input = message
-            if persistent_context or research_agent_selected:
+            if persistent_context or research_agent_selected or conversation_context:
                 classifier_input = (
                     f"Research agent selected: {research_agent_selected}\n"
                     f"User request: {message}\n"
+                    "Recent conversation context for resolving references only:\n"
+                    f"{conversation_context[:4000]}\n"
                     "Bounded project context for resolving references only; it is not external evidence:\n"
                     f"{persistent_context[:3000]}"
                 )

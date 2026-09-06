@@ -1524,6 +1524,8 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             "stages": result.stages,
             "research_rounds": len(result.research.get("rounds", [])),
             "research": result.research,
+            "orchestration": result.orchestration,
+            "orchestration_events": result.orchestration.get("events", []),
             "whole_request_usage": {
                 "input_tokens": total_input_tokens,
                 "output_tokens": total_output_tokens,

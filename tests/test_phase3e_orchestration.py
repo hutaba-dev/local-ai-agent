@@ -230,12 +230,15 @@ class Phase3EOrchestrationTests(unittest.TestCase):
             step("visual_two", "media_generate_image", {"visual_brief": VISUAL_BRIEF}),
         )
         with patch("runtime.agent_runtime.call_mcp_tool") as tool_call:
-            _, _, activity, orchestration = AgentRuntime(client=SequencedClient([duplicate]))._run_post_research_orchestration(
+            _, _, activity, orchestration = AgentRuntime(client=SequencedClient([
+                duplicate, "Media planning failed explicitly.",
+            ]))._run_post_research_orchestration(
                 "Create one visual", "Report", {}, LatencyRecorder(), ("media_generate_image",),
                 self.project_scope, None, "session-owner",
             )
-        self.assertEqual(activity, [])
-        self.assertEqual(orchestration["status"], "NOT_REQUESTED")
+        self.assertEqual(activity[0]["error"], "PLANNING_FAILED")
+        self.assertEqual(orchestration["status"], "FAILED")
+        self.assertTrue(orchestration["goal_satisfied"])
         tool_call.assert_not_called()
 
     def test_worker_credentials_never_enter_planner_or_media_arguments(self) -> None:

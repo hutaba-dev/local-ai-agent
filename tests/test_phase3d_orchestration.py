@@ -107,7 +107,9 @@ class Phase3DOrchestrationTests(unittest.TestCase):
                 self.project_scope, self.google_scope,
             )
 
-        self.assertEqual(answer, "Research complete. Project, Doc, Sheet, and chart were created.")
+        self.assertIn("Research complete. Project, Doc, Sheet, and chart were created.", answer)
+        self.assertIn("https://docs.test/doc-1", answer)
+        self.assertIn("https://sheets.test/sheet-1", answer)
         self.assertEqual(orchestration["status"], "AVAILABLE")
         self.assertEqual([item["name"] for item in activity], [
             "project_save_artifact", "google_docs_create", "google_sheets_create", "google_sheets_add_chart",
@@ -250,7 +252,7 @@ class Phase3DOrchestrationTests(unittest.TestCase):
         self.assertEqual(tool_call.call_args.args[1]["dataset"], DATASET)
         self.assertIn("validation_error", client.requests[2]["messages"][1]["content"])
 
-    def test_invalid_or_duplicate_plan_executes_nothing(self) -> None:
+    def test_invalid_or_duplicate_plan_falls_back_to_required_outputs(self) -> None:
         invalid_plans = [
             '{"steps":[{"id":"chart","tool":"google_sheets_add_chart","depends_on":[],"arguments":{"chart_type":"LINE","data_range":"A1:B2"}}]}',
             '{"steps":['
@@ -258,14 +260,22 @@ class Phase3DOrchestrationTests(unittest.TestCase):
             '{"id":"doc2","tool":"google_docs_create","depends_on":[],"arguments":{"title":"Two"}}]}',
         ]
         for plan in invalid_plans:
-            with self.subTest(plan=plan), patch("runtime.agent_runtime.call_mcp_tool") as tool_call:
-                _, _, activity, orchestration = AgentRuntime(client=SequencedClient([plan]))._run_post_research_orchestration(
+            client = SequencedClient([plan, "Required Doc created; chart failure reported."])
+            with self.subTest(plan=plan), patch(
+                "runtime.agent_runtime.call_mcp_tool",
+                return_value=outcome("google_docs_create", {"status": "AVAILABLE", "url": "https://docs.test/fallback"}),
+            ) as tool_call:
+                _, _, activity, orchestration = AgentRuntime(client=client)._run_post_research_orchestration(
                     "Create outputs", "Final report", {}, LatencyRecorder(),
                     ("google_docs_create", "google_sheets_add_chart"), None, self.google_scope,
                 )
-                self.assertEqual(activity, [])
-                self.assertEqual(orchestration["status"], "NOT_REQUESTED")
-                tool_call.assert_not_called()
+                self.assertEqual(tool_call.call_count, 1)
+                self.assertEqual(tool_call.call_args.args[0], "google_docs_create")
+                self.assertEqual(orchestration["status"], "PARTIAL_SUCCESS")
+                self.assertTrue(orchestration["goal_satisfied"])
+                self.assertEqual({item["name"] for item in activity}, {
+                    "google_docs_create", "google_sheets_add_chart",
+                })
 
 
 if __name__ == "__main__":
