@@ -7,6 +7,7 @@ import secrets
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
+import json
 from threading import Lock
 from time import monotonic
 from typing import Literal
@@ -98,6 +99,65 @@ class VisualRequest:
             "preserve": ", ".join(self.preserve_elements),
         }
         return ". ".join(f"{key}: {value}" for key, value in values.items() if value and value != "unspecified")
+
+
+@dataclass(frozen=True)
+class VisualBrief:
+    purpose: str
+    title: str
+    key_entities: tuple[str, ...] = ()
+    relationships: tuple[str, ...] = ()
+    hierarchy: tuple[str, ...] = ()
+    key_numbers: tuple[str, ...] = ()
+    visual_style: str = "editorial concept diagram"
+    constraints: tuple[str, ...] = ()
+
+    @classmethod
+    def from_mapping(cls, value: object) -> "VisualBrief":
+        if not isinstance(value, dict):
+            raise ValueError("visual_brief must be an object")
+
+        def text(key: str, limit: int, default: str = "") -> str:
+            raw = value.get(key, default)
+            if not isinstance(raw, str) or not raw.strip():
+                if default:
+                    return default
+                raise ValueError(f"visual_brief.{key} must be non-empty")
+            return raw.strip()[:limit]
+
+        def strings(key: str, count: int, length: int) -> tuple[str, ...]:
+            raw = value.get(key, [])
+            if not isinstance(raw, list):
+                raise ValueError(f"visual_brief.{key} must be an array")
+            return tuple(item.strip()[:length] for item in raw[:count] if isinstance(item, str) and item.strip())
+
+        return cls(
+            purpose=text("purpose", 300),
+            title=text("title", 200),
+            key_entities=strings("key_entities", 8, 120),
+            relationships=strings("relationships", 8, 200),
+            hierarchy=strings("hierarchy", 8, 160),
+            key_numbers=strings("key_numbers", 8, 120),
+            visual_style=text("visual_style", 200, "editorial concept diagram"),
+            constraints=strings("constraints", 10, 200),
+        )
+
+    def media_arguments(self) -> dict[str, object]:
+        intent = {
+            "purpose": self.purpose,
+            "key_entities": list(self.key_entities),
+            "relationships": list(self.relationships),
+            "hierarchy": list(self.hierarchy),
+            "key_numbers": list(self.key_numbers),
+            "constraints": list(self.constraints),
+        }
+        return {
+            "subject": self.title,
+            "intent": json.dumps(intent, ensure_ascii=False, separators=(",", ":"))[:2_000],
+            "composition": "; ".join((*self.hierarchy, *self.relationships))[:300] or "clear left-to-right causal hierarchy",
+            "style": self.visual_style,
+            "background": "clean high-contrast report visual with restrained detail",
+        }
 
 
 @dataclass(frozen=True)

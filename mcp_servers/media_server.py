@@ -47,7 +47,12 @@ def create_media_mcp(scope: MediaScope) -> MCPServer:
             raise ValueError("source image is too small")
         return MediaSource(image_id, content, normalized_mime, scope.project_id)
 
-    def artifact_result(execution, save_to_project: bool) -> MediaResult:
+    def artifact_result(
+        execution,
+        save_to_project: bool,
+        source_references: list[str],
+        related_results: dict[str, str],
+    ) -> MediaResult:
         if not save_to_project:
             return execution.result
         if not scope.project_id:
@@ -57,12 +62,16 @@ def create_media_mcp(scope: MediaScope) -> MCPServer:
         except ProjectStorageOfflineError:
             raise
         provenance = {
+            "artifact_type": "image",
+            "project_id": scope.project_id,
             "media_operation": execution.result.operation,
             "worker": execution.result.worker,
             "model": execution.result.model,
             "seed": execution.result.seed,
             "source_image_ids": list(execution.result.source_image_ids),
             "executed_capabilities": list(execution.executed_capabilities),
+            "source_references": source_references,
+            "related_results": related_results,
             "created_at": execution.result.created_at,
         }
         artifact = scope.tools.store.save_file(
@@ -78,8 +87,13 @@ def create_media_mcp(scope: MediaScope) -> MCPServer:
         )
         return replace(execution.result, artifact_id=str(artifact.get("artifact_id") or "") or None)
 
-    def response(execution, save_to_project: bool) -> dict[str, object]:
-        result = artifact_result(execution, save_to_project)
+    def response(
+        execution,
+        save_to_project: bool,
+        source_references: list[str],
+        related_results: dict[str, str],
+    ) -> dict[str, object]:
+        result = artifact_result(execution, save_to_project, source_references, related_results)
         return {
             "status": "AVAILABLE",
             "result": result.normalized(),
@@ -93,10 +107,25 @@ def create_media_mcp(scope: MediaScope) -> MCPServer:
             },
         }
 
-    def execute(request: VisualRequest, source: MediaSource | None, save_to_project: bool) -> dict[str, object]:
+    def execute(
+        request: VisualRequest,
+        source: MediaSource | None,
+        save_to_project: bool,
+        source_references: list[str] | None = None,
+        related_results: dict[str, str] | None = None,
+    ) -> dict[str, object]:
         try:
             execution = MEDIA_DIRECTOR.execute(request, source, namespace=namespace)
-            return response(execution, save_to_project)
+            return response(
+                execution,
+                save_to_project,
+                [item[:200] for item in (source_references or [])[:10] if isinstance(item, str) and item],
+                {
+                    str(key)[:80]: str(value)[:2_000]
+                    for key, value in list((related_results or {}).items())[:10]
+                    if value is not None
+                },
+            )
         except MediaError as error:
             return {"status": error.status.value, "error": str(error)}
         except ProjectStorageOfflineError:
@@ -146,6 +175,8 @@ def create_media_mcp(scope: MediaScope) -> MCPServer:
         latency_priority: Literal["FAST", "BALANCED"] = "BALANCED",
         output_size: str = "512x512",
         save_to_project: bool = False,
+        source_references: list[str] | None = None,
+        related_results: dict[str, str] | None = None,
     ) -> dict[str, object]:
         if not 1 <= len(subject.strip()) <= 500 or len(intent) > 2_000:
             raise ValueError("subject or intent length is invalid")
@@ -154,7 +185,7 @@ def create_media_mcp(scope: MediaScope) -> MCPServer:
             camera=camera[:300], lighting=lighting[:300], background=background[:300],
             quality_priority=quality_priority, latency_priority=latency_priority, output_size=output_size,
         )
-        return execute(request, None, save_to_project)
+        return execute(request, None, save_to_project, source_references, related_results)
 
     @server.tool(
         description="Apply all requested changes to one authorized logical source image while preserving identity and unchanged elements.",

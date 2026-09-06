@@ -270,6 +270,32 @@ def project_write_result(
     }
 
 
+def orchestrated_project_write_result(
+    orchestration: dict[str, object], project: dict[str, object]
+) -> dict[str, object] | None:
+    steps = orchestration.get("steps")
+    if not isinstance(steps, list):
+        return None
+    step = next((
+        item for item in steps
+        if isinstance(item, dict) and item.get("tool") == "project_save_artifact"
+    ), None)
+    if not isinstance(step, dict):
+        return None
+    artifact_ids = step.get("artifact_ids")
+    resource_id = artifact_ids[0] if isinstance(artifact_ids, list) and artifact_ids else None
+    status = str(step.get("status") or "ERROR")
+    return {
+        "status": status,
+        "success": status == "AVAILABLE",
+        "project_name": project.get("name"),
+        "project_id": project.get("id"),
+        "resource_type": "artifact",
+        "resource_id": resource_id,
+        "error": step.get("error_category"),
+    }
+
+
 def project_action_response(
     content: str,
     status: str,
@@ -1382,7 +1408,6 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
         project_scope = ProjectToolScope(
             ProjectTools(project_store), user.username, request.project_id, request.conversation_id
         ) if request.project_id else None
-        runtime_project_scope = None if write_requested else project_scope
         google_scope = GoogleToolScope(user.username, user_store) if google_oauth.configured() else None
         result = await run_in_threadpool(
             runtime.chat,
@@ -1393,7 +1418,7 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             False,
             images,
             project_context,
-            runtime_project_scope,
+            project_scope,
             google_scope,
         )
     except PermissionError as error:
@@ -1426,9 +1451,9 @@ async def chat(request: ChatRequest, http_request: Request, background_tasks: Ba
             result.content,
             project_user_message_id,
         )
-    project_write = None
+    project_write = orchestrated_project_write_result(result.orchestration, write_project) if write_project else None
     response_content = result.content
-    if write_requested and write_project and project_scope:
+    if write_requested and write_project and project_scope and project_write is None:
         resource_type = "memory" if re.search(r"(?:memory|메모리|기억)", request.message, re.IGNORECASE) else "artifact"
         if resource_type == "memory":
             tool_name = "project_save_memory"

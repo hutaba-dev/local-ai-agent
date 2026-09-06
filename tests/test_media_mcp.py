@@ -179,6 +179,8 @@ class MediaMCPTests(unittest.TestCase):
             with patch("mcp_servers.media_server.MEDIA_DIRECTOR.execute", return_value=execution()):
                 result = self.call(create_media_mcp(scope), "media_generate_image", {
                     "subject": "red square", "save_to_project": True,
+                    "source_references": ["research.final_synthesis"],
+                    "related_results": {"report_result": "steps.report.result"},
                 })
             artifacts = store.list_artifacts("owner", project["id"])
 
@@ -188,6 +190,10 @@ class MediaMCPTests(unittest.TestCase):
         self.assertEqual(provenance["seed"], 42)
         self.assertEqual(provenance["worker"], "worker-1")
         self.assertEqual(provenance["executed_capabilities"], ["image.generate"])
+        self.assertEqual(provenance["artifact_type"], "image")
+        self.assertEqual(provenance["project_id"], project["id"])
+        self.assertEqual(provenance["source_references"], ["research.final_synthesis"])
+        self.assertEqual(provenance["related_results"], {"report_result": "steps.report.result"})
 
     def test_host_preserves_busy_status_without_retry_or_fallback(self) -> None:
         host = MCPHost()

@@ -794,6 +794,40 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertTrue(payload["project_write"]["resource_id"])
         self.assertEqual(len(files), 1)
 
+    def test_orchestrated_project_write_is_not_repeated_by_web_fallback(self) -> None:
+        client = self.authenticated_client()
+        project = client.post("/api/projects", json={"name": "Bound Project"}).json()
+        conversation = client.post(
+            f"/api/projects/{project['id']}/conversations", json={"title": "Report"}
+        ).json()
+        result = replace(
+            self.runtime.chat("hello", "main"),
+            content="Research and artifact creation completed.",
+            orchestration={
+                "status": "AVAILABLE",
+                "steps": [{
+                    "step_id": "project",
+                    "tool": "project_save_artifact",
+                    "status": "AVAILABLE",
+                    "artifact_ids": ["artifact-runtime-1"],
+                    "error_category": None,
+                }],
+            },
+        )
+
+        with patch("web.app.runtime.chat", return_value=result), patch("web.app.call_mcp_tool") as fallback:
+            response = client.post("/api/chat", json={
+                "message": "조사해서 이 프로젝트에 보고서를 저장해줘.",
+                "selected_agent": "research",
+                "project_id": project["id"],
+                "conversation_id": conversation["id"],
+            })
+
+        payload = response.json()
+        self.assertTrue(payload["project_write"]["success"])
+        self.assertEqual(payload["project_write"]["resource_id"], "artifact-runtime-1")
+        fallback.assert_not_called()
+
     def test_general_chat_resolves_unique_named_project_for_save(self) -> None:
         client = self.authenticated_client()
         project = client.post("/api/projects", json={"name": "ABC"}).json()

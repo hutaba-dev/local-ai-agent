@@ -6,7 +6,7 @@ import json
 import os
 import re
 import base64
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -22,6 +22,7 @@ from hangul_romanize.rule import academic as academic_romanization
 from runtime.capability_registry import CAPABILITIES, capability_catalog, detailed_tools
 from runtime.mcp_host import call_mcp_tool
 from mcp_servers.google_server import GoogleToolScope
+from runtime.media import VisualBrief
 from runtime.role_registry import get_role
 from runtime.router import Route, route_request
 from runtime.sessions import SessionStore
@@ -43,6 +44,7 @@ MAX_RESEARCH_SEARCH_CALLS = 12
 MAX_RESEARCH_EXECUTION_SECONDS = 120
 MAX_MAIN_TOOL_ROUNDS = 3
 MAX_MAIN_TOOL_CALLS = 4
+MAX_ORCHESTRATION_STEPS = 5
 MAX_TOOL_OBSERVATION_CHARS = 12_000
 DEFAULT_MAX_TOKENS = 1024
 RESEARCH_MAX_TOKENS = 6144
@@ -82,6 +84,15 @@ class ChatResult:
     stages: list[dict[str, object]]
     research: dict[str, object]
     selected_capabilities: tuple[str, ...] = ()
+    orchestration: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OrchestrationStep:
+    id: str
+    tool: str
+    dependencies: tuple[str, ...]
+    arguments: dict[str, object]
 
 
 @dataclass(frozen=True)
@@ -99,6 +110,7 @@ class ResearchPlan:
     search_queries: tuple[str, ...] = ()
     preferred_capabilities: tuple[str, ...] = ()
     source_preferences: tuple[str, ...] = ()
+    requested_outputs: tuple[str, ...] = ()
     ready_to_answer: bool = False
     recommended_agent: str = ""
 
@@ -289,6 +301,7 @@ class AgentRuntime:
             "termination_reason": "non_deep_response",
         }
         selected_capabilities: tuple[str, ...] = ()
+        orchestration: dict[str, object] = {}
         if route.agent == "research" and route.search_mode != "NO_SEARCH":
             tools, answer, payload, research = self._run_deep_research(
                 message,
@@ -302,6 +315,17 @@ class AgentRuntime:
             )
             research["mode"] = route.search_mode
             selected_capabilities = self._research_capabilities(decision, tools)
+            answer, payload, orchestration_tools, orchestration = self._run_post_research_orchestration(
+                message, answer, payload, latency, decision.requested_outputs,
+                project_scope, google_scope, session.id,
+            )
+            tools.extend(orchestration_tools)
+            if orchestration_tools:
+                selected_capabilities = tuple(dict.fromkeys((
+                    *selected_capabilities,
+                    *(str(tool.get("capability")) for tool in orchestration_tools if tool.get("capability")),
+                )))
+            research["orchestration"] = orchestration
         else:
             tool_message = decision.queries or (message,)
             tools = latency.stage(
@@ -366,7 +390,280 @@ class AgentRuntime:
             latency.stages,
             research,
             selected_capabilities,
+            orchestration,
         )
+
+    def _run_post_research_orchestration(
+        self,
+        request: str,
+        report: str,
+        payload: dict[str, object],
+        latency: LatencyRecorder,
+        requested_outputs: tuple[str, ...],
+        project_scope: ProjectToolScope | None,
+        google_scope: GoogleToolScope | None,
+        media_owner_id: str | None = None,
+    ) -> tuple[str, dict[str, object], list[dict[str, object]], dict[str, object]]:
+        available_tools = []
+        if project_scope is not None and "project_save_artifact" in requested_outputs:
+            available_tools.append({
+                "name": "project_save_artifact",
+                "purpose": "Save the completed report to the current Project.",
+                "required_arguments": ["name"],
+            })
+        if google_scope is not None:
+            google_tools = {
+                "google_docs_create": {"name": "google_docs_create", "purpose": "Create a Google Doc from the completed report.", "required_arguments": ["title"]},
+                "google_sheets_create": {"name": "google_sheets_create", "purpose": "Create a Sheet from genuinely useful structured metrics.", "required_arguments": ["title", "values"]},
+                "google_sheets_add_chart": {"name": "google_sheets_add_chart", "purpose": "Add one chart only when requested and the Sheet values are chart-worthy.", "required_arguments": ["chart_type", "data_range"]},
+            }
+            available_tools.extend(google_tools[name] for name in requested_outputs if name in google_tools)
+        if "media_generate_image" in requested_outputs:
+            available_tools.append({
+                "name": "media_generate_image",
+                "purpose": "Create one compact information-focused concept image from the final research synthesis.",
+                "required_arguments": ["visual_brief"],
+            })
+        if not available_tools:
+            return report, payload, [], {"status": "NOT_REQUESTED", "steps": []}
+        planner_prompt = {
+            "request": request,
+            "completed_report": report[:12_000],
+            "available_output_tools": available_tools,
+            "contract": {
+                "max_steps": MAX_ORCHESTRATION_STEPS,
+                "allowed_order": [
+                    "project_save_artifact", "google_docs_create", "google_sheets_create",
+                    "google_sheets_add_chart", "media_generate_image",
+                ],
+                "references": {
+                    "report": "Runtime injects the completed report into Project artifact and Google Docs content.",
+                    "spreadsheet": "Runtime injects the exact successful google_sheets_create spreadsheet_id into chart arguments.",
+                    "media": "Runtime converts visual_brief into the existing MediaPlan and injects prior result references.",
+                },
+                "visual_brief_schema": {
+                    "purpose": "string", "title": "string", "key_entities": ["string"],
+                    "relationships": ["string"], "hierarchy": ["string"], "key_numbers": ["string"],
+                    "visual_style": "string", "constraints": ["string"],
+                },
+                "rules": [
+                    "Select non-media deliverables only when explicitly requested by the user.",
+                    "Select Media only when a visual is explicitly requested or one compact information visual materially improves the requested result.",
+                    "Media must use visual_brief only; never copy raw evidence, the full report, Doc body, or Sheet rows into it.",
+                    "Do not include report prose in Sheets; provide a bounded 2D scalar values array of useful metrics.",
+                    "Select a chart only when explicitly requested and numeric Sheet values support it.",
+                    "Each tool may appear at most once. Dependencies must refer to earlier step IDs.",
+                ],
+            },
+        }
+        try:
+            content, _ = self._complete(
+                [{"role": "system", "content": (
+                    "You plan post-research deliverables after final synthesis is complete. Decide WHAT outputs are required and their dependencies. "
+                    "Return JSON only as {\"steps\":[{\"id\":\"...\",\"tool\":\"...\",\"depends_on\":[],\"arguments\":{}}]}."
+                )}, {"role": "user", "content": json.dumps(planner_prompt, ensure_ascii=False)}],
+                2400,
+                latency,
+                "orchestration_plan",
+                temperature=0,
+            )
+            steps = self._parse_orchestration_steps(content, {item["name"] for item in available_tools})
+        except (httpx.HTTPError, ValueError):
+            steps = ()
+        if not steps:
+            return report, payload, [], {"status": "NOT_REQUESTED", "steps": []}
+
+        activity: list[dict[str, object]] = []
+        state: dict[str, dict[str, object]] = {}
+        executed_tools: set[str] = set()
+        for step in steps:
+            dependencies_ready = all(
+                dependency in state and state[dependency].get("status") == "AVAILABLE"
+                for dependency in step.dependencies
+            )
+            if not dependencies_ready:
+                step_state = {
+                    "step_id": step.id, "capability": self._orchestration_capability(step.tool),
+                    "tool": step.tool, "status": "DEPENDENCY_FAILED", "dependencies": list(step.dependencies),
+                    "result_reference": None, "artifact_ids": [], "external_urls": [],
+                    "error_category": "DEPENDENCY_FAILED", "retryable": True,
+                }
+                state[step.id] = step_state
+                activity.append(self._orchestration_activity(step_state, False, None))
+                continue
+            arguments = dict(step.arguments)
+            if step.tool == "project_save_artifact":
+                arguments.update({
+                    "content": report[:12_000],
+                    "artifact_type": "report",
+                    "description": "Final deep-research report generated by KIM",
+                })
+            elif step.tool == "google_docs_create":
+                arguments["content"] = report[:20_000]
+            elif step.tool == "google_sheets_add_chart":
+                sheet_result = next((
+                    item for item in state.values()
+                    if item.get("tool") == "google_sheets_create" and item.get("status") == "AVAILABLE"
+                ), None)
+                result = sheet_result.get("result") if isinstance(sheet_result, dict) else None
+                spreadsheet_id = result.get("spreadsheet_id") if isinstance(result, dict) else None
+                if not isinstance(spreadsheet_id, str) or not spreadsheet_id:
+                    step_state = {
+                        "step_id": step.id, "capability": "google", "tool": step.tool,
+                        "status": "DEPENDENCY_FAILED", "dependencies": list(step.dependencies),
+                        "result_reference": None, "artifact_ids": [], "external_urls": [],
+                        "error_category": "DEPENDENCY_FAILED", "retryable": True,
+                    }
+                    state[step.id] = step_state
+                    activity.append(self._orchestration_activity(step_state, False, None))
+                    continue
+                arguments["spreadsheet_id"] = spreadsheet_id
+            elif step.tool == "media_generate_image":
+                brief = VisualBrief.from_mapping(arguments.get("visual_brief"))
+                arguments = brief.media_arguments()
+                arguments.update({
+                    "save_to_project": project_scope is not None,
+                    "source_references": ["research.final_synthesis"],
+                    "related_results": self._orchestration_result_references(state),
+                })
+            outcome = call_mcp_tool(step.tool, arguments, project_scope, media_owner_id, google_scope)
+            executed_tools.add(step.tool)
+            output = outcome.output or {}
+            artifact_ids = self._result_values(
+                output,
+                ("artifact_id", "file_id", "document_id", "spreadsheet_id", "chart_id"),
+                ("artifact_id", "file_id", "id"),
+            )
+            result = output.get("result")
+            if isinstance(result, dict):
+                artifact_ids.extend(
+                    result[key] for key in ("artifact_id", "image_id", "job_id")
+                    if result.get(key) is not None and result[key] not in artifact_ids
+                )
+            external_urls = self._result_values(output, ("url", "webViewLink"), ("url", "webViewLink"))
+            step_state = {
+                "step_id": step.id,
+                "capability": self._orchestration_capability(step.tool),
+                "tool": step.tool,
+                "status": outcome.status,
+                "dependencies": list(step.dependencies),
+                "result_reference": f"steps.{step.id}.result" if output else None,
+                "artifact_ids": artifact_ids,
+                "external_urls": external_urls,
+                "error_category": None if outcome.success else outcome.status,
+                "retryable": not outcome.success,
+                "result": output,
+            }
+            state[step.id] = step_state
+            activity.append(self._orchestration_activity(step_state, outcome.success, output))
+
+        succeeded = sum(1 for item in state.values() if item["status"] == "AVAILABLE")
+        failed = len(state) - succeeded
+        status = "AVAILABLE" if failed == 0 else "PARTIAL_SUCCESS" if succeeded else "FAILED"
+        orchestration = {"status": status, "steps": list(state.values()), "max_steps": MAX_ORCHESTRATION_STEPS}
+        final_answer, final_payload = self._finalize_orchestration_response(request, report, orchestration, latency)
+        return final_answer, final_payload or payload, activity, orchestration
+
+    @staticmethod
+    def _parse_orchestration_steps(content: str, allowed_tools: set[str]) -> tuple[OrchestrationStep, ...]:
+        value = AgentRuntime._parse_json_object(content)
+        raw_steps = value.get("steps")
+        if not isinstance(raw_steps, list) or len(raw_steps) > MAX_ORCHESTRATION_STEPS:
+            raise ValueError("invalid orchestration steps")
+        steps: list[OrchestrationStep] = []
+        seen_ids: set[str] = set()
+        seen_tools: set[str] = set()
+        tool_step_ids: dict[str, str] = {}
+        for raw in raw_steps:
+            if not isinstance(raw, dict):
+                raise ValueError("invalid orchestration step")
+            step_id = raw.get("id")
+            tool = raw.get("tool")
+            dependencies = raw.get("depends_on", [])
+            arguments = raw.get("arguments", {})
+            if (
+                not isinstance(step_id, str) or not re.fullmatch(r"[a-z][a-z0-9_]{0,39}", step_id)
+                or not isinstance(tool, str) or tool not in allowed_tools or tool in seen_tools
+                or not isinstance(dependencies, list) or any(item not in seen_ids for item in dependencies)
+                or not isinstance(arguments, dict)
+            ):
+                raise ValueError("invalid orchestration dependency graph")
+            if tool == "google_sheets_add_chart" and tool_step_ids.get("google_sheets_create") not in dependencies:
+                raise ValueError("chart creation requires the successful Sheet step")
+            if tool == "media_generate_image":
+                VisualBrief.from_mapping(arguments.get("visual_brief"))
+            seen_ids.add(step_id)
+            seen_tools.add(tool)
+            tool_step_ids[tool] = step_id
+            steps.append(OrchestrationStep(step_id, tool, tuple(dependencies), arguments))
+        return tuple(steps)
+
+    @staticmethod
+    def _orchestration_capability(tool: str) -> str:
+        if tool.startswith("project_"):
+            return "project"
+        if tool.startswith("media_"):
+            return "media"
+        return "google"
+
+    @staticmethod
+    def _orchestration_result_references(state: dict[str, dict[str, object]]) -> dict[str, str]:
+        references: dict[str, str] = {}
+        for item in state.values():
+            if item.get("status") != "AVAILABLE":
+                continue
+            step_id = str(item.get("step_id", ""))
+            result_reference = item.get("result_reference")
+            if step_id and isinstance(result_reference, str):
+                references[f"{step_id}_result"] = result_reference
+            urls = item.get("external_urls")
+            if step_id and isinstance(urls, list) and urls:
+                references[f"{step_id}_url"] = str(urls[0])
+        return references
+
+    @staticmethod
+    def _result_values(
+        output: dict[str, object], keys: tuple[str, ...], nested_keys: tuple[str, ...] = (),
+    ) -> list[object]:
+        values = [output[key] for key in keys if key in output and output[key] is not None]
+        artifact = output.get("artifact")
+        if isinstance(artifact, dict):
+            values.extend(artifact[key] for key in nested_keys if artifact.get(key) is not None)
+        return list(dict.fromkeys(values))
+
+    @staticmethod
+    def _orchestration_activity(
+        step: dict[str, object], success: bool, output: dict[str, object] | None,
+    ) -> dict[str, object]:
+        return {
+            "name": step["tool"], "capability": step["capability"], "action": "WRITE_ARTIFACT",
+            "success": success, "output": json.dumps(output or {}, ensure_ascii=False)[:MAX_TOOL_OBSERVATION_CHARS],
+            "error": None if success else step["error_category"], "duration_ms": 0,
+            "details": {"status": step["status"], "step_id": step["step_id"], "dependencies": step["dependencies"]},
+        }
+
+    def _finalize_orchestration_response(
+        self, request: str, report: str, orchestration: dict[str, object], latency: LatencyRecorder,
+    ) -> tuple[str, dict[str, object]]:
+        compact_steps = [{key: step.get(key) for key in (
+            "step_id", "tool", "status", "artifact_ids", "external_urls", "error_category", "retryable"
+        )} for step in orchestration.get("steps", []) if isinstance(step, dict)]
+        try:
+            return self._complete(
+                [{"role": "system", "content": (
+                    "Write the final user response for a completed multi-capability task. Start with a concise analysis summary, then state Project save status, "
+                    "Google Docs and Sheets links, chart status, image artifact status, and any partial failures or retryable steps. "
+                    "Use only supplied operational results."
+                )}, {"role": "user", "content": json.dumps({
+                    "request": request, "final_research_report": report[:12_000],
+                    "orchestration_status": orchestration["status"], "steps": compact_steps,
+                }, ensure_ascii=False)}],
+                1600, latency, "orchestration_final_response", temperature=0,
+            )
+        except (httpx.HTTPError, ValueError):
+            links = [url for step in compact_steps for url in step.get("external_urls", []) if isinstance(url, str)]
+            suffix = "\n\n" + "\n".join(links) if links else ""
+            return f"{report}\n\nOrchestration status: {orchestration['status']}{suffix}", {}
 
     def _run_main_tool_loop(
         self,
@@ -832,7 +1129,7 @@ class AgentRuntime:
                 "final_synthesis",
                 lambda: self._synthesize_research_resilient(
                     question, all_tools, system_prompt, latency, persistent_context, research_plan,
-                    use_critic=True,
+                    use_critic=False,
                 ),
             )
             if RESEARCH_PROGRESS_PATTERN.search(answer):
@@ -1934,7 +2231,7 @@ class AgentRuntime:
             '"depth":"none|quick|deep","freshness_importance":"low|normal|high","evidence_needs":[],'
             '"primary_source_importance":"low|normal|high","scholarly_evidence_value":"low|normal|high",'
             '"market_data_value":"low|normal|high","entities":[],"unresolved_questions":[],"search_queries":[],'
-            '"preferred_capabilities":[],"source_preferences":[],"ready_to_answer":false,'
+            '"preferred_capabilities":[],"source_preferences":[],"requested_outputs":[],"ready_to_answer":false,'
             '"role":"main|coding|research|server"}. '
             "Use NO_SEARCH for writing, translation, supplied-text work, stable concepts, or local server/repository questions whose answer "
             "does not materially depend on external facts. A real company, market, industry, policy, person, publication, or current-event "
@@ -1942,6 +2239,11 @@ class AgentRuntime:
             "an inference or impact analysis. Do not confuse permission to reason with permission to invent current premises. "
             "Use QUICK_SEARCH for a current fact, recent event, price, availability, schedule, policy, or fact check. "
             "Use DEEP_RESEARCH only when multiple evidence gaps or iterative source verification materially improve the answer. "
+            "In requested_outputs include post-research deliverables using these exact names: project_save_artifact, "
+            "google_docs_create, google_sheets_create, google_sheets_add_chart, media_generate_image. "
+            "Select media_generate_image only when the user explicitly requests a visual or one compact information visual would materially "
+            "improve the requested result; do not select it for routine research. "
+            "Use an empty list when the user only asks for an answer or research report in chat. "
             "Research role selection changes expertise, not depth: it may still use NO_SEARCH, QUICK_SEARCH, or DEEP_RESEARCH. "
             "For QUICK_SEARCH provide exactly one concise query. "
             "For DEEP_RESEARCH provide 1 to 4 complementary queries that target the actual unresolved evidence needs. "
@@ -2026,6 +2328,13 @@ class AgentRuntime:
         depth = value.get("depth") if value.get("depth") in {"none", "quick", "deep"} else {
             "NO_SEARCH": "none", "QUICK_SEARCH": "quick", "DEEP_RESEARCH": "deep",
         }[mode]
+        requested_outputs = tuple(
+            name for name in strings("requested_outputs", MAX_ORCHESTRATION_STEPS)
+            if name in {
+                "project_save_artifact", "google_docs_create",
+                "google_sheets_create", "google_sheets_add_chart", "media_generate_image",
+            }
+        )
         return ResearchPlan(
             mode=mode,
             needs_external_information=value.get("needs_external_information") is True or mode != "NO_SEARCH",
@@ -2040,6 +2349,7 @@ class AgentRuntime:
             search_queries=queries,
             preferred_capabilities=strings("preferred_capabilities", 8),
             source_preferences=strings("source_preferences", 8),
+            requested_outputs=tuple(dict.fromkeys(requested_outputs)),
             ready_to_answer=value.get("ready_to_answer") is True or mode == "NO_SEARCH",
             recommended_agent=value.get("role") if value.get("role") in {"main", "coding", "research", "server"} else "",
         )
