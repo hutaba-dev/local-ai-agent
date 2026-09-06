@@ -72,6 +72,10 @@ def chart_response(chart_id: int = 77) -> FakeResponse:
     return FakeResponse(200, {"replies": [{"addChart": {"chart": {"chartId": chart_id}}}]})
 
 
+def valid_values_response() -> FakeResponse:
+    return FakeResponse(200, {"values": [["Supplier", "Capacity"], ["Alpha", 100000], ["Beta", 80000]]})
+
+
 class GoogleSheetsChartTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.access_token = "chart-access-token-never-return"
@@ -87,7 +91,7 @@ class GoogleSheetsChartTests(unittest.IsolatedAsyncioTestCase):
         self.requests: list[dict[str, object]] = []
 
     async def call(self, *responses: FakeResponse, **arguments: object) -> dict[str, object]:
-        queue = list(responses)
+        queue = [valid_values_response(), *responses]
         with patch(
             "mcp_servers.google_server.httpx.AsyncClient",
             side_effect=lambda **_kwargs: FakeAsyncClient(queue, self.requests),
@@ -106,11 +110,14 @@ class GoogleSheetsChartTests(unittest.IsolatedAsyncioTestCase):
                     title="Integration chart",
                     sheet_id=0,
                 )
-                spec = self.requests[0]["json"]["requests"][0]["addChart"]["chart"]["spec"]
+                spec = self.requests[1]["json"]["requests"][0]["addChart"]["chart"]["spec"]
                 self.assertEqual(result["status"], "AVAILABLE")
                 self.assertEqual(result["chart_id"], 77)
                 self.assertEqual(result["chart_type"], chart_type)
                 self.assertEqual(result["title"], "Integration chart")
+                self.assertEqual(result["series_names"], ["Capacity"])
+                self.assertEqual(result["numeric_point_counts"], [2])
+                self.assertTrue(result["source_verified"])
                 if chart_type == "PIE":
                     self.assertIn("pieChart", spec)
                 else:
@@ -137,9 +144,9 @@ class GoogleSheetsChartTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(result["sheet_id"], 42)
-        self.assertEqual(self.requests[0]["method"], "GET")
-        self.assertEqual(self.requests[0]["params"], {"fields": "sheets.properties(sheetId,title)"})
-        source = self.requests[1]["json"]["requests"][0]["addChart"]["chart"]["spec"]["basicChart"]
+        self.assertEqual(self.requests[1]["method"], "GET")
+        self.assertEqual(self.requests[1]["params"], {"fields": "sheets.properties(sheetId,title)"})
+        source = self.requests[2]["json"]["requests"][0]["addChart"]["chart"]["spec"]["basicChart"]
         self.assertEqual(source["domains"][0]["domain"]["sourceRange"]["sources"][0], {
             "sheetId": 42,
             "startRowIndex": 0,
@@ -148,7 +155,7 @@ class GoogleSheetsChartTests(unittest.IsolatedAsyncioTestCase):
             "endColumnIndex": 1,
         })
         self.assertEqual(source["series"][0]["series"]["sourceRange"]["sources"][0]["startColumnIndex"], 1)
-        anchor = self.requests[1]["json"]["requests"][0]["addChart"]["chart"]["position"]["overlayPosition"]["anchorCell"]
+        anchor = self.requests[2]["json"]["requests"][0]["addChart"]["chart"]["position"]["overlayPosition"]["anchorCell"]
         self.assertEqual(anchor, {"sheetId": 42, "rowIndex": 0, "columnIndex": 3})
 
     async def test_invalid_ranges_do_not_call_google(self) -> None:
@@ -166,6 +173,24 @@ class GoogleSheetsChartTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result["status"], "CHART_TYPE_UNSUPPORTED")
         self.assertEqual(self.requests, [])
+
+    async def test_text_only_and_unknown_ranges_reject_chart_without_mutation(self) -> None:
+        for values in (
+            [["Supplier", "Status"], ["Alpha", "Likely"], ["Beta", "UNKNOWN"]],
+            [["Supplier", "Capacity"], ["Alpha", None], ["Beta", None]],
+            [["Supplier", "Series 1"], ["Alpha", 100], ["Beta", 80]],
+        ):
+            with self.subTest(values=values):
+                self.requests.clear()
+                with patch(
+                    "mcp_servers.google_server.httpx.AsyncClient",
+                    side_effect=lambda **_kwargs: FakeAsyncClient([FakeResponse(200, {"values": values})], self.requests),
+                ):
+                    result = await add_google_sheets_chart(
+                        self.scope, "spreadsheet-1", "BAR", "A1:B3", sheet_id=0,
+                    )
+                self.assertEqual(result["status"], "NO_VALID_CHART_DATA")
+                self.assertEqual([request["method"] for request in self.requests], ["GET"])
 
     async def test_missing_spreadsheet_is_normalized(self) -> None:
         result = await self.call(
@@ -222,7 +247,7 @@ class GoogleSheetsChartTests(unittest.IsolatedAsyncioTestCase):
                 spreadsheet_id="spreadsheet-1", chart_type="BAR", data_range="A1:B5", sheet_id=0,
             )
         self.assertEqual(result["status"], "AVAILABLE")
-        self.assertEqual(len(self.requests), 2)
+        self.assertEqual(len(self.requests), 3)
         refresh.assert_awaited_once_with(self.refresh_token)
 
     async def test_403_is_permission_denied(self) -> None:

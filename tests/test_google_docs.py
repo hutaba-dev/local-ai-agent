@@ -55,7 +55,11 @@ class FakeAsyncClient:
         return None
 
     async def post(self, url: str, **kwargs: object) -> FakeResponse:
-        self.requests.append({"url": url, **kwargs})
+        self.requests.append({"method": "POST", "url": url, **kwargs})
+        return self.responses.pop(0)
+
+    async def get(self, url: str, **kwargs: object) -> FakeResponse:
+        self.requests.append({"method": "GET", "url": url, **kwargs})
         return self.responses.pop(0)
 
 
@@ -97,14 +101,56 @@ class GoogleDocsTests(unittest.IsolatedAsyncioTestCase):
             "url": "https://docs.google.com/document/d/doc-123/edit",
             "scope": DRIVE_FILE_SCOPE,
             "scope_limited": True,
-            "content_format": "plain_text",
+            "content_format": "native_google_docs",
+            "heading_count": 0,
+            "table_count": 0,
         })
         self.assertEqual(self.requests[0]["url"], DOCS_CREATE_ENDPOINT)
         self.assertEqual(self.requests[0]["json"], {"title": "AHNBYS report"})
-        self.assertEqual(
-            self.requests[1]["json"],
-            {"requests": [{"insertText": {"location": {"index": 1}, "text": "Report body"}}]},
+        requests = self.requests[1]["json"]["requests"]
+        self.assertEqual(requests[0], {"insertText": {"location": {"index": 1}, "text": "Report body\n"}})
+        self.assertEqual(requests[1]["updateParagraphStyle"]["paragraphStyle"]["namedStyleType"], "NORMAL_TEXT")
+
+    async def test_markdown_creates_native_headings_bold_and_table(self) -> None:
+        document_structure = {"body": {"content": [{
+            "startIndex": 15,
+            "table": {"tableRows": [
+                {"tableCells": [{"content": [{"startIndex": 17}]}, {"content": [{"startIndex": 20}]}]},
+                {"tableCells": [{"content": [{"startIndex": 24}]}, {"content": [{"startIndex": 27}]}]},
+            ]},
+        }]}}
+        result = await self.call(
+            FakeResponse(200, {"documentId": "doc-native"}),
+            FakeResponse(200, {}),
+            FakeResponse(200, document_structure),
+            FakeResponse(200, {}),
+            title="Native report",
+            content=(
+                "# Report\n## Findings\nA **verified** fact.\n"
+                "| Supplier | Capacity |\n|---|---:|\n| Alpha | 100000 |"
+            ),
         )
+
+        self.assertEqual(result["status"], "AVAILABLE")
+        self.assertEqual(result["content_format"], "native_google_docs")
+        self.assertEqual(result["heading_count"], 2)
+        self.assertEqual(result["table_count"], 1)
+        initial_requests = self.requests[1]["json"]["requests"]
+        inserted_text = initial_requests[0]["insertText"]["text"]
+        self.assertNotIn("#", inserted_text)
+        self.assertNotIn("**", inserted_text)
+        self.assertNotIn("|---", inserted_text)
+        styles = [item["updateParagraphStyle"]["paragraphStyle"]["namedStyleType"] for item in initial_requests if "updateParagraphStyle" in item]
+        self.assertEqual(styles[:2], ["HEADING_1", "HEADING_2"])
+        self.assertTrue(any("updateTextStyle" in item for item in initial_requests))
+        self.assertTrue(any("insertTable" in item for item in initial_requests))
+        self.assertEqual(self.requests[2]["method"], "GET")
+        table_requests = self.requests[3]["json"]["requests"]
+        table_values = [item["insertText"]["text"] for item in table_requests if "insertText" in item]
+        self.assertCountEqual(table_values, ["Supplier", "Capacity", "Alpha", "100000"])
+        header_styles = [item for item in table_requests if "updateTextStyle" in item]
+        self.assertEqual(len(header_styles), 2)
+        self.assertTrue(all(item["updateTextStyle"]["textStyle"]["bold"] for item in header_styles))
 
     async def test_disconnected_user_returns_not_connected(self) -> None:
         self.store.token = None

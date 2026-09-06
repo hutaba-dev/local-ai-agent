@@ -127,6 +127,53 @@ class GoogleSheetsTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.requests[1]["json"]["values"], [["A", "B"], [1, 2]])
 
+    async def test_typed_dataset_writes_numbers_nulls_sources_and_formatting(self) -> None:
+        dataset = {
+            "title": "Supplier capacity",
+            "columns": ["Supplier", "Capacity", "Evidence"],
+            "column_types": ["text", "integer", "text"],
+            "units": [None, "wafers/month", None],
+            "sources": ["S1"],
+            "rows": [["Alpha", 100000, "S1"], ["Beta", 80000, "S1"], ["Gamma", None, "UNKNOWN"]],
+            "chart_candidates": [{
+                "title": "Capacity by supplier", "chart_type": "BAR",
+                "category_column": 0, "series_columns": [1],
+            }],
+        }
+        result = await self.call(
+            FakeResponse(200, {"spreadsheetId": "typed", "sheets": [{"properties": {"sheetId": 17}}]}),
+            FakeResponse(200, {}),
+            FakeResponse(200, {}),
+            title="Typed dataset",
+            dataset=dataset,
+        )
+
+        self.assertEqual(result["status"], "AVAILABLE")
+        self.assertEqual(result["data_contract"], "tabular_dataset")
+        self.assertEqual(result["numeric_columns"], [1])
+        self.assertTrue(result["chart_ready"])
+        written = self.requests[1]["json"]["values"]
+        self.assertIsInstance(written[1][1], int)
+        self.assertIsNone(written[3][1])
+        self.assertEqual(written[1][2], "S1")
+        formatting = self.requests[2]["json"]["requests"]
+        self.assertTrue(any("updateSheetProperties" in item for item in formatting))
+        self.assertTrue(any("setBasicFilter" in item for item in formatting))
+        number_formats = [item for item in formatting if "repeatCell" in item and "numberFormat" in item["repeatCell"]["cell"]["userEnteredFormat"]]
+        self.assertEqual(number_formats[0]["repeatCell"]["range"]["startColumnIndex"], 1)
+
+    async def test_invalid_numeric_dataset_does_not_call_google(self) -> None:
+        result = await self.call(title="Invalid", dataset={
+            "title": "Invalid",
+            "columns": ["Supplier", "Capacity", "Evidence"],
+            "column_types": ["text", "integer", "text"],
+            "sources": ["S1"],
+            "rows": [["Alpha", "100,000 (S1)", "S1"], ["Beta", None, "UNKNOWN"]],
+            "chart_candidates": [],
+        })
+        self.assertEqual(result["status"], "INVALID_DATASET")
+        self.assertEqual(self.requests, [])
+
     async def test_disconnected_user_returns_not_connected_without_http(self) -> None:
         self.store.token = None
         result = await self.call(title="Title", values=[["A"]])

@@ -22,6 +22,19 @@ VISUAL_BRIEF = {
     "constraints": ["minimal text", "no invented logos"],
 }
 
+DATASET = {
+    "title": "Supplier capacity",
+    "columns": ["Supplier", "Capacity", "Evidence"],
+    "column_types": ["text", "integer", "text"],
+    "units": [None, "units", None],
+    "sources": ["S1"],
+    "rows": [["A", 10, "S1"], ["B", 14, "S1"]],
+    "chart_candidates": [{
+        "title": "Capacity by supplier", "chart_type": "BAR",
+        "category_column": 0, "series_columns": [1],
+    }],
+}
+
 
 class FakeResponse:
     def __init__(self, content: str) -> None:
@@ -136,8 +149,8 @@ class Phase3EOrchestrationTests(unittest.TestCase):
     def test_docs_sheets_chart_media_full_chain_preserves_phase3d_dependencies(self) -> None:
         planner = plan(
             step("doc", "google_docs_create", {"title": "Report"}),
-            step("sheet", "google_sheets_create", {"title": "Comparison", "values": [["Company", "Score"], ["A", 1]]}),
-            step("chart", "google_sheets_add_chart", {"chart_type": "BAR", "data_range": "A1:B2"}, ["sheet"]),
+            step("sheet", "google_sheets_create", {"title": "Comparison", "dataset": DATASET}),
+            step("chart", "google_sheets_add_chart", {}, ["sheet"]),
             step("visual", "media_generate_image", {"visual_brief": VISUAL_BRIEF}),
         )
         outputs = [
@@ -158,6 +171,7 @@ class Phase3EOrchestrationTests(unittest.TestCase):
             "google_docs_create", "google_sheets_create", "google_sheets_add_chart", "media_generate_image",
         ])
         self.assertEqual(tool_call.call_args_list[2].args[1]["spreadsheet_id"], "sheet-1")
+        self.assertEqual(tool_call.call_args_list[2].args[1]["data_range"], "A1:B3")
         media_refs = tool_call.call_args_list[3].args[1]["related_results"]
         self.assertEqual(media_refs["doc_url"], "https://docs.test/1")
         self.assertEqual(media_refs["sheet_url"], "https://sheets.test/1")

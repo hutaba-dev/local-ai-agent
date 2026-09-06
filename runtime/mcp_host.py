@@ -47,8 +47,10 @@ class MCPHealth(str, Enum):
 	DOCUMENT_CREATE_FAILED = "DOCUMENT_CREATE_FAILED"
 	SPREADSHEET_CREATE_FAILED = "SPREADSHEET_CREATE_FAILED"
 	VALUES_WRITE_FAILED = "VALUES_WRITE_FAILED"
+	INVALID_DATASET = "INVALID_DATASET"
 	SPREADSHEET_NOT_FOUND = "SPREADSHEET_NOT_FOUND"
 	RANGE_INVALID = "RANGE_INVALID"
+	NO_VALID_CHART_DATA = "NO_VALID_CHART_DATA"
 	CHART_TYPE_UNSUPPORTED = "CHART_TYPE_UNSUPPORTED"
 	CHART_CREATE_FAILED = "CHART_CREATE_FAILED"
 	ERROR = "ERROR"
@@ -119,7 +121,12 @@ class MCPHost:
 				server=spec.server,
 				cost=spec.cost_class,
 				permission=spec.permission,
-				timeout_seconds=180 if spec.server == "media-mcp" else 30 if spec.server in {"browser-mcp", "github-mcp"} else 20,
+				timeout_seconds=(
+					180 if spec.server == "media-mcp"
+					else 60 if spec.server == "google-mcp"
+					else 30 if spec.server in {"browser-mcp", "github-mcp"}
+					else 20
+				),
 				input_schema=spec.input_schema,
 			)
 			for name, spec in TOOL_SPECS.items()

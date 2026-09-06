@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from types import SimpleNamespace
 from unittest.mock import call, patch
@@ -8,6 +9,20 @@ from mcp_servers.google_server import GoogleToolScope
 from runtime.agent_runtime import AgentRuntime, LatencyRecorder
 from runtime.mcp_host import MCPCallOutcome
 from runtime.tool_registry import ProjectToolScope
+
+
+DATASET = {
+    "title": "Supplier capacity",
+    "columns": ["Supplier", "Capacity", "Evidence"],
+    "column_types": ["text", "integer", "text"],
+    "units": [None, "units", None],
+    "sources": ["S1"],
+    "rows": [["A", 10, "S1"], ["B", 14, "S1"]],
+    "chart_candidates": [{
+        "title": "Capacity by supplier", "chart_type": "BAR",
+        "category_column": 0, "series_columns": [1],
+    }],
+}
 
 
 class FakeResponse:
@@ -70,12 +85,12 @@ class Phase3DOrchestrationTests(unittest.TestCase):
 
     def test_full_chain_injects_report_and_exact_sheet_id_with_user_scopes(self) -> None:
         client = SequencedClient([
-            '{"steps":['
-            '{"id":"project","tool":"project_save_artifact","depends_on":[],"arguments":{"name":"market-report.md"}},'
-            '{"id":"doc","tool":"google_docs_create","depends_on":[],"arguments":{"title":"Market report"}},'
-            '{"id":"sheet","tool":"google_sheets_create","depends_on":[],"arguments":{"title":"Metrics","values":[["Year","Value"],[2024,10],[2025,14]]}},'
-            '{"id":"chart","tool":"google_sheets_add_chart","depends_on":["sheet"],"arguments":{"chart_type":"LINE","data_range":"A1:B3","title":"Trend"}}'
-            ']}',
+            json.dumps({"steps": [
+                {"id": "project", "tool": "project_save_artifact", "depends_on": [], "arguments": {"name": "market-report.md"}},
+                {"id": "doc", "tool": "google_docs_create", "depends_on": [], "arguments": {"title": "Market report"}},
+                {"id": "sheet", "tool": "google_sheets_create", "depends_on": [], "arguments": {"title": "Metrics", "dataset": DATASET}},
+                {"id": "chart", "tool": "google_sheets_add_chart", "depends_on": ["sheet"], "arguments": {}},
+            ]}),
             "Research complete. Project, Doc, Sheet, and chart were created.",
         ])
         outputs = [
@@ -99,10 +114,14 @@ class Phase3DOrchestrationTests(unittest.TestCase):
         ])
         project_arguments = tool_call.call_args_list[0].args[1]
         doc_arguments = tool_call.call_args_list[1].args[1]
+        sheet_arguments = tool_call.call_args_list[2].args[1]
         chart_arguments = tool_call.call_args_list[3].args[1]
         self.assertEqual(project_arguments["content"], "Final researched evidence")
         self.assertEqual(doc_arguments["content"], "Final researched evidence")
+        self.assertEqual(sheet_arguments["dataset"], DATASET)
         self.assertEqual(chart_arguments["spreadsheet_id"], "sheet-1")
+        self.assertEqual(chart_arguments["data_range"], "A1:B3")
+        self.assertEqual(chart_arguments["title"], "Capacity by supplier")
         self.assertIs(tool_call.call_args_list[0].args[2], self.project_scope)
         self.assertIs(tool_call.call_args_list[1].args[4], self.google_scope)
         self.assertEqual(orchestration["steps"][0]["artifact_ids"], ["artifact-1"])
@@ -111,11 +130,11 @@ class Phase3DOrchestrationTests(unittest.TestCase):
 
     def test_failed_sheet_blocks_chart_without_repeating_successful_writes(self) -> None:
         client = SequencedClient([
-            '{"steps":['
-            '{"id":"doc","tool":"google_docs_create","depends_on":[],"arguments":{"title":"Report"}},'
-            '{"id":"sheet","tool":"google_sheets_create","depends_on":[],"arguments":{"title":"Metrics","values":[["Name","Value"],["A",1]]}},'
-            '{"id":"chart","tool":"google_sheets_add_chart","depends_on":["sheet"],"arguments":{"chart_type":"BAR","data_range":"A1:B2"}}'
-            ']}',
+            json.dumps({"steps": [
+                {"id": "doc", "tool": "google_docs_create", "depends_on": [], "arguments": {"title": "Report"}},
+                {"id": "sheet", "tool": "google_sheets_create", "depends_on": [], "arguments": {"title": "Metrics", "dataset": DATASET}},
+                {"id": "chart", "tool": "google_sheets_add_chart", "depends_on": ["sheet"], "arguments": {}},
+            ]}),
             "The Doc succeeded; Sheet and chart need retry.",
         ])
         outputs = [
@@ -136,6 +155,100 @@ class Phase3DOrchestrationTests(unittest.TestCase):
         ])
         self.assertEqual(orchestration["status"], "PARTIAL_SUCCESS")
         self.assertEqual(activity[2]["error"], "DEPENDENCY_FAILED")
+
+    def test_artifact_content_removes_operational_tool_messages(self) -> None:
+        client = SequencedClient([
+            json.dumps({"steps": [
+                {"id": "project", "tool": "project_save_artifact", "depends_on": [], "arguments": {"name": "report.md"}},
+                {"id": "doc", "tool": "google_docs_create", "depends_on": [], "arguments": {"title": "Report"}},
+            ]}),
+            "Created.",
+        ])
+        report = "# Evidence\nVerified fact.\nGoogle Docs를 만들 수 없습니다.\n## Conclusion\nSupported."
+        with patch("runtime.agent_runtime.call_mcp_tool", side_effect=[
+            outcome("project_save_artifact", {"status": "AVAILABLE"}),
+            outcome("google_docs_create", {"status": "AVAILABLE"}),
+        ]) as tool_call:
+            AgentRuntime(client=client)._run_post_research_orchestration(
+                "Create artifacts", report, {}, LatencyRecorder(),
+                ("project_save_artifact", "google_docs_create"), self.project_scope, self.google_scope,
+            )
+        for call_item in tool_call.call_args_list:
+            self.assertNotIn("만들 수 없습니다", call_item.args[1]["content"])
+            self.assertIn("Verified fact", call_item.args[1]["content"])
+
+    def test_text_only_dataset_creates_sheet_but_skips_chart(self) -> None:
+        text_dataset = {
+            "title": "Supplier status",
+            "columns": ["Supplier", "Status", "Evidence"],
+            "column_types": ["text", "text", "text"],
+            "units": [None, None, None],
+            "sources": ["S1"],
+            "rows": [["A", "Likely", "S1"], ["B", "UNKNOWN", "S1"]],
+            "chart_candidates": [{
+                "title": "Status", "chart_type": "BAR", "category_column": 0, "series_columns": [1],
+            }],
+        }
+        client = SequencedClient([
+            json.dumps({"steps": [
+                {"id": "sheet", "tool": "google_sheets_create", "depends_on": [], "arguments": {"title": "Status", "dataset": text_dataset}},
+                {"id": "chart", "tool": "google_sheets_add_chart", "depends_on": ["sheet"], "arguments": {}},
+            ]}),
+            "Sheet created; chart skipped.",
+        ])
+        with patch("runtime.agent_runtime.call_mcp_tool", return_value=outcome(
+            "google_sheets_create", {"status": "AVAILABLE", "spreadsheet_id": "sheet-1"},
+        )) as tool_call:
+            _, _, _, orchestration = AgentRuntime(client=client)._run_post_research_orchestration(
+                "Create a Sheet and chart", "Report", {}, LatencyRecorder(),
+                ("google_sheets_create", "google_sheets_add_chart"), None, self.google_scope,
+            )
+        self.assertEqual(tool_call.call_count, 1)
+        self.assertEqual(orchestration["steps"][1]["status"], "NO_VALID_CHART_DATA")
+        self.assertFalse(orchestration["steps"][1]["retryable"])
+
+    def test_title_only_sheet_plan_extracts_typed_dataset_separately(self) -> None:
+        client = SequencedClient([
+            json.dumps({"steps": [{
+                "id": "sheet", "tool": "google_sheets_create", "depends_on": [],
+                "arguments": {"title": "Metrics"},
+            }]}),
+            json.dumps({"dataset": DATASET}),
+            "Sheet created.",
+        ])
+        with patch("runtime.agent_runtime.call_mcp_tool", return_value=outcome(
+            "google_sheets_create", {"status": "AVAILABLE", "spreadsheet_id": "sheet-1"},
+        )) as tool_call:
+            _, _, _, orchestration = AgentRuntime(client=client)._run_post_research_orchestration(
+                "Create a Sheet", "# Report\nTwo sourced values.", {}, LatencyRecorder(),
+                ("google_sheets_create",), None, self.google_scope,
+            )
+        self.assertEqual(orchestration["status"], "AVAILABLE")
+        self.assertEqual(tool_call.call_args.args[1]["dataset"], DATASET)
+        extraction_request = client.requests[1]["messages"][1]["content"]
+        self.assertIn("output_schema", extraction_request)
+        self.assertIn("completed_report", extraction_request)
+
+    def test_invalid_extraction_gets_one_bounded_repair_pass(self) -> None:
+        client = SequencedClient([
+            json.dumps({"steps": [{
+                "id": "sheet", "tool": "google_sheets_create", "depends_on": [],
+                "arguments": {"title": "Metrics"},
+            }]}),
+            json.dumps({"dataset": {**DATASET, "rows": [["A", "10", "S1"], ["B", 14, "S1"]]}}),
+            json.dumps({"dataset": DATASET}),
+            "Sheet created.",
+        ])
+        with patch("runtime.agent_runtime.call_mcp_tool", return_value=outcome(
+            "google_sheets_create", {"status": "AVAILABLE", "spreadsheet_id": "sheet-1"},
+        )) as tool_call:
+            _, _, _, orchestration = AgentRuntime(client=client)._run_post_research_orchestration(
+                "Create a Sheet", "# Report\nTwo sourced values.", {}, LatencyRecorder(),
+                ("google_sheets_create",), None, self.google_scope,
+            )
+        self.assertEqual(orchestration["status"], "AVAILABLE")
+        self.assertEqual(tool_call.call_args.args[1]["dataset"], DATASET)
+        self.assertIn("validation_error", client.requests[2]["messages"][1]["content"])
 
     def test_invalid_or_duplicate_plan_executes_nothing(self) -> None:
         invalid_plans = [
