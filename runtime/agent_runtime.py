@@ -68,6 +68,12 @@ EXPLICIT_WEB_EVIDENCE_PATTERN = re.compile(
     r"|(?:check|verify|search|research|use|consult|확인|검색|조사|검증|사용)"
     r".{0,120}(?:\b(?:web|internet|online|public\s+(?:web\s+)?(?:source|evidence))\b|웹|인터넷|온라인|공개\s*(?:출처|근거))"
 )
+GOOGLE_DOCS_REQUEST_PATTERN = re.compile(
+    r"(?i)(?:\bgoogle\s*docs?|\bdocs?)(?=$|[\s,./]|[와과랑및도은는이가을를에로])|구글\s*(?:독스|문서)"
+)
+GOOGLE_SHEETS_REQUEST_PATTERN = re.compile(
+    r"(?i)(?:\bgoogle\s*sheets?|\bsheets?)(?=$|[\s,./]|[와과랑및도은는이가을를에로])|구글\s*(?:시트|스프레드시트)"
+)
 HANGUL_TRANSLITER = Transliter(academic_romanization)
 COMPOUND_KOREAN_SURNAMES = {"남궁", "독고", "사공", "서문", "선우", "제갈", "황보"}
 
@@ -127,11 +133,22 @@ class TaskGoal:
     return_links: bool
 
     @classmethod
-    def from_plan(cls, plan: ResearchPlan) -> "TaskGoal":
+    def from_request(
+        cls, plan: ResearchPlan, request: str, project_available: bool = False,
+    ) -> "TaskGoal":
+        deliverables = [
+            output for output in plan.requested_outputs
+            if output != "project_save_artifact" or project_available
+        ]
+        if GOOGLE_DOCS_REQUEST_PATTERN.search(request):
+            deliverables.append("google_docs_create")
+        if GOOGLE_SHEETS_REQUEST_PATTERN.search(request):
+            deliverables.append("google_sheets_create")
+        required = tuple(dict.fromkeys(deliverables))
         return cls(
             research_required=plan.mode != "NO_SEARCH",
-            deliverables=plan.requested_outputs,
-            return_links=any(output in {"google_docs_create", "google_sheets_create"} for output in plan.requested_outputs),
+            deliverables=required,
+            return_links=any(output in {"google_docs_create", "google_sheets_create"} for output in required),
         )
 
 
@@ -329,7 +346,7 @@ class AgentRuntime:
                 conversation_context=self._conversation_planning_context(session.messages) if session.messages else "",
             ),
         ) if selected_agent in {"auto", "research"} else SearchDecision("NO_SEARCH")
-        goal = TaskGoal.from_plan(decision)
+        goal = TaskGoal.from_request(decision, message, project_scope is not None)
         search_mode = decision.mode
         route = route_request(message, selected_agent, search_mode, decision.recommended_agent)
         reuse_research = (
@@ -399,7 +416,7 @@ class AgentRuntime:
             research["mode"] = route.search_mode
             selected_capabilities = self._research_capabilities(decision, tools)
             answer, payload, orchestration_tools, orchestration = self._run_post_research_orchestration(
-                message, answer, payload, latency, decision.requested_outputs,
+                message, answer, payload, latency, goal.deliverables,
                 project_scope, google_scope, session.id,
             )
             tools.extend(orchestration_tools)
@@ -454,12 +471,12 @@ class AgentRuntime:
             answer += "\n\n> Response was truncated at the output limit. Ask to continue for the remaining section."
         self.sessions.append(session, "user", message)
         research_result = research.get("result")
-        self.sessions.append(
-            session,
-            "assistant",
-            answer,
-            {"research_result": research_result} if isinstance(research_result, dict) else None,
-        )
+        assistant_metadata: dict[str, object] = {}
+        if isinstance(research_result, dict):
+            assistant_metadata["research_result"] = research_result
+        if orchestration:
+            assistant_metadata["orchestration"] = orchestration
+        self.sessions.append(session, "assistant", answer, assistant_metadata or None)
         usage = payload.get("usage")
         return ChatResult(
             session.id,

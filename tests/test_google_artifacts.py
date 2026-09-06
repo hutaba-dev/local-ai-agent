@@ -23,12 +23,17 @@ class GoogleArtifactContractTests(unittest.TestCase):
     def test_operational_agent_messages_are_removed(self) -> None:
         report = sanitize_report(
             "# Analysis\nVerified result.\nGoogle Docs를 만들 수 없습니다.\n"
-            "Sheets API가 없어 수행할 수 없습니다.\n## Conclusion\nSupported conclusion."
+            "Sheets API가 없어 수행할 수 없습니다.\n"
+            "다른 Agent에서 재요청하세요.\n권한을 활성화해 주세요.\n"
+            "어떤 방식으로 진행할까요?\n## Conclusion\nSupported conclusion."
         )
         self.assertIn("Verified result", report)
         self.assertIn("Supported conclusion", report)
         self.assertNotIn("만들 수 없습니다", report)
         self.assertNotIn("API가 없어", report)
+        self.assertNotIn("재요청", report)
+        self.assertNotIn("권한을 활성화", report)
+        self.assertNotIn("어떤 방식", report)
 
     def test_typed_dataset_preserves_numbers_nulls_and_evidence(self) -> None:
         dataset = TabularDataset.from_mapping({

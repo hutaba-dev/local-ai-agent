@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from mcp_servers.google_server import GoogleToolScope
-from runtime.agent_runtime import AgentRuntime, ResearchPlan
+from runtime.agent_runtime import AgentRuntime, ResearchPlan, TaskGoal
 from runtime.mcp_host import MCPCallOutcome
 
 
@@ -135,6 +135,69 @@ class ParentGoalOrchestrationTests(unittest.TestCase):
         self.assertEqual(result.orchestration["events"][-2:], [
             "Goal satisfaction passed", "Final response emitted",
         ])
+
+    def test_parent_recovers_explicit_google_outputs_omitted_by_research_planner(self) -> None:
+        client = SequencedClient([
+            json.dumps({"steps": [
+                {"id": "doc", "tool": "google_docs_create", "depends_on": [], "arguments": {"title": "Report"}},
+                {"id": "sheet", "tool": "google_sheets_create", "depends_on": [], "arguments": {"title": "Metrics", "dataset": DATASET}},
+            ]}),
+            "Completed with links.",
+        ])
+        runtime = AgentRuntime(client=client)
+        planner_without_outputs = ResearchPlan(
+            "DEEP_RESEARCH", True, "deep", search_queries=("Samsung performance",),
+            requested_outputs=(), recommended_agent="research",
+        )
+        report = RESEARCH_RESULT["body_markdown"] + "\n이 Research 세션에서는 Docs/Sheets 기능이 없습니다."
+        with patch.object(runtime, "_search_decision", return_value=planner_without_outputs), patch.object(
+            runtime, "_run_deep_research", return_value=([], report, {}, research_state()),
+        ), patch("runtime.agent_runtime.call_mcp_tool", side_effect=[
+            outcome("google_docs_create", "https://docs.test/recovered"),
+            outcome("google_sheets_create", "https://sheets.test/recovered"),
+        ]) as tool_call:
+            result = runtime.chat(
+                "삼성전자를 조사해 Google Docs와 Sheets로 만들고 링크를 줘", "auto",
+                google_scope=self.google_scope,
+            )
+
+        self.assertEqual([call.args[0] for call in tool_call.call_args_list], [
+            "google_docs_create", "google_sheets_create",
+        ])
+        self.assertEqual(result.orchestration["required_deliverables"], [
+            "google_docs_create", "google_sheets_create",
+        ])
+        self.assertNotIn("Research 세션에서는", tool_call.call_args_list[0].args[1]["content"])
+        self.assertIn("https://docs.test/recovered", result.content)
+        self.assertIn("https://sheets.test/recovered", result.content)
+
+    def test_parent_does_not_infer_google_outputs_from_generic_document_language(self) -> None:
+        plan = ResearchPlan("DEEP_RESEARCH", True, "deep", search_queries=("topic",))
+
+        goal = TaskGoal.from_request(plan, "자료를 조사해서 보고서 문서로 정리해줘")
+
+        self.assertEqual(goal.deliverables, ())
+
+    def test_completed_google_writes_persist_and_are_not_repeated(self) -> None:
+        runtime, first, _, first_tools = self.run_research_task(("google_docs_create", "google_sheets_create"))
+        runtime._client.contents.append("Existing Google artifacts reused.")
+        followup_plan = ResearchPlan(
+            "NO_SEARCH", requested_outputs=("google_docs_create", "google_sheets_create"), recommended_agent="main",
+        )
+        with patch.object(runtime, "_search_decision", return_value=followup_plan), patch(
+            "runtime.agent_runtime.call_mcp_tool",
+        ) as repeated_write:
+            second = runtime.chat(
+                "방금 만든 Google Docs와 Sheets 링크를 다시 줘", "auto", first.session_id,
+                google_scope=self.google_scope,
+            )
+
+        self.assertEqual(first_tools.call_count, 2)
+        repeated_write.assert_not_called()
+        self.assertEqual(second.route.agent, "main")
+        self.assertEqual(second.research["termination_reason"], "reused_completed_research")
+        self.assertIn("https://docs.test/report", second.content)
+        self.assertIn("https://sheets.test/report", second.content)
 
     def test_followup_docs_reuses_research_without_research_rerun(self) -> None:
         client = SequencedClient([

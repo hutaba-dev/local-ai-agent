@@ -13,8 +13,11 @@ OPERATIONAL_LINE_PATTERN = re.compile(
     r"(?:cannot|can't|unable to)\s+(?:create|save|access|use).{0,60}(?:google|docs|sheets|image|workspace|project)|"
     r"(?:tool|api|workspace|project).{0,40}(?:permission|unavailable|not available|required)|"
     r"(?:권한|도구|API|workspace|워크스페이스|경로).{0,50}(?:없|부족|필요|요구)|"
+    r"(?:google|docs|sheets|독스|문서|시트).{0,50}(?:기능|도구|권한).{0,30}(?:없|불가|필요|요구)|"
     r"(?:만들|생성|저장|수행).{0,30}(?:수 없|불가)|"
-    r"(?:다음|별도).{0,20}(?:agent|에이전트).{0,30}(?:필요|수행)"
+    r"(?:다음|별도|다른).{0,20}(?:agent|에이전트).{0,30}(?:필요|수행|재요청)|"
+    r"(?:권한).{0,30}(?:활성화|연결).{0,20}(?:필요|요청|해\s*주)|"
+    r"어떤\s*방식으로\s*진행"
     r")"
 )
 TABLE_SEPARATOR_PATTERN = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*$")
