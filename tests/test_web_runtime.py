@@ -653,6 +653,14 @@ class WebRuntimeTests(unittest.TestCase):
         self.assertEqual(assistant["research_result"], research_result)
         self.assertFalse(any(item.get("type") == "research_result" for item in assistant["tool_metadata"]))
 
+    def test_web_ui_renders_parent_final_instead_of_research_sub_result(self) -> None:
+        script = (Path(__file__).parents[1] / "web" / "static" / "app.js").read_text(encoding="utf-8")
+
+        self.assertIn("const body = content;", script)
+        self.assertNotIn("const body = normalizedResearch?.body_markdown || content;", script)
+        self.assertIn('const orchestration = activity.orchestration || {};', script)
+        self.assertIn('["Parent events", orchestrationEvents]', script)
+
     def test_research_result_exposes_source_registry_without_rigid_sections(self) -> None:
         result = AgentRuntime._research_result("Free-form answer. **INFERENCE:** result [S1]", [{
             "name": "web_sources",

@@ -266,7 +266,7 @@ function addMessage(role, content, label, activity, researchResult = null) {
   const article = document.createElement("article");
   article.className = `message ${role}`;
   const normalizedResearch = researchResult || activity?.research?.result || null;
-  const body = normalizedResearch?.body_markdown || content;
+  const body = content;
   article.innerHTML = `<div class="message-header"><div class="message-label">${escapeHtml(label)}</div></div><div class="markdown">${markdown(body, normalizedResearch?.sources || [])}</div>`;
   if (role === "assistant" && (normalizedResearch || activity?.routed_agent === "research")) {
     renderResearchAnswer(article, normalizedResearch || {});
@@ -381,6 +381,11 @@ function activityElement(activity) {
   const wholeUsage = activity.whole_request_usage || {};
   const finalCall = activity.final_call || {};
   const research = activity.research || {};
+  const orchestration = activity.orchestration || {};
+  const orchestrationEvents = (activity.orchestration_events || orchestration.events || []).join(" → ") || "N/A";
+  const orchestrationSteps = (orchestration.steps || []).map((step) => (
+    `${step.tool || "unknown"}: ${step.status || "UNKNOWN"}`
+  )).join("; ") || "N/A";
   const sourcePlan = research.source_plan || {};
   const search = research.search || {};
   const searchProviders = Object.entries(search.providers || {}).map(([provider, metrics]) => (
@@ -452,6 +457,7 @@ function activityElement(activity) {
     ["Entity confidence", research.entity_confidence || "N/A"], ["Gap status", research.gap_status || "N/A"],
     ["Final synthesis executed", research.final_synthesis_executed ? "YES" : "NO"],
     ["Termination", research.termination_reason || "N/A"],
+    ["Parent events", orchestrationEvents], ["Deliverable steps", orchestrationSteps],
     ["LLM calls", wholeUsage.llm_call_count ?? 0], ["Whole LLM input", wholeUsage.input_tokens ?? 0],
     ["Whole LLM output", wholeUsage.output_tokens ?? 0], ["Stages", stages], ["LLM timing", llmCalls], ["Tools", tools],
   ];
