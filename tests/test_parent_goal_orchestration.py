@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from mcp_servers.google_server import GoogleToolScope
-from runtime.agent_runtime import AgentRuntime, ResearchPlan, TaskGoal
+from runtime.agent_runtime import AgentRuntime, LatencyRecorder, ResearchPlan, TaskGoal
 from runtime.mcp_host import MCPCallOutcome
 
 
@@ -117,12 +117,14 @@ class ParentGoalOrchestrationTests(unittest.TestCase):
     def test_research_then_docs_finishes_with_link(self) -> None:
         _, result, _, tool_call = self.run_research_task(("google_docs_create",))
         self.assertEqual([call.args[0] for call in tool_call.call_args_list], ["google_docs_create"])
+        self.assertIn(RESEARCH_RESULT["body_markdown"], result.content)
         self.assertIn("https://docs.test/report", result.content)
         self.assertTrue(result.orchestration["goal_satisfied"])
 
     def test_research_then_sheets_finishes_with_link(self) -> None:
         _, result, _, tool_call = self.run_research_task(("google_sheets_create",))
         self.assertEqual([call.args[0] for call in tool_call.call_args_list], ["google_sheets_create"])
+        self.assertIn(RESEARCH_RESULT["body_markdown"], result.content)
         self.assertIn("https://sheets.test/report", result.content)
 
     def test_research_docs_and_sheets_runs_every_required_output_once(self) -> None:
@@ -132,6 +134,9 @@ class ParentGoalOrchestrationTests(unittest.TestCase):
         ])
         self.assertIn("https://docs.test/report", result.content)
         self.assertIn("https://sheets.test/report", result.content)
+        self.assertTrue(result.content.startswith(RESEARCH_RESULT["body_markdown"]))
+        self.assertNotIn("Chart", result.content)
+        self.assertNotIn("Image", result.content)
         self.assertEqual(result.orchestration["events"][-2:], [
             "Goal satisfaction passed", "Final response emitted",
         ])
@@ -177,6 +182,43 @@ class ParentGoalOrchestrationTests(unittest.TestCase):
         goal = TaskGoal.from_request(plan, "자료를 조사해서 보고서 문서로 정리해줘")
 
         self.assertEqual(goal.deliverables, ())
+
+    def test_artifact_only_is_explicit_goal_contract(self) -> None:
+        plan = AgentRuntime._parse_research_plan(
+            '{"search_mode":"NO_SEARCH","requested_outputs":["google_docs_create"],'
+            '"delivery_mode":"ARTIFACT_ONLY"}'
+        )
+        goal = TaskGoal.from_request(plan, "채팅에는 쓰지 말고 Google Docs에만 저장해")
+        orchestration = {
+            "status": "AVAILABLE",
+            "steps": [{
+                "step_id": "doc", "tool": "google_docs_create", "status": "AVAILABLE",
+                "artifact_ids": ["doc-1"], "external_urls": ["https://docs.test/only"],
+                "error_category": None, "retryable": False,
+            }],
+        }
+
+        answer, _ = AgentRuntime(client=SequencedClient([]))._finalize_orchestration_response(
+            "request", RESEARCH_RESULT["body_markdown"], orchestration,
+            LatencyRecorder(),
+            goal.delivery_mode,
+        )
+
+        self.assertEqual(goal.delivery_mode, "ARTIFACT_ONLY")
+        self.assertNotIn(RESEARCH_RESULT["body_markdown"], answer)
+        self.assertIn("https://docs.test/only", answer)
+
+    def test_artifact_only_requires_explicit_chat_omission(self) -> None:
+        plan = ResearchPlan(
+            "DEEP_RESEARCH", requested_outputs=("google_docs_create",), delivery_mode="ARTIFACT_ONLY",
+        )
+
+        goal = TaskGoal.from_request(plan, "Research Samsung and create a Google Doc")
+
+        self.assertEqual(goal.delivery_mode, "CHAT_AND_ARTIFACTS")
+
+        explicit_goal = TaskGoal.from_request(plan, "Create the Doc, but don't show the report in chat")
+        self.assertEqual(explicit_goal.delivery_mode, "ARTIFACT_ONLY")
 
     def test_completed_google_writes_persist_and_are_not_repeated(self) -> None:
         runtime, first, _, first_tools = self.run_research_task(("google_docs_create", "google_sheets_create"))

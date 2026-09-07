@@ -74,6 +74,10 @@ GOOGLE_DOCS_REQUEST_PATTERN = re.compile(
 GOOGLE_SHEETS_REQUEST_PATTERN = re.compile(
     r"(?i)(?:\bgoogle\s*sheets?|\bsheets?)(?=$|[\s,./]|[와과랑및도은는이가을를에로])|구글\s*(?:시트|스프레드시트)"
 )
+ARTIFACT_ONLY_REQUEST_PATTERN = re.compile(
+    r"(?is)(?:(?:채팅|답변|chat).{0,60}(?:쓰지\s*말|보여주지\s*말|생략|제외|omit|do\s*not\s*(?:show|include))"
+    r"|(?:쓰지\s*말|보여주지\s*말|생략|제외|omit|do(?:n't|\s*not)\s*(?:show|include)).{0,60}(?:채팅|답변|chat))"
+)
 HANGUL_TRANSLITER = Transliter(academic_romanization)
 COMPOUND_KOREAN_SURNAMES = {"남궁", "독고", "사공", "서문", "선우", "제갈", "황보"}
 
@@ -120,6 +124,7 @@ class ResearchPlan:
     requested_outputs: tuple[str, ...] = ()
     ready_to_answer: bool = False
     recommended_agent: str = ""
+    delivery_mode: str = "CHAT_AND_ARTIFACTS"
 
     @property
     def queries(self) -> tuple[str, ...]:
@@ -131,6 +136,7 @@ class TaskGoal:
     research_required: bool
     deliverables: tuple[str, ...]
     return_links: bool
+    delivery_mode: str
 
     @classmethod
     def from_request(
@@ -149,6 +155,11 @@ class TaskGoal:
             research_required=plan.mode != "NO_SEARCH",
             deliverables=required,
             return_links=any(output in {"google_docs_create", "google_sheets_create"} for output in required),
+            delivery_mode=(
+                "ARTIFACT_ONLY"
+                if plan.delivery_mode == "ARTIFACT_ONLY" and ARTIFACT_ONLY_REQUEST_PATTERN.search(request)
+                else "CHAT_AND_ARTIFACTS"
+            ),
         )
 
 
@@ -390,13 +401,13 @@ class AgentRuntime:
             if pending_outputs:
                 answer, payload, tools, orchestration = self._run_post_research_orchestration(
                     message, answer, payload, latency, pending_outputs,
-                    project_scope, google_scope, session.id,
+                    project_scope, google_scope, session.id, goal.delivery_mode,
                 )
             else:
                 tools = []
                 orchestration = prior_orchestration or {"status": "AVAILABLE", "steps": []}
                 answer, payload = self._finalize_orchestration_response(
-                    message, answer, orchestration, latency,
+                    message, answer, orchestration, latency, goal.delivery_mode,
                 )
             selected_capabilities = tuple(dict.fromkeys(
                 str(tool.get("capability")) for tool in tools if tool.get("capability")
@@ -417,7 +428,7 @@ class AgentRuntime:
             selected_capabilities = self._research_capabilities(decision, tools)
             answer, payload, orchestration_tools, orchestration = self._run_post_research_orchestration(
                 message, answer, payload, latency, goal.deliverables,
-                project_scope, google_scope, session.id,
+                project_scope, google_scope, session.id, goal.delivery_mode,
             )
             tools.extend(orchestration_tools)
             if orchestration_tools:
@@ -503,6 +514,7 @@ class AgentRuntime:
         project_scope: ProjectToolScope | None,
         google_scope: GoogleToolScope | None,
         media_owner_id: str | None = None,
+        delivery_mode: str = "CHAT_AND_ARTIFACTS",
     ) -> tuple[str, dict[str, object], list[dict[str, object]], dict[str, object]]:
         artifact_report = sanitize_report(report)
         required_outputs = tuple(dict.fromkeys(requested_outputs))
@@ -735,6 +747,7 @@ class AgentRuntime:
             "steps": list(state.values()),
             "max_steps": MAX_ORCHESTRATION_STEPS,
             "required_deliverables": list(required_outputs),
+            "delivery_mode": delivery_mode,
             "goal_satisfied": goal_satisfied,
             "events": [
                 "Parent task started", "Research completed", "Parent resumed",
@@ -750,7 +763,9 @@ class AgentRuntime:
         }
         if not goal_satisfied:
             raise RuntimeError("required deliverables remain pending")
-        final_answer, final_payload = self._finalize_orchestration_response(request, report, orchestration, latency)
+        final_answer, final_payload = self._finalize_orchestration_response(
+            request, artifact_report, orchestration, latency, delivery_mode,
+        )
         return final_answer, final_payload or payload, activity, orchestration
 
     @staticmethod
@@ -932,29 +947,32 @@ class AgentRuntime:
 
     def _finalize_orchestration_response(
         self, request: str, report: str, orchestration: dict[str, object], latency: LatencyRecorder,
+        delivery_mode: str = "CHAT_AND_ARTIFACTS",
     ) -> tuple[str, dict[str, object]]:
         compact_steps = [{key: step.get(key) for key in (
             "step_id", "tool", "status", "artifact_ids", "external_urls", "error_category", "retryable"
         )} for step in orchestration.get("steps", []) if isinstance(step, dict)]
-        try:
-            answer, payload = self._complete(
-                [{"role": "system", "content": (
-                    "Write the final user response for a completed multi-capability task. Start with a concise analysis summary, then state Project save status, "
-                    "Google Docs and Sheets links, chart status, image artifact status, and any partial failures or retryable steps. "
-                    "Use only supplied operational results."
-                )}, {"role": "user", "content": json.dumps({
-                    "request": request, "final_research_report": report[:12_000],
-                    "orchestration_status": orchestration["status"], "steps": compact_steps,
-                }, ensure_ascii=False)}],
-                1600, latency, "orchestration_final_response", temperature=0,
-            )
-        except (httpx.HTTPError, ValueError):
-            answer, payload = f"{report}\n\nOrchestration status: {orchestration['status']}", {}
-        links = [url for step in compact_steps for url in step.get("external_urls", []) if isinstance(url, str)]
-        missing_links = [url for url in links if url not in answer]
-        if missing_links:
-            answer += "\n\n" + "\n".join(missing_links)
-        return answer, payload
+        labels = {
+            "project_save_artifact": "Project",
+            "google_docs_create": "Google Docs",
+            "google_sheets_create": "Google Sheets",
+            "google_sheets_add_chart": "Chart",
+            "media_generate_image": "Image",
+        }
+        receipt: list[str] = ["## 생성된 산출물"]
+        for step in compact_steps:
+            tool = str(step.get("tool", ""))
+            label = labels.get(tool, tool)
+            status = str(step.get("status", "UNKNOWN"))
+            urls = [url for url in step.get("external_urls", []) if isinstance(url, str)]
+            if status == "AVAILABLE":
+                receipt.append(f"- **{label}:** " + (" ".join(urls) if urls else "저장 완료"))
+            else:
+                receipt.append(f"- **{label}:** {status}")
+        artifact_receipt = "\n".join(receipt)
+        if delivery_mode == "ARTIFACT_ONLY":
+            return artifact_receipt, {}
+        return f"{report.rstrip()}\n\n{artifact_receipt}", {}
 
     def _run_main_tool_loop(
         self,
@@ -2610,6 +2628,7 @@ class AgentRuntime:
             '"primary_source_importance":"low|normal|high","scholarly_evidence_value":"low|normal|high",'
             '"market_data_value":"low|normal|high","entities":[],"unresolved_questions":[],"search_queries":[],'
             '"preferred_capabilities":[],"source_preferences":[],"requested_outputs":[],"ready_to_answer":false,'
+            '"delivery_mode":"CHAT_AND_ARTIFACTS|ARTIFACT_ONLY",'
             '"role":"main|coding|research|server"}. '
             "Use NO_SEARCH for writing, translation, supplied-text work, stable concepts, or local server/repository questions whose answer "
             "does not materially depend on external facts. A real company, market, industry, policy, person, publication, or current-event "
@@ -2619,6 +2638,8 @@ class AgentRuntime:
             "Use DEEP_RESEARCH only when multiple evidence gaps or iterative source verification materially improve the answer. "
             "In requested_outputs include post-research deliverables using these exact names: project_save_artifact, "
             "google_docs_create, google_sheets_create, google_sheets_add_chart, media_generate_image. "
+            "Use CHAT_AND_ARTIFACTS by default so the completed answer remains visible in chat. Use ARTIFACT_ONLY only when the user "
+            "explicitly asks not to show the report in chat and requests only an external artifact or link. "
             "Select media_generate_image only when the user explicitly requests a visual or one compact information visual would materially "
             "improve the requested result; do not select it for routine research. "
             "Use an empty list when the user only asks for an answer or research report in chat. "
@@ -2730,6 +2751,9 @@ class AgentRuntime:
             preferred_capabilities=strings("preferred_capabilities", 8),
             source_preferences=strings("source_preferences", 8),
             requested_outputs=tuple(dict.fromkeys(requested_outputs)),
+            delivery_mode=value.get("delivery_mode") if value.get("delivery_mode") in {
+                "CHAT_AND_ARTIFACTS", "ARTIFACT_ONLY",
+            } else "CHAT_AND_ARTIFACTS",
             ready_to_answer=value.get("ready_to_answer") is True or mode == "NO_SEARCH",
             recommended_agent=value.get("role") if value.get("role") in {"main", "coding", "research", "server"} else "",
         )

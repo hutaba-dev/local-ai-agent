@@ -107,9 +107,11 @@ class Phase3DOrchestrationTests(unittest.TestCase):
                 self.project_scope, self.google_scope,
             )
 
-        self.assertIn("Research complete. Project, Doc, Sheet, and chart were created.", answer)
+        self.assertTrue(answer.startswith("Final researched evidence"))
+        self.assertIn("## 생성된 산출물", answer)
         self.assertIn("https://docs.test/doc-1", answer)
         self.assertIn("https://sheets.test/sheet-1", answer)
+        self.assertEqual(len(client.requests), 1)
         self.assertEqual(orchestration["status"], "AVAILABLE")
         self.assertEqual([item["name"] for item in activity], [
             "project_save_artifact", "google_docs_create", "google_sheets_create", "google_sheets_add_chart",

@@ -613,10 +613,14 @@ class WebRuntimeTests(unittest.TestCase):
             }],
             "annotations": ["FACT"],
         }
+        final_content = (
+            research_result["body_markdown"]
+            + "\n\n## 생성된 산출물\n- **Google Docs:** https://docs.test/report"
+        )
         base_result = self.runtime.chat("hello", "main")
         result = replace(
             base_result,
-            content=research_result["body_markdown"],
+            content=final_content,
             route=Route("research", "Research fixture", "DEEP_RESEARCH"),
             selected_agent="research",
             research={"result": research_result, "rounds": []},
@@ -645,11 +649,15 @@ class WebRuntimeTests(unittest.TestCase):
             web_app.runtime = previous_runtime
 
         self.assertEqual(general.json()["research_result"], research_result)
+        self.assertEqual(general.json()["content"], final_content)
+        self.assertIn("https://docs.test/report", general.json()["content"])
         self.assertEqual(general.json()["activity"]["orchestration_events"], [
             "Research completed", "Final response emitted",
         ])
         self.assertEqual(project.json()["research_result"], research_result)
+        self.assertEqual(project.json()["content"], final_content)
         assistant = next(item for item in restored.json()["messages"] if item["role"] == "assistant")
+        self.assertEqual(assistant["content"], final_content)
         self.assertEqual(assistant["research_result"], research_result)
         self.assertFalse(any(item.get("type") == "research_result" for item in assistant["tool_metadata"]))
 
